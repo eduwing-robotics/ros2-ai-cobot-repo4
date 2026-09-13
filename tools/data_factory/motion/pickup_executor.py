@@ -1614,6 +1614,8 @@ class PickupExecutor:
         data = {key: copy.deepcopy(execution.get(key)) for key in ("step_index", "grasp_verdict", "semantic_verdict", "release_verdict", "precontact_confirmation", "grasp_decision", "semantic_decision", "release_decision", "gripper_feedback_m", "gripper_reference_m", "post_lift_gripper_feedback_m", "release_evidence", "scene_transition", "snapshot", "snapshot_error", "cancel_error", "durable_blocked", "cell_state_error", "scene_state_error", "phase_events_path", "behavior_report_status") if key in execution}
         if "prospective_contact" in execution:
             data["prospective_contact"] = copy.deepcopy(execution["prospective_contact"])
+        if "terminal_verification" in execution:
+            data["terminal_verification"] = copy.deepcopy(execution["terminal_verification"])
         if run.get("recycle_plan_digest") is not None:
             data["recycle_plan_digest"] = run["recycle_plan_digest"]
         if "learned_proposal" in run["plan"]:
@@ -1907,6 +1909,16 @@ class PickupExecutor:
         if run["state"] == "BLOCKED":
             return run["failure_code"]
         run["failure_code"] = code
+        getter = getattr(self.transport, "terminal_verification", None)
+        if callable(getter):
+            try:
+                retained = getter()
+                if isinstance(retained, dict):
+                    execution["terminal_verification"] = {
+                        "plan_digest": run["digest"], "segment_index": execution.get("learned_segment_index", 0),
+                        **copy.deepcopy(retained)}
+            except Exception:
+                pass  # Diagnostic retention must not replace the primary fault.
         if "mechanical_terminal" in run:
             run["mechanical_terminal"].update(status="FAILED", failure_code=code)
         # Fence callbacks before waiting on the sole transport cancellation owner.
@@ -2048,6 +2060,16 @@ class PickupExecutor:
                             code = "GRIPPER_OPEN_TIMEOUT"
                     self._fault(run, code)
                     continue
+                if active is not None and getattr(active, "terminal_observation", None) is not None:
+                    # Completion releases transport ownership. Preserve its
+                    # checked record even if cancellation concurrently fenced
+                    # executor advancement; a later fault snapshot is different.
+                    execution["terminal_verification"] = {
+                        "plan_digest": run["digest"], "segment_index": execution.get("learned_segment_index", 0),
+                        "phase": active.phase, "type": active.type, "deadline_monotonic_s": active.deadline,
+                        "status": active.terminal_observation_status, "code": active.terminal_observation_code,
+                        "action_terminal": copy.deepcopy(active.action_terminal_observation),
+                        "checked_observation": copy.deepcopy(active.terminal_observation)}
                 if run["state"] != "EXECUTING":
                     continue
                 if active is not None:
@@ -2092,16 +2114,25 @@ class PickupExecutor:
                     if "held_target_segments" in completed_step:
                         index = execution.get("learned_segment_index", 0)
                         segment = completed_step["held_target_segments"][index]
+                        terminal_observation = None
                         try:
-                            observed = self.transport.snapshot(run["plan"]["planning"]["max_joint_state_age_s"])
                             from tools.data_factory.rollout.finite_plan import check_segment_observation, execution_step
-                            terminal_observation = {"captured_at_s": self.source_clock(), "captured_monotonic_s": self.monotonic_clock(),
-                                                    "snapshot": copy.deepcopy(observed)}
+                            terminal_observation = copy.deepcopy(getattr(active, "terminal_observation", None))
+                            if terminal_observation is None:
+                                # Legacy/non-native transports have no checked
+                                # witness; native completion returns its exact one.
+                                observed = self.transport.snapshot(run["plan"]["planning"]["max_joint_state_age_s"])
+                                terminal_observation = {"captured_at_s": self.source_clock(), "captured_monotonic_s": self.monotonic_clock(),
+                                                        "snapshot": copy.deepcopy(observed)}
                             action_terminal = getattr(active, "action_terminal_observation", None)
                             if action_terminal is not None:
                                 terminal_observation["action_terminal"] = copy.deepcopy(action_terminal)
-                            terminal = check_segment_observation(execution_step(segment, run["plan"]["learned_proposal"]), terminal_observation, self.source_clock(), terminal=True,
-                                                                 steady_now=self.monotonic_clock())
+                            # Revalidate the confirmed record at its checked
+                            # instant. Next dispatch separately admits current
+                            # state; consumer delay cannot age a past result.
+                            terminal = check_segment_observation(execution_step(segment, run["plan"]["learned_proposal"]), terminal_observation,
+                                                                 terminal_observation["captured_at_s"], terminal=True,
+                                                                 steady_now=terminal_observation["captured_monotonic_s"])
                             from tools.data_factory.rollout.gripper_evidence import check_transition
                             check_transition(execution["learned_start_observation"], terminal_observation, command=segment["type"] == "GRIPPER")
                             if "contact_pending" in execution:
@@ -2118,6 +2149,11 @@ class PickupExecutor:
                                 "terminal_observation": terminal_observation})
                             execution["learned_terminal_snapshot"] = terminal
                         except Exception as exc:
+                            if terminal_observation is not None:
+                                execution["terminal_verification"] = {
+                                    "plan_digest": run["digest"], "segment_index": index, "status": "REJECTED",
+                                    "code": exc.code if isinstance(exc, ContractError) else "LEARNED_TERMINAL_STATE",
+                                    "checked_observation": copy.deepcopy(terminal_observation)}
                             self._fault(run, exc.code if isinstance(exc, ContractError) else "LEARNED_TERMINAL_STATE")
                             continue
                         self._emit_phase_event(run, "ACTION_TERMINAL", segment, "SUCCEEDED", {"step": segment, "terminal_status": "SUCCEEDED"})

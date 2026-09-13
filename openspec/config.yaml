@@ -4,6 +4,7 @@ context: |
   openspec/changes/establish-portfolio-proof-loop-intent/specs/portfolio-proof-loop/spec.md.
   Every lane must apply its requirements, especially "Curator owns reusable acquisition
   recommendations", "Native owners enforce safety without duplicate operator gates",
-  and "Existing product interfaces precede custom capabilities".
+  "Existing product interfaces precede custom capabilities", and
+  "Continuous policy execution is independent of evidence observation".
   Lane changes reference these shared requirements instead of copying a second rulebook.
   Specification acceptance is not evidence that implementation or physical execution is complete.

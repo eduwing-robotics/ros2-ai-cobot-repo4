@@ -411,13 +411,29 @@ The [Jazzy JTC](https://control.ros.org/jazzy/doc/ros2_controllers/joint_traject
 already consumes timed multi-waypoint trajectories; no replacement high-rate
 Python controller is required.
 
-The first bounded implementation candidate groups adjacent ARM ranges with an
-unchanged held gripper command, retaining every waypoint and its allocated
-duration. Never merge across a GRIPPER transition or silently drop small gripper
-changes. Preserve archived serialized-reference plan/trace replay through an
-explicit selection boundary. Grouping alone is not a complete continuous normal
-rollout: a common ARM/gripper timeline remains a separate candidate requiring
-native actuator-ordering evidence, not an assumed concurrency capability.
+The user clarified that the product requires continuous learned rollout, not a
+separate finite-playback product. The proposed 72-to-45 grouped-ARM mode is
+therefore **not adopted**: it preserves the same serial runtime abstraction and
+would add another maintained selection. Remove that unpromoted implementation
+candidate rather than expand it. Reuse native LeRobot prediction/chunk-consumption
+facilities and existing FR5 transport/controller capabilities for the normal
+runtime; retire row-terminal barriers from that path. Preserve historical evidence
+readability without retaining a second executable playback product merely for
+compatibility. Immutable command identity and admission remain useful, but must
+not dictate row-by-row execution. Connect evidence produced by the actual owners;
+do not build an unused parallel execution architecture to produce that evidence.
+Do not silently discard gripper changes or claim concurrent actuator behavior
+before establishing the actual native contract.
+
+The remaining gripper barrier must be attributed rather than declared a hardware
+law: the pinned SDK and [manufacturer peripheral API](https://fairino-doc-en.readthedocs.io/3.9.7/SDKManual/CPPRobotPeripherals.html)
+define `MoveGripper(block=1)` as non-blocking, already selected by our worker.
+The SDK wrapper forwards that flag to XMLRPC; our ROS patch explicitly pauses
+the ARM stream until gripper completion (servo-lifecycle change `056f688f`).
+Neither non-blocking RPC return nor that code comment proves concurrent physical
+servo/gripper behavior on the installed controller. Before removing this barrier,
+attribute the native servo-mode interaction using existing runtime evidence;
+do not add a duplicate Python scheduler or silently reinterpret command order.
 
 Terminal handling must retain the exact action result and the coherent native
 observation actually used to confirm completion. A fresh buffered sample is not

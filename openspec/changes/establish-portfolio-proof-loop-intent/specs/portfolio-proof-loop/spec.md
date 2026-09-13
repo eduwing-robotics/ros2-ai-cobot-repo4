@@ -77,6 +77,19 @@ Collection 전용 계획 작성·campaign 운영 기능은 책임을 식별할 �
 - **THEN** 해당 결과를 소유한 시스템이 필요한 검사·복구와 중단 사유를 처리하고, 조사 가능한 오류를 사람 확인으로 대체하지 않는다
 - **AND** 영향을 받지 않는 근거와 완료된 물리 효과는 보존하며 독립적인 적격 작업은 계속한다
 
+### Requirement: Continuous policy execution is independent of evidence observation
+정책 실행은 목표 주기에 맞춰 연속적으로 동작해야 하며(SHALL), 추론·증거 기록·진단의 주기를 고주기 제어의 완료 장벽으로 사용해서는 안 된다(MUST NOT). 증거 계층은 실제 추론·명령 소비·제어기 결과·관측 owner가 생산한 정보를 연결하는 관찰 책임을 갖는다(SHALL). 증거를 만들기 위해 사용하지 않을 별도 실행 제품이나 행별 정지 경로를 추가해서는 안 된다(MUST NOT). 실행 전 승인·현재 상태·충돌 및 장치 이상에 대한 중단은 기존 단일 실행 owner가 책임진다(SHALL); 관찰자 분리는 해당 조건의 우회를 뜻하지 않는다. 기록의 누락·지연은 사실대로 보존하고, 이를 완전한 실행·성공·학습 승인으로 표시해서는 안 된다(MUST NOT).
+
+#### Scenario: Observation or diagnosis is slower than actuation
+- **WHEN** 증거 저장·집계·진단 또는 다음 추론이 현재 제어 주기보다 오래 걸린다
+- **THEN** 이미 허가된 명령의 실행을 행마다 해당 작업의 완료와 동기화하지 않으며, 기존 실행 owner가 유효한 실행 범위와 입력 고갈·오류·취소를 처리한다
+- **AND** 관찰자는 원래 시각·명령 식별자·실제 소비 결과를 보존하고 별도 명령 전송 권한을 갖지 않는다
+
+#### Scenario: Reusing evidence does not preserve an unused runtime
+- **WHEN** 정상 정책 실행 경로를 교체하거나 기존 기록을 재분석한다
+- **THEN** 필요한 과거 증거 읽기와 실제 사용 중인 실행·기록 계약을 재사용하며, 호환성만을 이유로 사용하지 않는 두 번째 실행 모드를 유지하지 않는다
+- **AND** 테스트 통과나 계획된 구조만으로 실시간 주기·실물 실행·작업 성공을 입증했다고 주장하지 않는다
+
 ### Requirement: Automation takes over qualified responsibilities rather than bypassing gates
 반복적인 사람 입력을 줄이는 전환은 그 입력이 담당하던 관찰·판정·권한 범위·실패 대응을 명시하고 검증된 시스템 책임으로 인수해야 한다(SHALL). 관측 정확도, 잘못된 승인과 중단, 복구 가능성 및 사람 개입 빈도를 적용 범위 안에서 평가해야 한다(SHALL). 기존 gate를 바꾸는 개별 전환은 해당 authority의 승인된 계약과 회귀·실물 evidence를 갖추어야 하며(SHALL), 장기 자동화 intent 자체를 현재 gate 충족이나 승인으로 해석해서는 안 된다(MUST NOT).
 

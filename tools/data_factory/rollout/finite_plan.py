@@ -480,9 +480,6 @@ def check_segment_observation(segment, evidence, now, *, terminal=False, steady_
         observed = evidence["snapshot"]
         state = _execution_state(segment, evidence, now)
         gripper = observed["gripper_controller"]
-        expected = segment["final_joint_state"] if terminal else segment["start_joint_state"]
-        if any(abs(a - b) > segment["joint_tolerance_rad"] for a, b in zip(state[:6], expected)):
-            raise ContractError("LEARNED_TERMINAL_STATE" if terminal else "START_STATE_MISMATCH")
         if terminal or segment["type"] == "ARM":
             reference = _number(gripper["reference_position_m"], "GRIPPER_FEEDBACK_OUT_OF_RANGE")
             bound = segment["acceptable_feedback_m"]
@@ -506,6 +503,9 @@ def check_segment_observation(segment, evidence, now, *, terminal=False, steady_
                 bound = calibrated["requirements"]["acceptable_feedback_m"]
                 if not all(bound["min"] <= value <= bound["max"] for value in feedback):
                     raise ContractError("GRIPPER_FEEDBACK_OUT_OF_RANGE")
+        expected = segment["final_joint_state"] if terminal else segment["start_joint_state"]
+        if any(abs(a - b) > segment["joint_tolerance_rad"] for a, b in zip(state[:6], expected)):
+            raise ContractError("LEARNED_TERMINAL_STATE" if terminal else "START_STATE_MISMATCH")
         return state
     except ContractError:
         raise
@@ -1128,10 +1128,10 @@ def validate_execution_trace(plan, trace):
                 # Older traces omit this optional observation. New held waits retain
                 # actual JTC terminal time separately from native handoff completion.
                 try:
+                    expected_error = 1 if segments[index]["type"] == "ARM" else 0
                     if (set(action) != {"result_status", "error_code", "observed_at_s", "observed_monotonic_s"}
                             or type(action["result_status"]) is not int or action["result_status"] != 4
-                            or type(action["error_code"]) is not int or action["error_code"] != 0
-                            or segments[index]["type"] != "GRIPPER"
+                            or type(action["error_code"]) is not int or action["error_code"] != expected_error
                             or not started <= _number(action["observed_at_s"], "LEARNED_TRACE_TERMINAL") <= completed
                             or not item["start_observation"]["captured_monotonic_s"] <= _number(
                                 action["observed_monotonic_s"], "LEARNED_TRACE_TERMINAL") <= item["terminal_observation"]["captured_monotonic_s"]):

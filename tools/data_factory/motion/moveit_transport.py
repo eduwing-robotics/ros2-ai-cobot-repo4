@@ -66,9 +66,13 @@ class _ActivePhase:
     goal_handle: object | None = None
     result_future: object | None = None
     held_segment: dict | None = None
+    arm_segment: dict | None = None
     start_observation: dict | None = None
     action_succeeded: bool = False
     action_terminal_observation: dict | None = None
+    terminal_observation: dict | None = None
+    terminal_observation_status: str = "PENDING"
+    terminal_observation_code: str | None = None
 
 
 def _rotation_quaternion(columns):
@@ -926,6 +930,10 @@ class RosMoveItTransport:
         if phase == "LEARNED_CHUNK" and step_type == "GRIPPER" and "action_range" in compiled_step:
             active.held_segment = copy.deepcopy(compiled_step)
             active.start_observation = copy.deepcopy(start_observation)
+        elif (phase == "LEARNED_CHUNK" and step_type == "ARM" and "action_range" in compiled_step
+              and compiled_step["learned_proposal"].get("runtime_inputs", {}).get("hardware_wire_version") == 5):
+            active.arm_segment = copy.deepcopy(compiled_step)
+            active.start_observation = copy.deepcopy(start_observation)
         self._active = active
         self._execution_locked = True
         if cancel_event is not None and cancel_event.is_set():
@@ -1000,7 +1008,7 @@ class RosMoveItTransport:
             raise ContractError("ROS_EXEC_GOAL_PENDING")
         if self._clock() > active.deadline:
             raise ContractError("LEARNED_HARDWARE_COMPLETION_TIMEOUT" if active.action_succeeded
-                                and active.held_segment is not None else "ROS_EXEC_RESULT_TIMEOUT")
+                                and (active.held_segment is not None or active.arm_segment is not None) else "ROS_EXEC_RESULT_TIMEOUT")
         try:
             if not active.result_future.done():
                 self._rclpy.spin_once(self.node, timeout_sec=0.0)
@@ -1021,21 +1029,71 @@ class RosMoveItTransport:
             self._active = None
             self._execution_locked = True
             raise ContractError("ROS_EXEC_FAILED")
-        if active.held_segment is not None:
+        if active.held_segment is not None or active.arm_segment is not None:
             if not active.action_succeeded:
                 active.action_terminal_observation = {
-                    "result_status": result.status, "error_code": result.result.error_code,
+                    "result_status": result.status,
+                    "error_code": result.result.error_code.val if active.type == "ARM" else result.result.error_code,
                     "observed_at_s": time.time(), "observed_monotonic_s": self._clock()}
             active.action_succeeded = True
             if self._execution_locked:
                 raise ContractError("ROS_EXEC_CANCELLED")
-            completed = self._held_hardware_completed(active)
+            try:
+                completed = (self._arm_endpoint_confirmed(active) if active.arm_segment is not None
+                             else self._held_hardware_completed(active))
+            except ContractError as exc:
+                active.terminal_observation_status = "REJECTED"
+                active.terminal_observation_code = exc.code
+                raise
             if self._execution_locked:
                 raise ContractError("ROS_EXEC_CANCELLED")
             if not completed:
                 return None
+            active.terminal_observation_status = "CONFIRMED"
+            active.terminal_observation_code = None
         self._active = None
         return active
+
+    def terminal_verification(self):
+        """Retain the last checked witness separately from any fault snapshot."""
+        active = getattr(self, "_active", None)
+        if active is None or active.action_terminal_observation is None:
+            return None
+        return copy.deepcopy({"phase": active.phase, "type": active.type,
+            "deadline_monotonic_s": active.deadline, "status": active.terminal_observation_status,
+            "code": active.terminal_observation_code, "action_terminal": active.action_terminal_observation,
+            "checked_observation": active.terminal_observation})
+
+    def _arm_endpoint_confirmed(self, active):
+        """Action success plus endpoint confirmation under the original budget.
+
+        v5 proves coherent delivery, not physical acquisition after the action
+        result. An otherwise valid off-target sample is pending, even if it was
+        delivered later. A valid endpoint needs no extra receipt-time barrier.
+        """
+        from tools.data_factory.rollout.finite_plan import check_segment_observation
+        from tools.data_factory.rollout.gripper_evidence import check_transition
+        segment = active.arm_segment
+        self._rclpy.spin_once(self.node, timeout_sec=0.0)
+        snapshot = self.snapshot(segment["max_joint_state_age_s"])
+        now, steady = time.time(), self._clock()
+        evidence = {"captured_at_s": now, "captured_monotonic_s": steady,
+                    "snapshot": copy.deepcopy(snapshot), "action_terminal": copy.deepcopy(active.action_terminal_observation)}
+        active.terminal_observation = evidence
+        if steady > active.deadline:
+            raise ContractError("LEARNED_HARDWARE_COMPLETION_TIMEOUT")
+        check_transition(active.start_observation, evidence, command=False)
+        try:
+            check_segment_observation(segment, evidence, now, steady_now=steady, terminal=True)
+        except ContractError as exc:
+            # The shared checker validates all hard hardware/reference errors
+            # before this endpoint-only condition. Never turn those into waiting.
+            if exc.code != "LEARNED_TERMINAL_STATE":
+                raise
+            active.terminal_observation_status = "PENDING"
+            active.terminal_observation_code = exc.code
+            return False
+        return True
 
     def _held_hardware_completed(self, active):
         """Observe one retained command; never resend, renew its deadline or replan."""
@@ -1047,7 +1105,9 @@ class RosMoveItTransport:
         now, steady = time.time(), self._clock()
         if steady > active.deadline:
             raise ContractError("LEARNED_HARDWARE_COMPLETION_TIMEOUT")
-        evidence = {"captured_at_s": now, "captured_monotonic_s": steady, "snapshot": snapshot}
+        evidence = {"captured_at_s": now, "captured_monotonic_s": steady, "snapshot": copy.deepcopy(snapshot),
+                    "action_terminal": copy.deepcopy(active.action_terminal_observation)}
+        active.terminal_observation = evidence
         try:
             check_segment_observation(segment, evidence, now, steady_now=steady, allow_pending=True)
         except ContractError as exc:
@@ -1078,7 +1138,7 @@ class RosMoveItTransport:
             raise ContractError("ROS_EXEC_CANCEL_TIMEOUT")
         self._execution_locked = True
         if getattr(active, "action_succeeded", False):
-            # JTC is already terminal. A cancel request fences the handoff but
+            # The action is already terminal. A cancel request fences the handoff but
             # cannot manufacture CANCELED or stop an in-flight hardware RPC.
             # Keep the actual terminal result for poll_terminal_evidence.
             raise ContractError("ROS_EXEC_CANCEL_NOT_CANCELED")

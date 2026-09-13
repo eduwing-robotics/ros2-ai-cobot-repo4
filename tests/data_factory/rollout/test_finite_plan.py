@@ -1479,6 +1479,21 @@ class FinitePlanTest(unittest.TestCase):
         self.assertEqual(terminal["action_terminal"], {"result_status": 4, "error_code": 0,
                          "observed_at_s": 11.01, "observed_monotonic_s": 11.01})
         from tools.data_factory.rollout.finite_plan import validate_execution_trace
+        # MoveIt and FollowJointTrajectory use different success codes. Keep
+        # the actual ARM result readable without accepting a gripper code for it.
+        arm_trace = copy.deepcopy(trace)
+        arm_terminal = arm_trace["segments"][0]["terminal_observation"]
+        arm_terminal["action_terminal"] = {
+            "result_status": 4, "error_code": 1,
+            "observed_at_s": arm_terminal["captured_at_s"],
+            "observed_monotonic_s": arm_terminal["captured_monotonic_s"],
+        }
+        arm_trace["trace_digest"] = canonical_digest({k: v for k, v in arm_trace.items() if k != "trace_digest"})
+        self.assertEqual(validate_execution_trace(frozen, arm_trace), arm_trace)
+        arm_terminal["action_terminal"]["error_code"] = 0
+        arm_trace["trace_digest"] = canonical_digest({k: v for k, v in arm_trace.items() if k != "trace_digest"})
+        with self.assertRaisesRegex(ContractError, "LEARNED_TRACE_TERMINAL"):
+            validate_execution_trace(frozen, arm_trace)
         for field, value in (("result_status", 5), ("observed_at_s", 11.12), ("observed_monotonic_s", 9.)):
             altered = copy.deepcopy(trace)
             altered["segments"][1]["terminal_observation"]["action_terminal"][field] = value
