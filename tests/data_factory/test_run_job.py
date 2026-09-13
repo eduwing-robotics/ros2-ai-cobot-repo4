@@ -369,6 +369,167 @@ class RunJobTest(unittest.TestCase):
                 resolver.assert_not_called()
                 child.assert_not_called()
 
+    def test_normal_stream_grant_and_static_policy_are_distinct_from_finite_output(self):
+        from tools.data_factory.rollout.stream_plan import POLICY_SCHEMA
+        from tools.data_factory.rollout.finite_plan import PROPOSAL_SCHEMA
+
+        def grant(schema):
+            value = {
+                "schema_version": "data_factory.learned_task_grant.v1",
+                "grant_id": "normal-grant", "issued_by": "operator", "run_id": "run",
+                "scope": {"adaptation": {"schema_version": schema}},
+                "deadline_s": 100., "terminal_reserve_s": 10., "max_outputs": 1,
+                "revoked": False,
+            }
+            value["grant_digest"] = run_job.canonical_digest(value)
+            return value
+
+        self.assertTrue(run_job._normal_stream_grant({"task_grant": grant(POLICY_SCHEMA)}))
+        self.assertFalse(run_job._normal_stream_grant({"task_grant": grant(PROPOSAL_SCHEMA[:-1] + "2")}))
+        with tempfile.TemporaryDirectory() as directory:
+            robot = Path(directory) / "robot.urdf"
+            robot.write_text("<robot name='retained'/>")
+            source = {"steps": [
+                {"limits": {"velocity_scaling": .1}},
+                {"limits": {"velocity_scaling": .05}},
+            ]}
+            inputs = {"fps": 30, "warmup": {"output_disposition": "DISCARDED"}}
+            checkpoint = {"tree_digest": run_job.canonical_digest("tree")}
+            policy = run_job._native_stream_policy(
+                SimpleNamespace(checkpoint=checkpoint), source,
+                {"urdf": str(robot)}, inputs, instruction="pick and place",
+            )
+        self.assertEqual(policy, {
+            "schema_version": POLICY_SCHEMA,
+            "checkpoint": checkpoint,
+            "instruction": "pick and place",
+            "robot_description": "<robot name='retained'/>",
+            "velocity_scaling": .05,
+            "period_s": 1 / 30,
+            "max_observation_age_s": .3,
+            "runtime_inputs": inputs,
+        })
+        checkpoint["tree_digest"] = "changed"
+        inputs["fps"] = 1
+        self.assertNotEqual(policy["checkpoint"], checkpoint)
+        self.assertEqual(policy["runtime_inputs"]["fps"], 30)
+
+    def test_normal_stream_routes_static_plan_and_stops_before_legacy_preapproval_or_effects(self):
+        from tools.data_factory.rollout.stream_plan import POLICY_SCHEMA
+
+        validated = runtime_validated(job={
+            **JOB, "instruction": "pick and place",
+        })
+        program = runtime_motion(validated, continuous=True)
+        request = {
+            **payload("live"),
+            "learned_checkpoint": "/synthetic/checkpoint",
+            "gripper_source_clock": "/synthetic/clock.json",
+        }
+        grant = {
+            "schema_version": "data_factory.learned_task_grant.v1",
+            "grant_id": "normal-grant", "issued_by": "operator",
+            "run_id": request["run_id"],
+            "scope": {"adaptation": {"schema_version": POLICY_SCHEMA}},
+            "deadline_s": 100., "terminal_reserve_s": 10.,
+            "max_outputs": 1, "revoked": False,
+        }
+        grant["grant_digest"] = run_job.canonical_digest(grant)
+        request["task_grant"] = grant
+        policy = {
+            "schema_version": POLICY_SCHEMA,
+            "checkpoint": {"tree_digest": run_job.canonical_digest("tree")},
+            "instruction": validated["normalized_job"]["instruction"],
+            "robot_description": "<robot name='retained'/>",
+            "velocity_scaling": .1,
+            "period_s": 1 / 30,
+            "max_observation_age_s": .3,
+            "runtime_inputs": {"fps": 30},
+        }
+        from tools.data_factory.rollout.task_authority import task_scope
+        grant["scope"] = task_scope(program, SCENE, policy)
+        grant["grant_digest"] = run_job.canonical_digest({
+            key: value for key, value in grant.items()
+            if key != "grant_digest"
+        })
+        planned = {
+            "ok": True, "code": "PLANNED", "state": "PLANNED",
+            "plan_digest": run_job.canonical_digest("normal-plan"),
+        }
+
+        class Job:
+            state = "IDLE"
+            readiness_contract = None
+
+            def __init__(self):
+                self.plan_stream = mock.Mock(return_value=planned)
+                self.plan_only = mock.Mock(side_effect=AssertionError(
+                    "normal task must not enter finite planning",
+                ))
+
+            def set_lifecycle_event_call(self, callback):
+                self.lifecycle_event_call = callback
+
+        class Child:
+            def __init__(self):
+                self.closed = False
+
+            def close(self, **_kwargs):
+                self.closed = True
+                return 0
+
+        job, child = Job(), Child()
+        recorder = mock.Mock(side_effect=AssertionError(
+            "static normal planning must not start a recorder",
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            robot = Path(directory) / "robot.urdf"
+            robot.write_text(policy["robot_description"])
+            request["urdf"] = str(robot)
+            with (
+                mock.patch.object(
+                    run_job, "_native_run_inputs",
+                    return_value=(SimpleNamespace(checkpoint=policy["checkpoint"]), {"fps": 30}),
+                ),
+                mock.patch.object(
+                    run_job, "CellStateStore",
+                    return_value=SimpleNamespace(read=lambda: {
+                        "robot_system_id": request["expected_robot_system_id"],
+                        "cell_ready": True,
+                    }),
+                ),
+                mock.patch.object(run_job, "SceneStateStore"),
+                mock.patch.object(run_job, "_prepare_run_dir"),
+                mock.patch.object(run_job, "_infer_native_program", side_effect=AssertionError(
+                    "normal task must not infer a finite program before planning",
+                )),
+                mock.patch.object(run_job, "_operator_summary", side_effect=AssertionError(
+                    "normal task has no legacy finite operator summary",
+                )),
+                mock.patch.object(run_job, "_write_preapproval_evidence", side_effect=AssertionError(
+                    "normal task has no legacy finite preapproval envelope",
+                )),
+                mock.patch.object(run_job, "ResourceMonitor") as resources,
+            ):
+                result = run_job.run_live(
+                    request, threading.Event(), lambda _: None,
+                    resolver=lambda _: (validated, program, SCENE),
+                    executor_factory=lambda *_: child,
+                    recorder_factory=recorder,
+                    camera_warmup_call=lambda *_: {}, one_job=job,
+                )
+        self.assertEqual(
+            (result["ok"], result["code"], result["state"]),
+            (False, "LEARNED_STREAM_COMMIT_UNAVAILABLE", "PLANNED"),
+        )
+        job.plan_stream.assert_called_once_with(
+            request["run_id"], program, SCENE, policy,
+        )
+        job.plan_only.assert_not_called()
+        recorder.assert_not_called()
+        resources.assert_not_called()
+        self.assertTrue(child.closed)
+
     def test_learned_cli_preserves_explicit_inputs_without_enabling_live_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             job_path = Path(directory) / "job.json"
@@ -1890,6 +2051,16 @@ class RunJobTest(unittest.TestCase):
                 preapproval_checklist=None, repository_root=Path(__file__).resolve().parents[2],
                 task_grant=authority)
         self.assertEqual(check_scoped(), instruction_binding)
+        from tools.data_factory.rollout.stream_plan import POLICY_SCHEMA
+        normal_grant = copy.deepcopy(grant)
+        normal_grant["scope"]["adaptation"]["schema_version"] = POLICY_SCHEMA
+        normal_grant["grant_digest"] = run_job.canonical_digest({
+            key: value for key, value in normal_grant.items()
+            if key != "grant_digest"
+        })
+        self.assertEqual(
+            check_scoped(authority=normal_grant), instruction_binding,
+        )
         for key in ("place_id", "cell_calibration_id", "sheet_manifest_digest", "x_mm"):
             with self.subTest(scoped_destination=key):
                 changed = copy.deepcopy(scoped_validated)

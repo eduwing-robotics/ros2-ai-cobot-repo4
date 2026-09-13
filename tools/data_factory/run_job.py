@@ -1766,7 +1766,9 @@ def _validate_episode_instruction_scope(
                 raise ContractError("EPISODE_INSTRUCTION_SCOPE")
         if task_grant is not None:
             from tools.data_factory.rollout.task_authority import uses_scoped_generation
-            if (preapproval_checklist is not None or not uses_scoped_generation(task_grant)
+            if (preapproval_checklist is not None
+                    or not (uses_scoped_generation(task_grant)
+                            or _normal_stream_grant({"task_grant": task_grant}))
                     or task_grant["scope"].get("task") != checked["instruction"]):
                 raise ContractError("EPISODE_INSTRUCTION_SCOPE")
             destination = validated.get("destination_resolved_inputs", {}).get("normalized_job")
@@ -2698,6 +2700,43 @@ def _native_run_inputs(payload, profile, cancel, *, instruction):
     inputs = {**runtime_options, "clock_binding": binding, "camera_topics": topics,
               "camera_mapping": mapping, "fps": profile["fps"], "warmup": warmup, "hardware_wire_version": (5 if binding["schema_version"] == "fr5.gripper_temporal_policy.v2" else 4) if causal else 2}
     return native, inputs
+
+
+def _normal_stream_grant(payload):
+    """Recognize the explicit normal-task grant without treating finite v2 as streaming."""
+    from tools.data_factory.rollout.stream_plan import POLICY_SCHEMA
+    from tools.data_factory.rollout.task_authority import validate_grant
+
+    grant = payload.get("task_grant") if isinstance(payload, dict) else None
+    if grant is None:
+        return False
+    checked = validate_grant(grant)
+    adaptation = checked["scope"].get("adaptation")
+    return isinstance(adaptation, dict) and adaptation.get("schema_version") == POLICY_SCHEMA
+
+
+def _native_stream_policy(native, source, payload, inputs, *, instruction):
+    """Build the static normal policy identity; no prediction or motion is consumed."""
+    from tools.data_factory.rollout.stream_plan import POLICY_SCHEMA
+
+    try:
+        robot_description = Path(payload["urdf"]).read_text()
+    except (KeyError, OSError, TypeError) as exc:
+        raise ContractError("LEARNED_ROBOT_BINDING") from exc
+    return {
+        "schema_version": POLICY_SCHEMA,
+        "checkpoint": copy.deepcopy(native.checkpoint),
+        "instruction": instruction,
+        "robot_description": robot_description,
+        "velocity_scaling": min(
+            step["limits"]["velocity_scaling"]
+            for step in source["steps"]
+            if "velocity_scaling" in step["limits"]
+        ),
+        "period_s": 1 / inputs["fps"],
+        "max_observation_age_s": .3,
+        "runtime_inputs": copy.deepcopy(inputs),
+    }
 
 
 def run_learned_plan_only(payload, cancel, publish, *, checkpoint, observation=None, camera_topics=None,
@@ -3958,6 +3997,7 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
     profile = None
     try:
         learned = _learned_options(payload)
+        normal_stream = learned is not None and _normal_stream_grant(payload)
         if learned is not None and (approval_scope != "HUMAN_GATED" or campaign_authorization is not None
                                     or object_reposition_binding is not None):
             raise ContractError("LEARNED_HUMAN_APPROVAL_REQUIRED")
@@ -4054,7 +4094,8 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
             raise ContractError("PREAPPROVAL_CHECKLIST_SCOPE")
         from tools.data_factory.rollout.task_authority import uses_scoped_generation
         scoped_instruction = (episode_instruction_binding is not None and not bound_runtime
-                              and learned is not None and uses_scoped_generation(payload.get("task_grant")))
+                              and learned is not None and (uses_scoped_generation(payload.get("task_grant"))
+                                                           or normal_stream))
         if not scoped_instruction and (
             (episode_instruction_binding is not None)
             != (
@@ -4271,14 +4312,26 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                 # Existing camera readiness must finish before acquiring the
                 # original inputs; its waiting time cannot consume their age.
                 camera_warmup_future.result()
-                program = _infer_native_program(native, program, executor, cancel,
-                    urdf=payload["urdf"], instruction=(validated["normalized_job"]["instruction"]
-                        if checked_episode_instruction is None else checked_episode_instruction["instruction"]),
-                    period_s=1 / inputs["fps"], camera_topics=inputs["camera_topics"], runtime_inputs=inputs,
-                    generation_binding=dict(run_id=payload["run_id"], grant=payload.get("task_grant"),
-                        scene_binding=scene_binding, predecessor_plan_digest=None, lease_id=None))
+                instruction = (validated["normalized_job"]["instruction"]
+                               if checked_episode_instruction is None
+                               else checked_episode_instruction["instruction"])
+                if normal_stream:
+                    policy = _native_stream_policy(
+                        native, program, payload, inputs, instruction=instruction,
+                    )
+                    planned = job.plan_stream(
+                        payload["run_id"], program, scene_binding, policy,
+                    )
+                else:
+                    program = _infer_native_program(native, program, executor, cancel,
+                        urdf=payload["urdf"], instruction=instruction,
+                        period_s=1 / inputs["fps"], camera_topics=inputs["camera_topics"], runtime_inputs=inputs,
+                        generation_binding=dict(run_id=payload["run_id"], grant=payload.get("task_grant"),
+                            scene_binding=scene_binding, predecessor_plan_digest=None, lease_id=None))
+                    planned = job.plan_only(payload["run_id"], program, scene_binding)
                 trajectory_binding = None
-            planned = job.plan_only(payload["run_id"], program, scene_binding)
+            else:
+                planned = job.plan_only(payload["run_id"], program, scene_binding)
         except Exception as exc:
             plan_error = exc
         camera_warmup = None
@@ -4298,6 +4351,15 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                 run_id=payload["run_id"], plan_digest=planned["plan_digest"],
                 data={"planning_response": planned["planning_response"]}
                 if "planning_response" in planned else None,
+            )
+        if normal_stream:
+            # The normal task has no finite operator-summary/precommit envelope.
+            # Stop before approval, recorder begin or motion until the same owner
+            # exposes checked relative-template commit with an explicit epoch.
+            return _response(
+                ok=False, code="LEARNED_STREAM_COMMIT_UNAVAILABLE", state="PLANNED",
+                run_id=payload["run_id"], plan_digest=planned["plan_digest"],
+                data={"mode": "live", "training_authorized": False},
             )
         trajectory_binding = _bind_trajectory_to_planned_program(
             trajectory_binding, payload=payload, validated=validated,
