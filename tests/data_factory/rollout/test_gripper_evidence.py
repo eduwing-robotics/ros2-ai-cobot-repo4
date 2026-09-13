@@ -132,6 +132,11 @@ class NativeGripperEvidenceTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 self.assertEqual(self.run_native(scenario), {"native_write_only": True})
 
+    def test_current_driver_pauses_arm_during_gripper_despite_fresh_state(self):
+        self.assertEqual(self.run_native("overlap_write"), {
+            "initial_arm_sends": 0, "active_arm_sends": 0,
+            "fault_stops_sends": True, "physical_overlap": "UNKNOWN"})
+
     def test_off_target_old_done_needs_command_activity_or_dwell(self):
         # Reuse the actual worker with only device telemetry varied. No ROS/network.
         fixture = Path(__file__).with_name("gripper_native_fixture.cpp").read_text().split("int main(")[0]

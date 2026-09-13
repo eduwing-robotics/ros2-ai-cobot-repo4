@@ -161,6 +161,34 @@ int main(int argc,char **argv) {
   using namespace fairino_hardware;
   assert(argc==2 || argc==3);std::string mode=argv[1];FairinoHardwareInterface h;
   auto &r=*h._ptr_robot;h._gripper_evidence.activate();
+  if(mode=="overlap_write") {
+    // Source-only discriminator for an isolated overlap candidate. The fake
+    // SDK counts calls; it makes no claim that physical overlap is supported.
+    h._require_gripper_source_clock=true;h._require_coherent_snapshot=true;
+    h._pending_gripper_position.reset();h._gripper_command_generation=0;
+    h._arm_stream_paused=false;h._jnt_position_command[6]=.012;
+    auto &v=h._gripper_evidence_values;
+    const auto steady=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    v[0]=5.;v[27]=1.;v[42]=.3;v[10]=v[106]=v[110]=steady;
+    v[107]=v[108]=v[109]=1.;
+    assert(h.write({}, {})==hardware_interface::return_type::OK);
+    const int initial_sends=r.arm_sends;
+    assert(h._gripper_command_generation==1 && h._pending_gripper_position);
+    // Simulate in-flight gripper state, with still-current coherent telemetry.
+    h._pending_gripper_position.reset();h._gripper_rpc_active=true;
+    h._gripper_evidence.active=1;v[5]=v[6]=1.;v[23]=1.;v[24]=h._arm_stream_paused?0.:1.;
+    h._jnt_position_command[0]+=.01;
+    assert(h.write({}, {})==hardware_interface::return_type::OK);
+    const int active_sends=r.arm_sends;
+    // Existing fault handling must survive the overlap candidate as well.
+    udp_command_error=17;
+    assert(h.write({}, {})==hardware_interface::return_type::ERROR);
+    assert(r.arm_sends==active_sends && r.moves==0 && r.resumes==0);
+    std::cout<<"{\"initial_arm_sends\":"<<initial_sends
+             <<",\"active_arm_sends\":"<<active_sends
+             <<",\"fault_stops_sends\":true,\"physical_overlap\":\"UNKNOWN\"}";
+    return 0;
+  }
   if(mode=="distinct_reference" || mode=="legacy_deadband") {
     h._require_gripper_source_clock=mode=="distinct_reference";
     h._pending_gripper_position.reset();h._gripper_command_generation=0;
