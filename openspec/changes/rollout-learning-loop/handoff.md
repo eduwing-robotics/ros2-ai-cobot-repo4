@@ -34,6 +34,13 @@ This bootstrap is navigation and operating context, not another approval layer.
   Evidence belongs to its actual boundary → preserve UNKNOWN rather than turn
   model output, controller completion or a retrospective measurement into task
   success or a measured historical cause. The receipts below already hold details.
+- **Reusing a historical ROS launch omitted object-scoped gripper settings.**
+  The September 13 scoped return reached the existing settings gate and rejected
+  before learned capture/dispatch: environment defaults used close force 50 and
+  open speed 20, whereas the qualified 24mm profile requires 20 and 10 → launch
+  provenance includes current object settings, not just library hashes → reuse
+  the existing `_runtime_gripper_settings` resolver when bringing up the selected
+  stack. Do not change the grasp profile or weaken its equality check.
 
 ### Volatile checkpoint — refresh, do not inherit as authority
 
@@ -63,6 +70,49 @@ than inheriting old PID, free-memory or usage-limit screens. Preserve unrelated
 dirty files. Thin natural use is closed; its receipts below are provenance, not
 a reason to resume Router maintenance. No new tests or session simulation were
 created for this documentation-only bootstrap.
+
+## September 13 resumed scoped native consumer — actual progress and limit
+
+Main `d9015aa` was pushed before these attempts. Both used the existing normal
+`LEARNED_RUN` operator start intent, original12k saved native processors, sole
+PickupExecutor and unchanged physical gates. The fresh task grant was bounded
+to ten policy outputs with a ten-minute wall deadline and 90s terminal reserve;
+this is an attempt budget, not a new quality threshold. No archived proposal or
+personal exact-plan verdict supplied execution authority.
+
+- `learned-scoped-return-20260913-r1`: object-setting launch omission described
+  above; `GRIPPER_SETTINGS_MISMATCH` before learned capture/dispatch. Both camera
+  warmups passed. The request, terminal Web view and run artifacts remain local.
+- `learned-scoped-return-20260913-r2`: the existing gripper-settings resolver
+  supplied close velocity/force20/20 and open velocity/force10/50; actual ROS
+  readback matched. New wire-v5 instance passed10.001s readiness with4,005 samples
+  and1,000 source-progress observations. Native live inference took153.664ms;
+  oldest observation at completion was239.675ms. The v2 proposal passed plan
+  admission and recorder readiness, then execution admission returned
+  `LEARNED_STALE_STATE`: execute goal count0, recorder goal count1,14 retained
+  diagnostic rows. No dataset episode was admitted; physical Pick remains UNKNOWN.
+
+The retained r2 plan digest is
+`sha256:9faacb7f17498d85bd14c40eb608ef7c50fca5f42581a36c51622784cc520a74`;
+proposal digest is
+`sha256:de17a75ae027f28f89424e0e61b0fd3e9af477a47aa50b426bdd344f6f14c87d`.
+The server-derived red→blue instruction binding is present in preapproval.
+Evidence lives under `outputs/data_factory/runs/learned-scoped-return-20260913-r2`
+and `.agent-local/work/lerobot-fr5/scoped-return-20260913-r2-view-9.json`.
+These local artifacts are excluded from Git; this checkpoint is not a public
+video or a claim of complete rollout→recollection utility.
+
+The failing execute snapshot was not retained, so which timestamp triggered its
+rejection is UNKNOWN. A later read-only probe with the live transport options
+and current policy showed, after0.8s without spinning callbacks, a snapshot
+whose controller source ages were92.26/92.21ms while receipt ages were0.24/0.07ms;
+that sample passed. The next probe snapshot rejected `LEARNED_HARDWARE_STALE`.
+This is new acquisition-path evidence, not reconstruction of the original failure.
+The retained follow-up is `scoped-return-snapshot-followup-live-options.json` in
+the same local work directory. The existing Rollout owner has a bounded source/CPU
+follow-up; root keeps hardware ownership. Model/operator processes exited and
+released GPU after the terminal result. Do not restart a policy attempt merely
+because an old grant or process identifier exists.
 
 ## September 13 bounded close of Thin natural use
 

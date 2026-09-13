@@ -34,6 +34,12 @@ bounded continuity question only; learned task success remains unproven.
 - [ ] Use a fresh qualified runtime and fresh run/grant/Scene binding for the
   next bounded learned Pick, mechanical release/reset and canonical diagnosis;
   consume its original-condition recommendation through existing Collection.
+  September13 r2 now passes native generation, plan admission and recorder
+  readiness (153.664ms inference,239.675ms oldest observation), but execute
+  admission rejects `LEARNED_STALE_STATE` before any goal.14 diagnostic rows
+  retained, no admitted episode or task success. Resolve the actual snapshot
+  acquisition/consumption boundary; source/receipt age divergence was observed
+  in a later read-only probe, not proven as the original rejection's cause.
 - [x] Connect completed scoped-attempt/mechanical-terminal lineage to explicit
   original-condition validation advice without human FAIL fabrication. Focused
   software tests cover recommendation rejection/legacy compatibility and the
