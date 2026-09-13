@@ -386,3 +386,42 @@ results. A later joint support/defect plot is useful only if it represents real
 matched observations. Preserve source/data/model/split/noise provenance so the
 same evidence can be reinterpreted as the product evolves without rebuilding a
 parallel presentation dataset or claiming unmeasured runtime benefit.
+
+### First bounded S/D evidence — September 13
+
+One original rhythm40/12k native model run completed in **87.252s**, including
+68.539s loading, with 1,120 actual solver NFE and 32 additional image-encoder
+calls. Peak RSS was 3,801,014,272 bytes and CUDA allocator peak 995,901,440 bytes.
+The process exited zero and released the exclusive GPU allocation. No training,
+live observation or robot command occurred. The first cohort was one q=.5
+observation from TRAIN 2,3,10,11,18,19,26,27 and EVAL 32–39; q is time fraction,
+not semantic phase. Saved native inputs/processors/noise remained unchanged;
+fixed10 reproduced all retained 8×50×7 physical outputs exactly.
+
+- **S: descriptive only, utility inconclusive.** Sampled-TRAIN and EVAL median
+  visual distances were .21543 and .22100 with broad overlap. Only 8/32 TRAIN
+  episodes were represented; leave-one-episode-out TRAIN queries had three
+  same-instruction neighbors versus four for EVAL. This is not a calibrated
+  support threshold or a clean physical-strata separation. Retain counterexamples
+  and visual/XY/yaw/task confounding instead of promoting a favorable correlation.
+- **D: reference unresolved, utility inconclusive.** E40–E80 residual was
+  11.68–14.10% of E5–E80 discrepancy; none passed the predeclared 10% engineering
+  screen. That screen is not a universal convergence bound or physical gate,
+  and the near miss does not prove D invalid. The defect probe costs ten NFE,
+  including five extra probes; bare fixed10 also costs ten and was closer to
+  E80 in all eight observations. No immediate compute-efficiency win follows.
+- **Interpretation counterexample:** near-constant J5 contributed 32.56% of the
+  normalized E5–E80 squared discrepancy but only 3.88e-6 degrees physical RMS.
+  Normalized numerical discrepancy is not physical importance. Do not silently
+  retune axis weights or turn this observation into a new admission condition.
+
+End this resource round: no scheduler, support veto, E160, larger estimator or
+automatic extra run. These scoped results neither qualify nor block product
+rollout. Subsequent integration needs new utility evidence, not more research
+infrastructure. Existing local `sd-preparation-20260913/{results.md,summary.json}`
+retains per-episode values, counterexamples and stdlib postprocessing checks;
+the frozen raw JSONL SHA-256 is
+`9621ff1e7d94e1495a66f68a5336870c33b8923188e8c1e711d5629454e24b18`.
+Those files are under `.agent-local/work/lerobot-fr5/`, not public Git assets.
+Portfolio may present this as inexpensive hypothesis discrimination alongside
+the working data-engine path, not an adaptive-inference performance result.
