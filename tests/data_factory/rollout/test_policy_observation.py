@@ -121,6 +121,20 @@ class PolicyObservationTest(unittest.TestCase):
         stream.close.assert_called_once()
         self.assertEqual(job.execution_evidence, {"actual_owner_event": "unchanged"})
 
+    def test_malformed_observation_retry_preserves_schema_rejection(self):
+        job, executor, transport, stream, run, topics = self.task_observer()
+        request = {"schema_version": "fr5.pickup_executor.command.v4", "op_id": "malformed",
+                   "op": "observe_policy", "payload": {
+                       "run_id": job.run_id, "plan_digest": job.plan_digest,
+                       "camera_topics": topics, "max_observation_age_s": .3}}
+        for _ in range(2):
+            response = executor.process(request)
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["code"], "LEARNED_OBSERVATION_SCHEMA")
+            self.assertIsNone(response["data"])
+        transport.poll_active.assert_not_called()
+        transport.policy_observation_stream.assert_not_called()
+
     def test_transport_observation_pump_does_not_wait_for_motion_completion(self):
         transport = object.__new__(RosMoveItTransport)
         transport.node = object()

@@ -467,6 +467,8 @@ class PickupExecutor:
         return copy.deepcopy(snapshot)
 
     def _policy_observation_owner(self, payload):
+        fields = {"run_id", "plan_digest", "lease_id", "camera_topics", "max_observation_age_s"}
+        _exact(payload, fields, "LEARNED_OBSERVATION_SCHEMA")
         run = self._bound(payload)
         if (self.motion_only_binding_digest is not None or "task_grant" not in run
                 or "mechanical_terminal" in run
@@ -489,8 +491,7 @@ class PickupExecutor:
         change Scene/evidence authority. Initial absence is a pending sample,
         not a physical failure or a fabricated fresh observation.
         """
-        fields = {"run_id", "plan_digest", "lease_id", "camera_topics", "max_observation_age_s"}
-        run = self._policy_observation_owner(_exact(payload, fields, "LEARNED_OBSERVATION_SCHEMA"))
+        run = self._policy_observation_owner(payload)
         from tools.data_factory.rollout.finite_plan import _number, check_freshness
         proposal = run["plan"]["learned_proposal"]
         age = _number(payload["max_observation_age_s"], "LEARNED_SOURCE_CLOCK")
