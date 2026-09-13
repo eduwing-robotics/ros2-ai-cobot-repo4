@@ -17,6 +17,13 @@ terminal evidence and missing-contact diagnostics. Scene remains UNKNOWN when
 landing is not physically observed; expected MoveIt world geometry does not assert
 an observed slot, Pick success, learned Place success, or training authority.
 
+The existing canonical diagnostic builder validates and projects mechanical
+terminal evidence, unavailable-contact diagnostics and retained task handoff
+metadata before computing the diagnostic digest. The live caller only persists
+the unchanged lifecycle source. Web and Collection consumers reconstruct that
+same diagnostic and retain strict equality/digest checks; neither consumer drops
+mechanical fields to accept a response.
+
 Native scene services retain floor/wall geometry, attach one object to
 `gripper_link` with only `finger_tip_right_link` and `finger_tip_left_link` as
 explicit touch links, check collision/readback, and detach at measured FK into an
@@ -54,3 +61,18 @@ stale contact, darkness, changed source scope, scene readback mismatch, revocati
 during freeze, incorrect partial-open feedback, and hardware incarnation change.
 No ROS node, robot, camera, model, GPU, installation, original dataset mutation,
 or live qualification is used by these fixtures.
+
+`MechanicalDiagnosticConsumerTests` exercises the real diagnostic producer,
+temporary lifecycle persistence, Web result consumption and Collection analysis
+binding for unchanged, unavailable-contact, terminal and handoff results. It also
+checks changed lifecycle and malformed/foreign terminal rejection. Its minimal
+terminal serialization is a software consumer fixture, not physical evidence.
+
+The diagnostic correction's focused regression changed from six failing subcases
+to two passing tests. Full discovery ran 1,368 tests with three skips and two
+failures in `ObjectPositionContinuityTests` (return and unknown-return scenarios,
+`PHYSICAL_CONSOLE_RESOLVED_JOB`). Both failures also reproduce when the two changed
+production modules are loaded from main `3811f9d` in the same environment. The
+full suite is therefore recorded as FAIL, with no new failure demonstrated by
+this comparison; the independent object-position issue remains outside this
+diagnostic correction. These software results do not discharge physical acceptance.

@@ -37,7 +37,7 @@ from tools.data_factory.operator.workflow.application import (
 from tools.data_factory.operator.catalog import load_operator_catalog
 from tools.data_factory.operator.web import projection
 from tools.fr5_data_factory import ContractError, canonical_digest
-from .operator.fixtures import draft as campaign_draft, hypothesis, motion
+from .operator.fixtures import draft as campaign_draft, hypothesis, motion, payload
 
 
 COMMIT = "f0f380979d24711acca22e8e53da1e7985e0d7ad"
@@ -692,6 +692,111 @@ def learned_lifecycle(fixture, order=1, *, completed=False, reviewed=False):
         })
     build_run_diagnostic(result)
     return result
+
+
+class MechanicalDiagnosticConsumerTests(unittest.TestCase):
+    def lifecycle(self, kind):
+        from tools.data_factory.motion.mechanical_terminal import PHASES
+        result = learned_lifecycle(RecommendationFixture(), order=0, reviewed=True)
+        if kind == "contact":
+            result["execution_evidence"]["mechanical_contact_diagnostic"] = {
+                "status": "BLOCKED_UNAVAILABLE", "code": "MECHANICAL_CONTACT_UNAVAILABLE",
+            }
+        elif kind == "terminal":
+            parent = result["plan_envelope"]["plan"]
+            # Minimal validator-accepted serialization, not physical qualification.
+            terminal = redigest({
+                "parent_plan_digest": digest(parent),
+                "source_program_digest": digest(parent["learned_source_program"]),
+                "control_source": "QUALIFIED_MECHANICAL_RELEASE",
+                "recording_scope": "OUT_OF_DATASET", "semantic_success": "NOT_MEASURED",
+                "steps": [{"phase": phase} for phase in PHASES],
+            }, "terminal_digest")
+            result["execution_evidence"]["mechanical_terminal"] = {
+                "plan": terminal, "status": "COMPLETED", "terminal_phases": list(PHASES),
+            }
+        elif kind == "handoff":
+            result["task_handoff"] = {"status": "BLOCKED_UNAVAILABLE"}
+        return result
+
+    def test_retained_mechanical_diagnostic_reaches_operator_and_collection(self):
+        from tools.data_factory.collection_recommendation import _analysis_ref
+        from tools.data_factory.operator.workflow.learned_run import LearnedRunApplication
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        for kind in ("baseline", "contact", "terminal", "handoff"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                lifecycle = self.lifecycle(kind)
+                before = copy.deepcopy(lifecycle)
+                request = payload("live")
+                request.update(run_id=lifecycle["run_id"], run_root=str(root),
+                    dataset_root=str(root / "unused-dataset"),
+                    learned_checkpoint=str(root / "unused-checkpoint"),
+                    gripper_source_clock="SYSTEM_TIME")
+                request["job"]["operator_or_agent_id"] = "fixture-operator"
+                (root / lifecycle["run_id"]).mkdir()
+                def producer(value, *_args, **_kwargs):
+                    return run_job._response(ok=False, code=lifecycle["code"],
+                        state=lifecycle["state"], run_id=lifecycle["run_id"],
+                        plan_digest=lifecycle["plan_digest"],
+                        data=run_job.learned_run_diagnostic(lifecycle, payload=value))
+                app = LearnedRunApplication(payload=request, operator_label="fixture-operator",
+                                            run_live_call=producer)
+                app._run()
+                self.assertIsNone(app.error)
+                self.assertEqual(app.lifecycle_result, lifecycle)
+                self.assertEqual(lifecycle, before)
+                saved_path = root / lifecycle["run_id"] / "learned_lifecycle_result.json"
+                saved_bytes = saved_path.read_bytes()
+                self.assertEqual(json.loads(saved_bytes), lifecycle)
+                diagnostic = app.result["data"]
+                self.assertEqual(diagnostic, build_run_diagnostic(lifecycle))
+                self.assertEqual(diagnostic["diagnostic_digest"], digest({
+                    k: v for k, v in diagnostic.items() if k != "diagnostic_digest"}))
+                for field in ("mechanical_terminal", "mechanical_contact_diagnostic"):
+                    self.assertEqual(diagnostic.get(field), lifecycle["execution_evidence"].get(field))
+                self.assertEqual(diagnostic.get("task_handoff"), lifecycle.get("task_handoff"))
+                ref = {"availability": "AVAILABLE", "schema_version": diagnostic["schema_version"],
+                       "analysis_id": diagnostic["run_id"], "analysis_digest": digest(diagnostic),
+                       "reason_codes": []}
+                self.assertEqual(_analysis_ref(ref, owner="rollout", artifact=lifecycle,
+                                               normalize=False), ref)
+                changed = copy.deepcopy(lifecycle)
+                changed["code"] = "CHANGED"
+                with self.assertRaisesRegex(ContractError, "COLLECTION_RECOMMENDATION_ANALYSIS_DIGEST"):
+                    _analysis_ref(ref, owner="rollout", artifact=changed, normalize=False)
+                # Strict operator equality still rejects a changed retained source.
+                saved_path.write_text(json.dumps(changed))
+                response = copy.deepcopy(app.result)
+                tampered = LearnedRunApplication(payload=request, operator_label="fixture-operator",
+                    run_live_call=lambda *_args, **_kwargs: response)
+                tampered._run()
+                self.assertEqual(tampered.error, "LEARNED_WEB_RESULT_CHANGED")
+                self.assertIsNone(tampered.lifecycle_result)
+                self.assertEqual(diagnostic["task_effectiveness"], "UNKNOWN")
+                self.assertEqual(diagnostic["physical_qualification"], "UNKNOWN")
+                self.assertFalse(diagnostic["training_authorized"])
+                self.assertFalse((root / "unused-dataset").exists())
+
+    def test_malformed_terminal_rejected_by_canonical_builder_before_persistence(self):
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        for kind in ("missing_plan", "changed_parent", "changed_digest"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                lifecycle = self.lifecycle("terminal")
+                terminal = lifecycle["execution_evidence"]["mechanical_terminal"]
+                if kind == "missing_plan":
+                    terminal.pop("plan")
+                elif kind == "changed_parent":
+                    terminal["plan"]["parent_plan_digest"] = digest("foreign")
+                    redigest(terminal["plan"], "terminal_digest")
+                else:
+                    terminal["plan"]["terminal_digest"] = digest("changed")
+                with self.assertRaisesRegex(ContractError, "MECHANICAL_TERMINAL_BINDING"):
+                    build_run_diagnostic(lifecycle)
+                with self.assertRaisesRegex(ContractError, "MECHANICAL_TERMINAL_BINDING"):
+                    run_job.learned_run_diagnostic(lifecycle,
+                        payload={"run_id": lifecycle["run_id"], "run_root": directory})
+                self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 class RolloutRecommendationTests(unittest.TestCase):

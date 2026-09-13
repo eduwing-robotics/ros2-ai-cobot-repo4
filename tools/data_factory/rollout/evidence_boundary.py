@@ -480,5 +480,13 @@ def build_run_diagnostic(lifecycle_result: Mapping[str, Any]) -> dict[str, Any]:
     }
     if history:
         diagnostic["execution_history"] = history
+    evidence = result["execution_evidence"]
+    if "mechanical_terminal" in evidence:
+        from tools.data_factory.motion.mechanical_terminal import validate_terminal_evidence
+        diagnostic["mechanical_terminal"] = validate_terminal_evidence(evidence["mechanical_terminal"], plan)
+    elif "mechanical_contact_diagnostic" in evidence:
+        diagnostic["mechanical_contact_diagnostic"] = copy.deepcopy(evidence["mechanical_contact_diagnostic"])
+    if "task_handoff" in result:
+        diagnostic["task_handoff"] = copy.deepcopy(result["task_handoff"])
     diagnostic["diagnostic_digest"] = canonical_digest(diagnostic)
     return diagnostic
