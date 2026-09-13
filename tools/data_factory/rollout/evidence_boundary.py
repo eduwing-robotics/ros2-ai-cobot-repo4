@@ -466,7 +466,9 @@ def build_run_diagnostic(lifecycle_result: Mapping[str, Any]) -> dict[str, Any]:
         if native:
             plan = validate_stream_plan(plan)
             if (result.get("scene_binding", plan["scene_binding"]) != plan["scene_binding"]
-                    or recorder.get("run_id", result["run_id"]) != result["run_id"]):
+                    or recorder.get("run_id") != result["run_id"]
+                    or not isinstance(recorder.get("transaction_id"), str)
+                    or not recorder["transaction_id"].strip()):
                 raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
             if evidence is not None and not isinstance(evidence, dict):
                 raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
