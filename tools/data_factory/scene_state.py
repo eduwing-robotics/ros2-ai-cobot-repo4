@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import fcntl
 import json
@@ -213,6 +214,120 @@ class SceneStateStore:
 
     def _path(self, *, create: bool = False) -> Path:
         return self._cell.runtime_path("scene_state.json", create_robot=create)
+
+    def recover_initial_contact_rejection(
+        self, *, prior_confirmation: dict, lifecycle_result: dict,
+        preapproval_evidence: dict, expected_cell: dict,
+    ) -> dict:
+        """Correct the initial CONTACT_PROFILE_UNAVAILABLE bookkeeping fault.
+
+        Trusted retained executor evidence, not a public operator assertion.
+        Caller must have ended the lifecycle owner and frozen its retained
+        inputs; this is not recovery concurrent with a live executor or writer.
+        The source-bound prepare failure precedes the first start_phase call;
+        empty traces or zero gripper generations alone never establish this.
+        This preserves an old observation, not a new human acknowledgement.
+        """
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        code = "SCENE_NO_DISPATCH_RECOVERY"
+        failure = "CONTACT_PROFILE_UNAVAILABLE"
+        prior_confirmation, result, preapproval, expected_cell = copy.deepcopy(
+            (prior_confirmation, lifecycle_result, preapproval_evidence, expected_cell))
+        try:
+            diagnostic = build_run_diagnostic(result)
+            plan = result["plan_envelope"]["plan"]
+            evidence = result["execution_evidence"]
+            trace = diagnostic["execution_trace"]
+            binding = validate_scene_binding(plan["scene_binding"])
+            prior = _validate(prior_confirmation["after_scene"]["scene_state"], self.robot_system_id)
+            prior_cell = self._cell._validate(prior_confirmation["after_cell"])
+            failed = _validate(evidence["scene_transition"]["scene_state"], self.robot_system_id)
+            self._cell._validate(expected_cell)
+            item = prior["objects"][binding["object_instance_id"]]
+            initial = plan["steps"][0]["initial_hardware_binding"]
+            hardware = evidence["snapshot"]["gripper_controller"]["hardware_execution"]
+            wire = hardware["wire"]
+            generation = plan["learned_proposal"]["generation_context"]
+            if (result["code"] != failure or evidence["failure_code"] != failure
+                    or result["state"] != "ABORTED" or result["executor_state"] != "BLOCKED"
+                    or result.get("cancel_error") is not None or evidence.get("cancel_error") is not None
+                    or evidence["step_index"] != 0 or evidence.get("learned_history", []) != []
+                    or "mechanical_terminal" in evidence or "task_handoff" in evidence or "task_handoff" in result
+                    or evidence["prospective_contact"] != {"status": "UNAVAILABLE", "code": failure}
+                    or trace["status"] != "FAILED" or trace["failure_code"] != failure
+                    or trace.get("segments", []) != [] or trace["terminal_phases"] != []
+                    or trace["terminal_state"] is not None
+                    or generation["predecessor_plan_digest"] is not None
+                    or plan["robot_system_id"] != self.robot_system_id
+                    or result["scene_binding"] != binding or "source_slot" in binding
+                    or preapproval["run_id"] != result["run_id"]
+                    or preapproval["plan_digest"] != result["plan_digest"]
+                    or preapproval["plan_envelope"]["plan"] != plan
+                    or preapproval["plan_envelope_digest"] != canonical_digest(preapproval["plan_envelope"])
+                    or prior_confirmation["after_scene"]["scene_state_digest"] != canonical_digest(prior)
+                    or binding["scene_state_digest"] != canonical_digest(prior)
+                    or binding["revision"] != prior["revision"]
+                    or item["state"] != "ON_SURFACE" or item["source"] != "HUMAN"
+                    or not prior_cell["cell_ready"] or prior_cell["reason_code"] != "HUMAN_ACKNOWLEDGED"
+                    or expected_cell["cell_ready"] or expected_cell["reason_code"] != failure
+                    or expected_cell["run_id"] != result["run_id"]
+                    or expected_cell["plan_digest"] != result["plan_digest"]
+                    or evidence["scene_transition"]["scene_state_digest"] != canonical_digest(failed)
+                    or wire["version"] != 5 or initial["generation"] != 0
+                    or [wire[f"incarnation_{i}"] for i in range(4)] != initial["incarnation"]
+                    or hardware["clock_binding"] != plan["learned_proposal"]["runtime_inputs"]["clock_binding"]
+                    or any(wire[key] != 0 for key in ("generation", "active_generation", "completed_generation",
+                           "selected_generation", "selected_valid", "error", "device_main_error", "device_sub_error"))):
+                raise ContractError(code)
+            # Only the executor's exact UNKNOWN write may have changed Scene.
+            expected_failed = copy.deepcopy(prior)
+            stamp = failed["updated_at"]
+            expected_failed.update(revision=prior["revision"] + 1, updated_at=stamp)
+            expected_failed["objects"][item["instance_id"]] = {
+                **item, "state": "UNKNOWN", "pose": None, "source": "ROBOT_ACTION",
+                "updated_by": "pickup-executor", "updated_at": stamp,
+            }
+            phase_path = Path(evidence["phase_events_path"])
+            if (failed != expected_failed or phase_path.name != "phase_events.jsonl"
+                    or phase_path.parent.name != result["run_id"] or phase_path.read_bytes() != b""):
+                raise ContractError(code)
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise ContractError(code) from exc
+
+        # Same Scene -> Cell lock order as update_object. Publish the receipt
+        # before either correction, and readiness last: partial I/O fails closed.
+        scene_fd = os.open(self._cell.runtime_path("scene_state.lock", create_robot=True), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        cell_fd = None
+        try:
+            self._flock(scene_fd, False)
+            cell_fd = os.open(self._cell.runtime_path("state.lock", create_robot=True), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            self._flock(cell_fd, False)
+            if self.read() != failed or self._cell.read() != expected_cell:
+                raise ContractError("STATE_CHANGED")
+            receipt_path = self._cell.runtime_path(f"no_dispatch_recovery-{result['run_id']}.json")
+            if receipt_path.exists():
+                raise ContractError("SCENE_RECOVERY_ALREADY_RETAINED")
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            restored = {**prior, "revision": failed["revision"] + 1, "updated_at": now}
+            ready = {**prior_cell, "reason_code": "NO_DISPATCH_CONTINUITY", "updated_at": now,
+                     "run_id": result["run_id"], "plan_digest": result["plan_digest"]}
+            receipt = {"schema_version": "data_factory.no_dispatch_recovery.v1",
+                       "basis": "INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE",
+                       "prior_confirmation_digest": canonical_digest(prior_confirmation),
+                       "lifecycle_result_digest": diagnostic["lifecycle_result_digest"],
+                       "preapproval_evidence_digest": canonical_digest(preapproval),
+                       "before_scene": failed, "before_cell": expected_cell,
+                       "after_scene": restored, "after_cell": ready,
+                       "new_human_confirmation": False, "execution_authorized": False}
+            receipt["receipt_digest"] = canonical_digest(receipt)
+            write_json_atomic(receipt_path, receipt)
+            write_json_atomic(self._path(create=True), _validate(restored, self.robot_system_id))
+            write_json_atomic(self._cell.runtime_path("state.json", create_robot=True), self._cell._validate(ready))
+            return receipt
+        finally:
+            if cell_fd is not None:
+                os.close(cell_fd)
+            os.close(scene_fd)
 
     def read(self) -> dict:
         path = self._path()

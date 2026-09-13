@@ -1,16 +1,105 @@
 import io
+import copy
 import json
 import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from tools.data_factory import scene_state
 from tools.fr5_data_factory import ContractError, canonical_digest
 
 
 class SceneStateTest(unittest.TestCase):
+    def test_initial_contact_recovery_preserves_observation_and_rejects_changed_evidence(self):
+        # Synthetic store transaction tests; canonical lifecycle validation is
+        # a separate existing boundary, explicitly substituted in this fixture.
+        for fault in (None, "cell", "scene", "prior_pose", "other_failure", "dispatched",
+                      "history", "predecessor", "selected", "incarnation", "phase",
+                      "preapproval", "canonical", "receipt_io", "scene_io", "cell_io"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                store = scene_state.SceneStateStore(directory, "fr5-lab-a")
+                initial = store.update_object(instance_id="cube", object_profile_id="cube-24mm",
+                    state="ON_SURFACE", source="HUMAN", updated_by="original-operator",
+                    pose={"place_id":"PLACE_A", "yaw_deg":0, "x_mm":10, "y_mm":20})
+                prior_cell = store._cell.acknowledge_ready("original-operator")
+                confirmation = {"after_scene":initial, "after_cell":prior_cell}
+                binding = {"scene_state_digest":initial["scene_state_digest"],
+                           "revision":initial["scene_state"]["revision"], "object_instance_id":"cube"}
+                clock = {"schema_version":"fr5.gripper_temporal_policy.v2", "incarnation":[1,2,3,4]}
+                plan = {"run_id":"synthetic-contact-rejection", "robot_system_id":"fr5-lab-a",
+                        "scene_binding":binding, "steps":[{"initial_hardware_binding":{"generation":0,"incarnation":[1,2,3,4]}}],
+                        "learned_proposal":{"generation_context":{"predecessor_plan_digest":None},
+                                            "runtime_inputs":{"clock_binding":clock}}}
+                envelope = {"plan":plan}
+                preapproval = {"run_id":plan["run_id"], "plan_digest":canonical_digest(plan),
+                    "plan_envelope":envelope, "plan_envelope_digest":canonical_digest(envelope)}
+                phase = Path(directory) / plan["run_id"] / "phase_events.jsonl"
+                phase.parent.mkdir()
+                phase.write_bytes(b"")
+                failed = store.update_object(instance_id="cube", object_profile_id="cube-24mm",
+                    state="UNKNOWN", source="ROBOT_ACTION", updated_by="pickup-executor")
+                cell = store._cell.mark_blocked("CONTACT_PROFILE_UNAVAILABLE", plan["run_id"], canonical_digest(plan))
+                wire = dict.fromkeys(("generation", "active_generation", "completed_generation", "selected_generation",
+                                      "selected_valid", "error", "device_main_error", "device_sub_error"), 0)
+                wire.update(version=5, **{f"incarnation_{i}":i+1 for i in range(4)})
+                trace = {"status":"FAILED", "failure_code":"CONTACT_PROFILE_UNAVAILABLE", "segments":[],
+                         "terminal_phases":[], "terminal_state":None}
+                result = {"run_id":plan["run_id"], "plan_digest":canonical_digest(plan), "plan_envelope":envelope,
+                    "scene_binding":binding, "code":"CONTACT_PROFILE_UNAVAILABLE", "state":"ABORTED", "executor_state":"BLOCKED",
+                    "execution_evidence":{"failure_code":"CONTACT_PROFILE_UNAVAILABLE", "step_index":0,
+                        "prospective_contact":{"status":"UNAVAILABLE", "code":"CONTACT_PROFILE_UNAVAILABLE"},
+                        "scene_transition":failed, "phase_events_path":str(phase),
+                        "snapshot":{"gripper_controller":{"hardware_execution":{"wire":wire,"clock_binding":clock}}}}}
+                if fault == "cell": store._cell.mark_blocked("OTHER_OWNER", "other", canonical_digest("other"))
+                if fault == "scene": store.update_object(instance_id="cube", object_profile_id="cube-24mm", state="UNKNOWN", source="HUMAN", updated_by="other")
+                if fault == "prior_pose": confirmation["after_scene"]["scene_state"]["objects"]["cube"]["pose"]["x_mm"] = 99
+                if fault == "other_failure": result["code"] = "CANCEL_UNCONFIRMED"
+                if fault == "dispatched": result["execution_evidence"]["step_index"] = 1
+                if fault == "history": result["execution_evidence"]["learned_history"] = [{}]
+                if fault == "predecessor": plan["learned_proposal"]["generation_context"]["predecessor_plan_digest"] = canonical_digest("prior")
+                if fault == "selected": wire["selected_valid"] = 1
+                if fault == "incarnation": wire["incarnation_0"] = 99
+                if fault == "phase": phase.write_text('{"event":"DISPATCH_REQUESTED"}\n')
+                if fault == "preapproval": preapproval["plan_digest"] = canonical_digest("other")
+                before_scene, before_cell = copy.deepcopy(store.read()), store._cell.read()
+                original_observation = copy.deepcopy(initial["scene_state"]["objects"]["cube"])
+                writes = []
+                real_write = scene_state.write_json_atomic
+                def write(path, value):
+                    writes.append(Path(path).name)
+                    if fault == {1:"receipt_io",2:"scene_io",3:"cell_io"}.get(len(writes)):
+                        raise OSError("synthetic write failure")
+                    return real_write(path, value)
+                diagnostic = {"execution_trace":trace, "lifecycle_result_digest":canonical_digest(result)}
+                with mock.patch("tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
+                                side_effect=ContractError("SYNTHETIC_CANONICAL_REJECTION") if fault == "canonical" else None,
+                                return_value=diagnostic) as canonical, mock.patch.object(scene_state, "write_json_atomic", side_effect=write):
+                    if fault is not None:
+                        with self.assertRaises((ContractError, OSError)):
+                            store.recover_initial_contact_rejection(prior_confirmation=confirmation,
+                                lifecycle_result=result, preapproval_evidence=preapproval, expected_cell=cell)
+                        self.assertEqual(store._cell.read(), before_cell)
+                        if fault != "cell_io": self.assertEqual(store.read(), before_scene)
+                    else:
+                        receipt = store.recover_initial_contact_rejection(prior_confirmation=confirmation,
+                            lifecycle_result=result, preapproval_evidence=preapproval, expected_cell=cell)
+                        self.assertEqual(store.read()["objects"]["cube"], original_observation)
+                        self.assertEqual(store.read()["revision"], before_scene["revision"] + 1)
+                        self.assertEqual(store._cell.read()["reason_code"], "NO_DISPATCH_CONTINUITY")
+                        self.assertEqual(store._cell.read()["acknowledged_by"], "original-operator")
+                        self.assertTrue(store._cell.read()["cell_ready"])
+                        self.assertFalse(receipt["new_human_confirmation"])
+                        self.assertFalse(receipt["execution_authorized"])
+                        self.assertEqual(json.loads(store._cell.runtime_path(writes[0]).read_text()), receipt)
+                        self.assertEqual(writes[1:], ["scene_state.json", "state.json"])
+                        with self.assertRaises(ContractError):
+                            store.recover_initial_contact_rejection(prior_confirmation=confirmation,
+                                lifecycle_result=result, preapproval_evidence=preapproval, expected_cell=cell)
+                    canonical.assert_called()
+
     def test_native_motion_only_release_vacates_source_under_parent_cell_owner(self):
         from datetime import datetime, timezone
         from tools.data_factory.cell_state import CellStateStore

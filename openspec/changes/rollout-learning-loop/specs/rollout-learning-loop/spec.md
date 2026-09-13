@@ -1304,6 +1304,14 @@ policy, plan or condition lineage.
 
 ### Requirement: Robot-model replacement preserves historical learning coordinates
 
+A stopped initial `CONTACT_PROFILE_UNAVAILABLE` attempt may correct its exact
+erroneous UNKNOWN Scene write using retained canonical failure, preapproval and
+original observation evidence proving failure before the first dispatch. The
+correction SHALL preserve the original observation provenance, CAS the exact
+failed Scene/Cell, retain a correction receipt and restore readiness last. It
+SHALL NOT fabricate fresh human confirmation, apply to ambiguous or dispatched
+attempts, or replace the next run's current hardware/Scene/plan admission.
+
 A correction to robot geometry SHALL distinguish the model used for collision
 checking from the controller-reference and measured-feedback coordinates stored
 in learning data. A geometry-only replacement SHALL preserve joint order, units,
