@@ -769,13 +769,15 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
             result["task_handoff"] = {"status": "BLOCKED_UNAVAILABLE"}
         elif kind == "legacy_null_handoff":
             result["task_handoff"] = None
+        elif kind == "generation_cleanup":
+            result["generation_cleanup"] = {"status": "UNCONFIRMED", "code": "JSONL_BROKEN_PIPE"}
         return result
 
     def test_retained_mechanical_diagnostic_reaches_operator_and_collection(self):
         from tools.data_factory.collection_recommendation import _analysis_ref
         from tools.data_factory.operator.workflow.learned_run import LearnedRunApplication
         from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
-        for kind in ("baseline", "contact", "terminal", "handoff", "legacy_handoff", "legacy_null_handoff"):
+        for kind in ("baseline", "contact", "terminal", "handoff", "legacy_handoff", "legacy_null_handoff", "generation_cleanup"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 lifecycle = self.lifecycle(kind)
@@ -788,7 +790,8 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                 request["job"]["operator_or_agent_id"] = "fixture-operator"
                 (root / lifecycle["run_id"]).mkdir()
                 def producer(value, *_args, **_kwargs):
-                    return run_job._response(ok=False, code=lifecycle["code"],
+                    return run_job._response(ok=False,
+                        code="LEARNED_POLICY_FAILED" if kind == "generation_cleanup" else lifecycle["code"],
                         state=lifecycle["state"], run_id=lifecycle["run_id"],
                         plan_digest=lifecycle["plan_digest"],
                         data=run_job.learned_run_diagnostic(lifecycle, payload=value))
@@ -811,13 +814,21 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                     lifecycle["execution_evidence"].get("task_handoff", lifecycle.get("task_handoff")))
                 if kind == "legacy_null_handoff":
                     self.assertIn("task_handoff", diagnostic)
+                if kind == "generation_cleanup":
+                    self.assertEqual(app.result["code"], "LEARNED_POLICY_FAILED")
+                    self.assertEqual(diagnostic["generation_cleanup"], lifecycle["generation_cleanup"])
+                else:
+                    self.assertNotIn("generation_cleanup", diagnostic)
                 ref = {"availability": "AVAILABLE", "schema_version": diagnostic["schema_version"],
                        "analysis_id": diagnostic["run_id"], "analysis_digest": digest(diagnostic),
                        "reason_codes": []}
                 self.assertEqual(_analysis_ref(ref, owner="rollout", artifact=lifecycle,
                                                normalize=False), ref)
                 changed = copy.deepcopy(lifecycle)
-                changed["code"] = "CHANGED"
+                if kind == "generation_cleanup":
+                    changed["generation_cleanup"]["code"] = "CHANGED"
+                else:
+                    changed["code"] = "CHANGED"
                 with self.assertRaisesRegex(ContractError, "COLLECTION_RECOMMENDATION_ANALYSIS_DIGEST"):
                     _analysis_ref(ref, owner="rollout", artifact=changed, normalize=False)
                 # Strict operator equality still rejects a changed retained source.
@@ -832,6 +843,22 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                 self.assertEqual(diagnostic["physical_qualification"], "UNKNOWN")
                 self.assertFalse(diagnostic["training_authorized"])
                 self.assertFalse((root / "unused-dataset").exists())
+
+    def test_malformed_generation_cleanup_rejected_before_persistence(self):
+        for cleanup in (None, [], {}, {"status": "COMPLETED", "code": "OK"},
+                        {"status": "UNCONFIRMED", "code": ""},
+                        {"status": "UNCONFIRMED", "code": 1},
+                        {"status": "UNCONFIRMED", "code": "x" * 129},
+                        {"status": "UNCONFIRMED", "code": "ERROR", "stopped": True}):
+            with self.subTest(cleanup=cleanup), tempfile.TemporaryDirectory() as directory:
+                lifecycle = self.lifecycle("baseline")
+                lifecycle["generation_cleanup"] = cleanup
+                run_dir = Path(directory) / lifecycle["run_id"]
+                run_dir.mkdir()
+                with self.assertRaisesRegex(ContractError, "ROLLOUT_RUN_DIAGNOSTIC_CLEANUP"):
+                    run_job.learned_run_diagnostic(lifecycle,
+                        payload={"run_id": lifecycle["run_id"], "run_root": directory})
+                self.assertEqual(list(run_dir.iterdir()), [])
 
     def test_malformed_terminal_rejected_by_canonical_builder_before_persistence(self):
         from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic

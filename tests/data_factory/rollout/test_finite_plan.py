@@ -673,6 +673,13 @@ class FinitePlanTest(unittest.TestCase):
                     self.assertTrue(executor.runs["run"]["cancel_event"].is_set())
                     self.assertFalse(transport.owns_active_goal)
                     self.assertEqual(result["data"]["task_effectiveness"], "UNKNOWN")
+                    from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+                    retained = json.loads((Path(value["run_root"]) / "run" /
+                                           "learned_lifecycle_result.json").read_text())
+                    self.assertEqual(retained.get("generation_cleanup"), result["data"].get("generation_cleanup"))
+                    self.assertEqual(build_run_diagnostic(retained), result["data"])
+                    self.assertEqual(result["data"]["diagnostic_digest"], canonical_digest({
+                        k: v for k, v in result["data"].items() if k != "diagnostic_digest"}))
                 else:
                     self.assertFalse(any(target == "recorder" for target, _ in calls))
                 self.assertEqual(closed, [True])

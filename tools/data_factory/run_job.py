@@ -4950,9 +4950,11 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                     summary = _operator_summary(planned)
                 except Exception as exc:
                     cancelled = job.cancel()
-                    diagnostic = learned_run_diagnostic(cancelled, payload=payload)
                     if hasattr(exc, "generation_cleanup"):
-                        diagnostic = {**(diagnostic or {}), "generation_cleanup": exc.generation_cleanup}
+                        # Retain the earlier generation-cleanup attempt alongside
+                        # the sole owner's cancellation result, before projection.
+                        cancelled = {**cancelled, "generation_cleanup": exc.generation_cleanup}
+                    diagnostic = learned_run_diagnostic(cancelled, payload=payload)
                     return _response(ok=False, code=exc.code if isinstance(exc, ContractError) else "LEARNED_NEXT_PREPARATION_FAILED",
                         state=cancelled["state"], run_id=payload["run_id"], plan_digest=job.plan_digest,
                         data=diagnostic)

@@ -493,5 +493,14 @@ def build_run_diagnostic(lifecycle_result: Mapping[str, Any]) -> dict[str, Any]:
     if nested_handoff or legacy_handoff:
         diagnostic["task_handoff"] = copy.deepcopy(
             evidence["task_handoff"] if nested_handoff else result["task_handoff"])
+    if "generation_cleanup" in result:
+        cleanup = result["generation_cleanup"]
+        # One unconfirmed cleanup attempt is diagnostic metadata, not evidence
+        # of physical stop or a replacement for the lifecycle's disposition.
+        if (not isinstance(cleanup, dict) or set(cleanup) != {"status", "code"}
+                or cleanup["status"] != "UNCONFIRMED"
+                or not isinstance(cleanup["code"], str) or not 1 <= len(cleanup["code"]) <= 128):
+            raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_CLEANUP")
+        diagnostic["generation_cleanup"] = cleanup
     diagnostic["diagnostic_digest"] = canonical_digest(diagnostic)
     return diagnostic
