@@ -448,12 +448,15 @@ class NativeSmolVLA:
         fps,
         shutdown_event=None,
         queue_threshold=30,
+        max_observation_age_s=None,
     ):
         """Own one native asynchronous producer for a complete task.
 
         Yields ``(engine, queue, notify_observation)``. The callback accepts the
         same canonical FR5 observation as the one-shot API, while the engine
         retains LeRobot's preprocessing, inference loop, and queue merge.
+        An explicit max_observation_age_s qualifies native generations once at
+        host merge completion; it is not a dispatch TTL for their queued rows.
         """
         import numpy as np
         from types import SimpleNamespace
@@ -474,6 +477,9 @@ class NativeSmolVLA:
             or isinstance(queue_threshold, bool)
             or not isinstance(queue_threshold, int)
             or queue_threshold < 0
+            or max_observation_age_s is not None and (
+                not _finite_number(max_observation_age_s) or max_observation_age_s <= 0
+            )
         ):
             raise ContractError("LEARNED_TASK_INFERENCE_INPUT")
 
@@ -549,6 +555,7 @@ class NativeSmolVLA:
             )
             queue = start_with_acknowledged_queue(
                 engine, require_observation_provenance=True,
+                max_observation_age_s=max_observation_age_s,
             )
             # Native stop() clears its handle even when join times out. Retain
             # the actual thread now, including if the caller stops it early.

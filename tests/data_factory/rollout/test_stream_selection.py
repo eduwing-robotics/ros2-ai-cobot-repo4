@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 import torch
 from lerobot.policies.rtc import RTCConfig
@@ -48,6 +49,63 @@ class StreamSelectionTest(unittest.TestCase):
         self.queue = AcknowledgedActionQueue(
             RTCConfig(enabled=False), require_observation_provenance=True,
         )
+
+    def qualified_selection(self):
+        queue = AcknowledgedActionQueue(
+            RTCConfig(enabled=False), require_observation_provenance=True,
+            max_observation_age_s=.3,
+        )
+        queue._system_clock = mock.Mock(side_effect=[1.1, 1.2])
+        queue._steady_clock = mock.Mock(side_effect=[10., 10.1])
+        queue.get_action_index()
+        actions = torch.tensor([[.01] * 6 + [.01], [.02] * 6 + [.01]])
+        merge(queue, actions, actions)
+        snapshot = queue.snapshot()
+        return queue, snapshot, select_stream_revision(snapshot, robot_description=ROBOT)
+
+    def test_generation_receipt_binds_original_source_and_survives_dispatch_delay(self):
+        queue, snapshot, selection = self.qualified_selection()
+        self.assertEqual(selection["generation_eligibility"],
+                         snapshot.generation_eligibility[0].to_dict())
+        # Qualification replays original clocks; no fresh clock or per-row TTL.
+        with mock.patch("time.time", side_effect=AssertionError("not an input-age renewal")):
+            self.assertEqual(validate_stream_selection(
+                selection, robot_description=ROBOT, max_observation_age_s=.3), selection)
+            self.assertEqual(acknowledge_stream_selection(
+                queue, snapshot, selection, selected_count=1, robot_description=ROBOT), 1)
+        self.assertEqual(queue.qsize(), 1)
+
+    def test_generation_receipt_missing_or_rebound_cannot_enter_qualified_consumer(self):
+        _, _, original = self.qualified_selection()
+        for kind in ("missing", "chunk", "source", "bound", "stale", "clock", "eligible"):
+            with self.subTest(kind=kind):
+                selected = copy.deepcopy(original)
+                receipt = selected["generation_eligibility"]
+                if kind == "missing":
+                    del selected["generation_eligibility"]
+                else:
+                    if kind == "chunk": receipt["chunk_id"] += 1
+                    elif kind == "source": receipt["observation_digest"] = canonical_digest("other")
+                    elif kind == "bound": receipt["max_observation_age_s"] = 1.
+                    elif kind == "stale": receipt["merge_completed_at_s"] = 1.5
+                    elif kind == "clock": receipt["merge_completed_monotonic_s"] = 9.
+                    else: receipt["eligible"] = False
+                    receipt["receipt_digest"] = canonical_digest({
+                        k: v for k, v in receipt.items() if k != "receipt_digest"})
+                selected["selection_digest"] = canonical_digest({
+                    k: v for k, v in selected.items() if k != "selection_digest"})
+                with self.assertRaises(ContractError):
+                    validate_stream_selection(selected, robot_description=ROBOT,
+                                              max_observation_age_s=.3)
+
+    def test_partial_or_mixed_generation_receipts_do_not_select(self):
+        _, snapshot, _ = self.qualified_selection()
+        receipts = snapshot.generation_eligibility
+        for altered in (receipts[:1], (receipts[0], None)):
+            with self.subTest(receipts=altered):
+                with self.assertRaisesRegex(ContractError, "LEARNED_STREAM_GENERATION_BINDING"):
+                    select_stream_revision(replace(snapshot, generation_eligibility=altered),
+                                           robot_description=ROBOT)
 
     def test_json_validator_import_does_not_load_torch_or_lerobot(self):
         result = subprocess.run(

@@ -559,8 +559,15 @@ full-7D controller-reference progress may conditionally advance the unchanged
 native prefix. Queue mutation identity is not observation freshness. The transport
 exposes initialized cached state without discovery/RPC/spin waits for commit;
 initial task setup and historical Collection acquisition keep their own behavior.
-Normal caller/owner integration and once-per-output generation eligibility remain
-open. In particular, do not introduce a300ms dispatch TTL for every queued row:
+The native producer can now qualify each generation once using the existing
+explicit observation-age bound, its actual sampled input identity and host
+sampling-start/merge-completion clocks. The immutable receipt follows the native
+rows through selection and conditional ACK; rejected merges preserve the prior
+queue and native error path. Legacy source-only consumers remain metadata-only.
+This is host generation evidence, not CUDA synchronization or physical timing.
+The normal owner must require the configured bound when validating a selection;
+normal caller/owner commit integration remains open. In particular, do not
+introduce a300ms dispatch TTL for every queued row:
 an eligible horizon intentionally outlives acquisition, and rejecting its tail
 can prevent queue draining. No production controller lead time is inferred from
 that TTL or the policy period; physical timing still needs its own evidence.

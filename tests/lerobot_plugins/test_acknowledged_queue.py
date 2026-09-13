@@ -1,6 +1,7 @@
 """CPU-only checks for the LeRobot ActionQueue acknowledgment seam."""
 
 import unittest
+import json
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -8,6 +9,7 @@ import torch
 from lerobot.policies.rtc import ActionQueue, RTCConfig
 from lerobot_strategy_fr5.acknowledged_queue import (
     AcknowledgedActionQueue,
+    GenerationEligibility,
     ObservationProvenance,
     RawActionIndex,
 )
@@ -18,6 +20,153 @@ def actions(start: int, rows: int = 4) -> torch.Tensor:
 
 
 class AcknowledgedActionQueueTest(unittest.TestCase):
+    def eligible_queue(self):
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False),
+            require_observation_provenance=True, max_observation_age_s=.3)
+        clocks = [100., 10.]
+        queue._system_clock = lambda: clocks[0]
+        queue._steady_clock = lambda: clocks[1]
+        return queue, clocks
+
+    @staticmethod
+    def generation_input(queue, stamp, digest="a"):
+        provenance = ObservationProvenance("sha256:" + digest * 64, "SYSTEM_TIME",
+            tuple((name, stamp) for name in ("camera1", "camera2", "state")))
+        queue.get_action_index()  # Exact native attempt-start seam.
+        queue.observed_input({"state": 1}, provenance)["state"]
+        return provenance
+
+    def test_generation_receipt_qualifies_at_actual_merge_completion_not_later_dispatch(self):
+        queue, clocks = self.eligible_queue()
+        provenance = self.generation_input(queue, 99.95)
+        native_merge = ActionQueue.merge
+
+        def finish(*args, **kwargs):
+            result = native_merge(*args, **kwargs)
+            clocks[:] = [100.15, 10.15]
+            return result
+
+        with patch.object(ActionQueue, "merge", finish):
+            queue.merge(actions(0, 2), actions(100, 2), real_delay=0)
+        snapshot = queue.snapshot()
+        receipt = snapshot.generation_eligibility[0]
+        self.assertIsInstance(receipt, GenerationEligibility)
+        self.assertIs(snapshot.generation_eligibility[1], receipt)
+        self.assertEqual(receipt.observation, provenance)
+        self.assertEqual((receipt.sampling_started_at_s, receipt.merge_completed_at_s), (100., 100.15))
+        wire = receipt.to_dict()
+        self.assertEqual(json.loads(json.dumps(wire)), wire)
+        self.assertTrue(wire["eligible"])
+        self.assertEqual(wire["max_observation_age_s"], .3)
+        wire["source_timestamps_s"]["state"] = -1
+        self.assertEqual(receipt.to_dict()["source_timestamps_s"]["state"], 99.95)
+        clocks[:] = [1000., 1000.]
+        self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=2), snapshot.rows)
+        self.assertEqual(queue.snapshot().generation_eligibility, ())
+
+    def test_generation_stale_append_rolls_back_native_tensors_cursor_and_receipts(self):
+        queue, clocks = self.eligible_queue()
+        self.generation_input(queue, 99.95)
+        queue.merge(actions(0, 2), actions(100, 2), real_delay=0)
+        queue.get()
+        before = queue.snapshot()
+        clocks[:] = [100.1, 10.1]
+        self.generation_input(queue, 100.05, "b")
+        clocks[:] = [100.5, 10.5]
+        with self.assertRaisesRegex(RuntimeError, "GENERATION_STALE"):
+            queue.merge(actions(1000, 2), actions(2000, 2), real_delay=0)
+        after = queue.snapshot()
+        self.assertEqual((after.generation, after.queue_index, after.rows, after.generation_eligibility),
+                         (before.generation, before.queue_index, before.rows, before.generation_eligibility))
+        self.assertTrue(torch.equal(after.original_actions, before.original_actions))
+        self.assertTrue(torch.equal(after.processed_actions, before.processed_actions))
+        self.assertEqual(after.observation_provenance, before.observation_provenance)
+        self.generation_input(queue, 100.45, "c")
+        queue.merge(actions(3000, 1), actions(4000, 1), real_delay=0)
+        appended = queue.snapshot()
+        self.assertEqual([r.chunk_id for r in appended.generation_eligibility], [1, 2])
+        self.assertEqual(queue.advance_unchanged_prefix(before, count=1), before.rows)
+        queue.clear()
+        self.assertEqual(queue.snapshot().generation_eligibility, ())
+
+    def test_generation_retry_clears_failed_inference_and_failed_merge_attempt(self):
+        queue, clocks = self.eligible_queue()
+        self.generation_input(queue, 99.95, "a")
+        # A failed inference never called merge. Native get_action_index resets
+        # both its source token and sampling clocks before B's feature reads.
+        clocks[:] = [100.2, 10.2]
+        second = self.generation_input(queue, 100.15, "b")
+        clocks[:] = [100.25, 10.25]
+        queue.merge(actions(0, 1), actions(100, 1), real_delay=0)
+        receipt = queue.snapshot().generation_eligibility[0]
+        self.assertEqual(receipt.observation, second)
+        self.assertEqual(receipt.sampling_started_at_s, 100.2)
+        queue.get_action_index()
+        with self.assertRaisesRegex(RuntimeError, "PROVENANCE_MISSING"):
+            queue.merge(actions(0, 1), actions(100, 1), real_delay=0)
+        self.assertFalse(hasattr(queue._sampled_observation, "started"))
+        self.assertFalse(hasattr(queue._sampled_observation, "value"))
+        self.assertEqual(queue.generation, 1)
+
+    def test_generation_native_merge_exception_remains_primary_and_does_not_publish_receipt(self):
+        queue, _ = self.eligible_queue()
+        self.generation_input(queue, 100.)
+        queue.merge(actions(0, 2), actions(100, 2), real_delay=0)
+        queue.get()
+        before = queue.snapshot()
+        self.generation_input(queue, 100.)
+        with patch.object(queue, "_system_clock", side_effect=RuntimeError("secondary clock")):
+            with self.assertRaises(RuntimeError) as raised:
+                queue.merge(actions(1000, 2), torch.ones(2, 6), real_delay=0)
+        self.assertNotIn("secondary clock", str(raised.exception))
+        self.assertNotIn("GENERATION", str(raised.exception))
+        after = queue.snapshot()
+        self.assertEqual(after.generation_eligibility, before.generation_eligibility)
+        self.assertEqual(after.rows, before.rows)
+        self.assertTrue(torch.equal(after.original_actions, before.original_actions))
+        self.assertTrue(torch.equal(after.processed_actions, before.processed_actions))
+        self.assertFalse(hasattr(queue._sampled_observation, "started"))
+
+    def test_generation_configuration_requires_existing_provenance_and_positive_bound(self):
+        with self.assertRaisesRegex(ValueError, "GENERATION_CONFIG"):
+            AcknowledgedActionQueue(RTCConfig(enabled=False), max_observation_age_s=.3)
+        for age in (False, 0., -1., float("nan"), float("inf")):
+            with self.subTest(age=age), self.assertRaisesRegex(ValueError, "GENERATION_CONFIG"):
+                AcknowledgedActionQueue(RTCConfig(enabled=False),
+                    require_observation_provenance=True, max_observation_age_s=age)
+
+    def test_generation_clock_future_source_and_missing_start_fail_closed(self):
+        for finish in ((99.99, 10.1), (100.1, 9.99), (100.1, 10.31), (float("nan"), 10.1)):
+            queue, clocks = self.eligible_queue()
+            self.generation_input(queue, 100.)
+            clocks[:] = finish
+            with self.subTest(finish=finish), self.assertRaisesRegex(RuntimeError, "GENERATION_(CLOCK|STALE)"):
+                queue.merge(actions(0, 1), actions(100, 1), real_delay=0)
+            self.assertEqual(queue.generation, 0)
+        queue, clocks = self.eligible_queue()
+        future = self.generation_input(queue, 100.01)
+        clocks[:] = [100.1, 10.1]
+        with self.assertRaisesRegex(RuntimeError, "GENERATION_STALE"):
+            queue.merge(actions(0, 1), actions(100, 1), real_delay=0)
+        queue.observed_input({"state": 1}, future)["state"]
+        with self.assertRaisesRegex(RuntimeError, "GENERATION_START_MISSING"):
+            queue.merge(actions(0, 1), actions(100, 1), real_delay=0)
+
+    def test_generation_receipt_is_checked_by_atomic_prefix_but_legacy_remains_optional(self):
+        queue, _ = self.eligible_queue()
+        self.generation_input(queue, 100.)
+        queue.merge(actions(0, 1), actions(100, 1), real_delay=0)
+        original = queue.snapshot()
+        for receipts in ((), (None,)):
+            changed = replace(original, generation_eligibility=receipts)
+            with self.assertRaisesRegex(RuntimeError, "PREFIX_CHANGED"):
+                queue.advance_unchanged_prefix(changed, count=1)
+        legacy = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        legacy.merge(actions(0, 1), actions(100, 1), real_delay=0)
+        snapshot = legacy.snapshot()
+        self.assertEqual(snapshot.generation_eligibility, (None,))
+        self.assertEqual(legacy.advance_unchanged_prefix(replace(snapshot, generation_eligibility=()), count=1), snapshot.rows)
+
     def test_observed_input_binds_without_changing_native_tensors(self):
         queue = AcknowledgedActionQueue(
             RTCConfig(enabled=False), require_observation_provenance=True,

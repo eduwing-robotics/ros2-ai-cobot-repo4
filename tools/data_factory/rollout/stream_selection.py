@@ -88,9 +88,53 @@ def _projection(rows, *, upper_m, projection_quanta):
     return projected
 
 
+def _generation_receipt(value, source, chunk, max_age_s):
+    """Replay original generation qualification without a dispatch-time TTL."""
+    code = "LEARNED_STREAM_GENERATION_BINDING"
+    fields = {"schema_version", "chunk_id", "observation_digest", "source_clock",
+              "source_timestamps_s", "sampling_started_at_s", "sampling_started_monotonic_s",
+              "merge_completed_at_s", "merge_completed_monotonic_s", "max_observation_age_s",
+              "eligible", "receipt_digest"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value["schema_version"] != "data_factory.native_generation_eligibility.v1"
+            or type(value["chunk_id"]) is not int or value["chunk_id"] != chunk
+            or value["eligible"] is not True
+            or any(value[key] != source[key] for key in source)
+            or value["receipt_digest"] != canonical_digest({
+                key: item for key, item in value.items() if key != "receipt_digest"})):
+        raise ContractError(code)
+    numbers = [value[key] for key in ("sampling_started_at_s", "sampling_started_monotonic_s",
+               "merge_completed_at_s", "merge_completed_monotonic_s", "max_observation_age_s")]
+    try:
+        if any(type(number) not in (int, float) or not math.isfinite(number) for number in numbers):
+            raise ContractError(code)
+        started, steady_started, completed, steady_completed, bound = numbers
+        if (bound <= 0 or completed < started or steady_completed < steady_started
+                or max_age_s is not None and bound != max_age_s):
+            raise ContractError(code)
+        for stamp in source["source_timestamps_s"].values():
+            if (stamp > started or completed - stamp > bound
+                    or started - stamp + steady_completed - steady_started > bound):
+                raise ContractError("LEARNED_STALE_OBSERVATION")
+    except OverflowError as exc:
+        raise ContractError(code) from exc
+
+
 def validate_stream_selection(value, *, robot_description,
-                              gripper_projection_quanta=GRIPPER_PROJECTION_QUANTA):
-    """Validate detached JSON and return its exact controller action rows."""
+                              gripper_projection_quanta=GRIPPER_PROJECTION_QUANTA,
+                              max_observation_age_s=None):
+    """Validate detached JSON and return its exact controller action rows.
+
+    An explicit age bound requires the original once-qualified generation
+    receipt. It never evaluates the age of queued rows against the current time.
+    """
+    try:
+        if max_observation_age_s is not None and (
+                type(max_observation_age_s) not in (int, float)
+                or not math.isfinite(max_observation_age_s) or max_observation_age_s <= 0):
+            raise ContractError("LEARNED_STREAM_GENERATION_BINDING")
+    except OverflowError as exc:
+        raise ContractError("LEARNED_STREAM_GENERATION_BINDING") from exc
     fields = {
         "schema_version", "snapshot_generation", "snapshot_queue_index",
         "source_chunk", "source_row_indices", "source_observation",
@@ -98,7 +142,7 @@ def validate_stream_selection(value, *, robot_description,
         "processed_actions", "controller_actions", "robot_description_digest",
         "gripper_projection", "selection_digest",
     }
-    if (not isinstance(value, dict) or set(value) != fields
+    if (not isinstance(value, dict) or not fields <= set(value) <= fields | {"generation_eligibility"}
             or value.get("schema_version") != SELECTION_SCHEMA):
         raise ContractError("LEARNED_STREAM_SELECTION_SCHEMA")
     selected = copy.deepcopy(value)
@@ -119,6 +163,10 @@ def validate_stream_selection(value, *, robot_description,
             or indices != list(range(indices[0], indices[0] + len(indices)))):
         raise ContractError("LEARNED_STREAM_SELECTION_SOURCE")
     selected["source_observation"] = _observation(selected["source_observation"])
+    if max_observation_age_s is not None or "generation_eligibility" in selected:
+        _generation_receipt(selected.get("generation_eligibility"),
+                            selected["source_observation"], selected["source_chunk"],
+                            max_observation_age_s)
     if (selected["joint_order"] != JOINTS or selected["units"] != UNITS
             or selected["action_semantics"] != "ABSOLUTE_JOINT_POSITION"):
         raise ContractError("LEARNED_ACTION_CONTRACT")
@@ -227,6 +275,18 @@ def select_stream_revision(snapshot, *, robot_description,
             "projection_quanta": gripper_projection_quanta,
         },
     }
+    receipts = snapshot.generation_eligibility
+    if receipts:
+        if len(receipts) != len(snapshot.rows):
+            raise ContractError("LEARNED_STREAM_GENERATION_BINDING")
+        selected_receipts = receipts[:row_count]
+        if any(item is not None for item in selected_receipts):
+            from lerobot_strategy_fr5.acknowledged_queue import GenerationEligibility
+            receipt = selected_receipts[0]
+            if (not isinstance(receipt, GenerationEligibility)
+                    or any(item != receipt for item in selected_receipts)):
+                raise ContractError("LEARNED_STREAM_GENERATION_BINDING")
+            selection["generation_eligibility"] = receipt.to_dict()
     selection["selection_digest"] = canonical_digest(selection)
     return validate_stream_selection(
         selection, robot_description=robot_description,

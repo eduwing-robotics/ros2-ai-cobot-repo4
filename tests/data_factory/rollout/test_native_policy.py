@@ -183,6 +183,30 @@ class NativePolicyTest(unittest.TestCase):
         native.device = "cpu"
         return native
 
+    def test_task_scope_forwards_explicit_generation_bound_without_per_row_age_check(self):
+        native = self.async_native(_AsyncPolicy())
+        with native.prepare_task_inference(instruction="pick", fps=30, queue_threshold=0,
+                                          max_observation_age_s=.3) as (engine, queue, notify):
+            clocks = [100.1, 10.1]
+            queue._system_clock, queue._steady_clock = lambda: clocks[0], lambda: clocks[1]
+            notify({"source_clock": "SYSTEM_TIME", "source_timestamps_s": {
+                "camera1": 100., "camera2": 100., "state": 100.},
+                "observation.state": [0.] * 7,
+                "observation.images.camera1": fake_rgb(), "observation.images.camera2": fake_rgb()})
+            engine.resume()
+            deadline = time.monotonic() + 2.
+            while queue.qsize() < 2 and time.monotonic() < deadline:
+                time.sleep(.005)
+            snapshot = queue.snapshot()
+            self.assertEqual(len(snapshot.rows), 2)
+            receipt = snapshot.generation_eligibility[0].to_dict()
+            self.assertEqual(receipt["max_observation_age_s"], .3)
+            self.assertEqual(receipt["source_timestamps_s"]["state"], 100.)
+            engine.pause()
+            clocks[:] = [1000., 1000.]
+            self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=2), snapshot.rows)
+        self.assertFalse(engine._policy_active.is_set())
+
     def test_task_scope_uses_native_async_queue_and_resets_once_across_chunks(self):
         from lerobot.rollout.inference.rtc import RTCInferenceEngine
         from lerobot_strategy_fr5.acknowledged_queue import AcknowledgedActionQueue

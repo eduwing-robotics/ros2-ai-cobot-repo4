@@ -137,6 +137,78 @@ class NativeAsyncTest(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(engine.failed)
 
+    def test_generation_eligibility_native_failed_retry_uses_new_sampling_start_and_identity(self):
+        policy = ProvenanceSampler(fail_first=True)
+        engine = self._engine(policy)
+        engine._rtc_queue_threshold = 0
+        queue = start_with_acknowledged_queue(engine, require_observation_provenance=True,
+                                               max_observation_age_s=.3)
+        thread = engine._rtc_thread
+        clocks = [1.1, 10.1]
+        queue._system_clock, queue._steady_clock = lambda: clocks[0], lambda: clocks[1]
+        keys = [f"j{i}" for i in range(7)]
+        try:
+            engine.notify_observation(queue.observed_input(dict.fromkeys(keys, 1.), self._provenance(1.)))
+            engine.resume()
+            self.assertTrue(policy.first_started.wait(2.))
+            clocks[:] = [2.1, 11.1]
+            second = self._provenance(2.)
+            engine.notify_observation(queue.observed_input(dict.fromkeys(keys, 2.), second))
+            policy.release_first.set()
+            deadline = time.monotonic() + 2.
+            while queue.generation < 1 and time.monotonic() < deadline:
+                time.sleep(.005)
+            snapshot = queue.snapshot()
+            self.assertEqual(len(snapshot.generation_eligibility), 4)
+            receipt = snapshot.generation_eligibility[0]
+            self.assertEqual(receipt.observation, second)
+            self.assertEqual(receipt.sampling_started_at_s, 2.1)
+            self.assertEqual(receipt.sampling_started_monotonic_s, 11.1)
+            self.assertEqual(receipt.merge_completed_at_s, 2.1)
+            torch.testing.assert_close(snapshot.processed_actions, torch.full((4, 7), 2.))
+        finally:
+            policy.release_first.set()
+            engine.stop()
+        self.assertFalse(thread.is_alive())
+
+    def test_generation_native_merge_staleness_rejects_without_publishing_or_new_retry_loop(self):
+        policy = ProvenanceSampler()
+        engine = self._engine(policy)
+        queue = start_with_acknowledged_queue(engine, require_observation_provenance=True,
+                                               max_observation_age_s=.3)
+        thread = engine._rtc_thread
+        clocks, rejected = [1.1, 10.1], threading.Event()
+        queue._system_clock, queue._steady_clock = lambda: clocks[0], lambda: clocks[1]
+        native_merge = queue.merge
+
+        def observe_rejection(*args, **kwargs):
+            try:
+                return native_merge(*args, **kwargs)
+            except RuntimeError as exc:
+                if "GENERATION_STALE" in str(exc):
+                    engine.pause()  # Bounded harness, not new production retry policy.
+                    rejected.set()
+                raise
+
+        with mock.patch.object(queue, "merge", side_effect=observe_rejection):
+            try:
+                engine.notify_observation(queue.observed_input(dict.fromkeys([f"j{i}" for i in range(7)], 1.), self._provenance(1.)))
+                engine.resume()
+                self.assertTrue(policy.first_started.wait(2.))
+                clocks[:] = [1.4, 10.4]
+                policy.release_first.set()
+                self.assertTrue(rejected.wait(2.))
+                self.assertEqual(queue.generation, 0)
+                self.assertEqual(queue.snapshot().generation_eligibility, ())
+                self.assertEqual(queue.qsize(), 0)
+                # Native resets consecutive_errors before merge. A rejection
+                # is not a promise that engine.failed will become true.
+                self.assertFalse(engine.failed)
+            finally:
+                policy.release_first.set()
+                engine.stop()
+        self.assertFalse(thread.is_alive())
+
     def test_unwrapped_observation_after_failure_cannot_inherit_stale_identity(self):
         policy = ProvenanceSampler(fail_first=True)
         engine = self._engine(policy)
