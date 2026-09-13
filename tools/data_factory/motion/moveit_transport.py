@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
-from tools.fr5_data_factory import ContractError, canonical_digest
+from tools.fr5_data_factory import ContractError, DIGEST, canonical_digest
 from .actuator_stream import ActuatorStream
 
 
@@ -1029,6 +1029,7 @@ class RosMoveItTransport:
         self._native_geometry_deadline = deadline
         self._native_geometry = None
         self._native_geometry_ready = None
+        self._native_geometry_candidate = None
         self._native_geometry_capture = GeometryCapture(self.node, deadline=deadline, clock=self._clock)
 
     def _bound_native_geometry_scene(self, captured, plan, context):
@@ -1096,6 +1097,7 @@ class RosMoveItTransport:
 
     def _close_learned_geometry(self):
         """Only owned CPU/read resources; no implied physical stop."""
+        self._native_geometry_candidate = None
         closed = True
         for name in ("_native_geometry_capture", "_native_geometry"):
             resource = getattr(self, name, None)
@@ -1106,7 +1108,160 @@ class RosMoveItTransport:
                     closed = False
         return closed
 
-    def build_learned_actuator_goals(self, initial_state, actions, *, period_s, start_time_ns):
+    def prepare_learned_revision_geometry(self, arm_goal, gripper_goal, *, revision,
+                                         scene_binding, assignments, deadline):
+        """Check a detached next pair while the current native pair keeps running.
+
+        ``assignments`` is ((hypothesis, (sample_index, ...)), ...), an
+        explicit selection by the contact owner, not an
+        inferred task phase or a blanket source/carried/released safety gate.
+        Scene identity is the task owner's captured SceneStateStore revision;
+        the helper initialization separately binds the full native model/Scene.
+        This method sends only a CPU query and creates no motion authority.
+        """
+        ready = getattr(self, "_native_geometry_ready", None)
+        if (not isinstance(self._active, ActuatorStream) or self._active.fenced
+                or not isinstance(ready, dict) or ready.get("status") != "READY"):
+            raise ContractError("NATIVE_GEOMETRY_NOT_READY")
+        if getattr(self, "_native_geometry_candidate", None) is not None:
+            raise ContractError("NATIVE_GEOMETRY_BUSY")
+        if (not isinstance(revision, str) or not revision
+                or not isinstance(scene_binding, dict)
+                or set(scene_binding) != {"scene_state_digest", "revision"}
+                or not isinstance(scene_binding["scene_state_digest"], str)
+                or not DIGEST.fullmatch(scene_binding["scene_state_digest"])
+                or type(scene_binding["revision"]) is not int or scene_binding["revision"] < 0
+                or type(assignments) is not tuple or not assignments):
+            raise ContractError("NATIVE_GEOMETRY_BINDING")
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or not self._clock() < deadline <= self._native_geometry_deadline):
+            raise ContractError("NATIVE_GEOMETRY_DEADLINE")
+        arm, gripper = copy.deepcopy((arm_goal, gripper_goal))
+        samples = self._learned_actuator_reference_samples(arm, gripper, relative=True)
+        if arm.trajectory.header.stamp.sec != 0 or arm.trajectory.header.stamp.nanosec != 0:
+            raise ContractError("NATIVE_GEOMETRY_RELATIVE_TEMPLATE")
+        if (any(type(a) is not tuple or len(a) != 2 or type(a[0]) is not str
+                or a[0] not in {"source", "carried", "released"}
+                or type(a[1]) is not tuple or not a[1]
+                or any(type(i) is not int or not 0 <= i < len(samples) for i in a[1])
+                or tuple(sorted(set(a[1]))) != a[1] for a in assignments)
+                or len({h for h, _ in assignments}) != len(assignments)
+                or {i for _, indices in assignments for i in indices} != set(range(len(samples)))):
+            raise ContractError("NATIVE_GEOMETRY_ASSIGNMENT")
+        pair_digest = self._learned_actuator_pair_digest(arm, gripper)
+        binding = canonical_digest({
+            "selection_revision": revision, "native_template_digest": pair_digest,
+            "scene_binding": scene_binding, "assignments": assignments,
+            "initialization_digest": ready["initialization_digest"],
+            "contact_context_digest": canonical_digest(self._native_geometry_context),
+            "task_plan_digest": canonical_digest(self._native_geometry_plan),
+            "deadline_monotonic_s": deadline})
+        self._native_geometry.submit(
+            tuple((h, tuple(samples[i][1] for i in indices)) for h, indices in assignments),
+            binding=binding, deadline=deadline)
+        self._native_geometry_candidate = {
+            "arm": arm, "gripper": gripper, "revision": revision, "binding": binding,
+            "scene_binding": copy.deepcopy(scene_binding), "assignments": assignments,
+            "sample_count": len(samples), "native_template_digest": pair_digest,
+            "initialization_digest": ready["initialization_digest"],
+            "deadline": deadline, "report": None}
+        return binding
+
+    def poll_learned_revision_geometry(self, *, binding):
+        """Retain query facts only. Mismatch/failure never cancels current motion."""
+        candidate = getattr(self, "_native_geometry_candidate", None)
+        if candidate is None:
+            raise ContractError("NATIVE_GEOMETRY_NOT_CHECKED")
+        try:
+            if candidate["report"] is None:
+                result = self._native_geometry.poll(binding=binding)
+                if result is None:
+                    return None
+                if (result.get("status") != "CHECKED" or result.get("binding") != candidate["binding"]
+                        or result.get("initialization_digest") != candidate["initialization_digest"]
+                        or not isinstance(result.get("query_digest"), str)
+                        or not DIGEST.fullmatch(result["query_digest"])
+                        or not isinstance(result.get("scene_cdr_digest"), str)
+                        or not DIGEST.fullmatch(result["scene_cdr_digest"])):
+                    raise ContractError("NATIVE_GEOMETRY_BINDING")
+                variants = result.get("variants")
+                if (not isinstance(variants, list) or len(variants) != len(candidate["assignments"])
+                        or any(v.get("hypothesis") != h or not isinstance(v.get("samples"), list)
+                               or len(v["samples"]) != len(indices)
+                               or any(type(s.get("allowed")) is not bool or type(s.get("saturated")) is not bool
+                                      for s in v["samples"])
+                               for v, (h, indices) in zip(variants, candidate["assignments"]))):
+                    raise ContractError("NATIVE_GEOMETRY_BINDING")
+                candidate["report"] = {
+                    "status": "CHECKED", "binding": candidate["binding"],
+                    "selection_revision": candidate["revision"], "native_template_digest": candidate["native_template_digest"],
+                    "initialization_digest": result["initialization_digest"],
+                    "scene_cdr_digest": result["scene_cdr_digest"], "query_digest": result["query_digest"],
+                    "sample_count": candidate["sample_count"], "assignments": candidate["assignments"],
+                    "allowed": all(s["allowed"] and not s["saturated"] for v in variants for s in v["samples"])}
+            if binding != candidate["binding"]:
+                raise ContractError("NATIVE_GEOMETRY_SUPERSEDED")
+            return copy.deepcopy(candidate["report"])
+        except Exception:
+            self._native_geometry_candidate = None
+            raise
+
+    def submit_checked_learned_revision(self, *, binding, scene_binding, start_time_ns, dispatch_guard):
+        """Consume one check through the existing native pair owner and guard.
+
+        Caller supplies the *current* Scene binding and holds its existing
+        Scene/authority boundary through this call. Its guard still checks
+        current state, hardware, queue identity and executable start time.
+        Geometry binds relative timing, not a prematurely frozen wall-clock
+        deadline. Only the common epoch is filled here; the final executable
+        digest binds that epoch to the unchanged checked relative template.
+        A returned/mutated report is never accepted as admission. No stale
+        result's intervals are retimed; a rejected attempt needs a newly checked candidate.
+        """
+        candidate = getattr(self, "_native_geometry_candidate", None)
+        if candidate is None or candidate["report"] is None:
+            raise ContractError("NATIVE_GEOMETRY_NOT_CHECKED")
+        self._native_geometry_candidate = None
+        if (binding != candidate["binding"]
+                or canonical_digest(scene_binding) != canonical_digest(candidate["scene_binding"])):
+            raise ContractError("NATIVE_GEOMETRY_SUPERSEDED")
+        if not candidate["report"]["allowed"]:
+            raise ContractError("COLLISION_DETECTED")
+        if not callable(dispatch_guard):
+            raise ContractError("ROS_EXEC_DISPATCH_GUARD")
+        if type(start_time_ns) is not int or not 0 < start_time_ns < 2**31 * 10**9:
+            raise ContractError("ROS_EXEC_STEP")
+        if self._learned_actuator_pair_digest(candidate["arm"], candidate["gripper"]) != candidate["native_template_digest"]:
+            raise ContractError("NATIVE_GEOMETRY_BINDING")
+        arm, gripper = copy.deepcopy((candidate["arm"], candidate["gripper"]))
+        for goal in (arm, gripper):
+            goal.trajectory.header.stamp.sec, goal.trajectory.header.stamp.nanosec = divmod(start_time_ns, 1_000_000_000)
+        pair_digest = self._learned_actuator_pair_digest(arm, gripper)
+        executable = {"selection_revision": candidate["revision"], "geometry_binding": binding,
+                      "native_template_digest": candidate["native_template_digest"],
+                      "start_time_ns": start_time_ns, "native_pair_digest": pair_digest}
+        executable["revision"] = canonical_digest(executable)
+
+        def guard(pair, predecessor):
+            if self._clock() >= candidate["deadline"]:
+                raise ContractError("NATIVE_GEOMETRY_TIMEOUT")
+            if self._learned_actuator_pair_digest(pair["arm"], pair["gripper"]) != pair_digest:
+                raise ContractError("NATIVE_GEOMETRY_BINDING")
+            dispatch_guard(pair, predecessor)
+            if self._clock() >= candidate["deadline"]:
+                raise ContractError("NATIVE_GEOMETRY_TIMEOUT")
+
+        try:
+            self.submit_learned_actuator_revision(arm, gripper,
+                revision=executable["revision"], dispatch_guard=guard)
+        except BaseException as exc:
+            # A send failure may follow an ambiguous native attempt. Preserve
+            # the final revision identity without claiming either acceptance.
+            exc.native_executable_revision = copy.deepcopy(executable)
+            raise
+        return executable
+
+    def build_learned_actuator_goals(self, initial_state, actions, *, period_s, start_time_ns=None):
         """Build native timelines, without admission, retiming or side effects.
 
         The initial anchor is not a policy row. ARM uses its native interpolation
@@ -1115,9 +1270,11 @@ class RosMoveItTransport:
         active over [i*period, (i+1)*period). Omitting it skips the first target.
         This reference schedule is not proof of individual SDK command delivery.
         The dispatch owner must qualify the current start and controller settings.
+        Omitted start_time_ns builds a zero-epoch geometry template; it cannot
+        be submitted by the native transport without an explicitly bound epoch.
         """
         try:
-            if (type(start_time_ns) is not int or not 0 < start_time_ns < 2**31 * 10**9
+            if (start_time_ns is not None and (type(start_time_ns) is not int or not 0 < start_time_ns < 2**31 * 10**9)
                     or type(period_s) not in (int, float) or not math.isfinite(period_s) or period_s <= 0
                     or not isinstance(actions, (list, tuple)) or not actions):
                 raise ContractError("ROS_EXEC_STEP")
@@ -1146,7 +1303,8 @@ class RosMoveItTransport:
                 point.time_from_start.sec, point.time_from_start.nanosec = divmod(timestamp, 1_000_000_000)
                 goal.trajectory.points.append(point)
         for goal in (arm, gripper):
-            goal.trajectory.header.stamp.sec, goal.trajectory.header.stamp.nanosec = divmod(start_time_ns, 1_000_000_000)
+            goal.trajectory.header.stamp.sec, goal.trajectory.header.stamp.nanosec = divmod(
+                0 if start_time_ns is None else start_time_ns, 1_000_000_000)
         return arm, gripper
 
     def submit_learned_actuator_revision(self, arm_goal, gripper_goal, *, revision, dispatch_guard):
@@ -1170,7 +1328,7 @@ class RosMoveItTransport:
             self._execute_goal_count += after["arm"] - before["arm"]
             self._gripper_goal_count += after["gripper"] - before["gripper"]
 
-    def _validate_learned_actuator_goals(self, arm_goal, gripper_goal):
+    def _validate_learned_actuator_goals(self, arm_goal, gripper_goal, *, relative=False):
         """Shared message checks for native submission and geometry consumers."""
         for goal, names in ((arm_goal, JOINT_ORDER), (gripper_goal, ["finger_right_joint"])):
             if (not isinstance(goal, self._FollowJointTrajectory.Goal)
@@ -1194,7 +1352,7 @@ class RosMoveItTransport:
         stamp = arm_goal.trajectory.header.stamp
         if (arm_goal.trajectory.header != gripper_goal.trajectory.header
                 or stamp.sec < 0 or not 0 <= stamp.nanosec < 1_000_000_000
-                or stamp.sec == 0 and stamp.nanosec == 0):
+                or not relative and stamp.sec == 0 and stamp.nanosec == 0):
             raise ContractError("ROS_EXEC_STEP")
 
     def check_learned_actuator_collision(self, plan, arm_goal, gripper_goal):
@@ -1207,11 +1365,25 @@ class RosMoveItTransport:
         supplied by the existing execution owner before this query. No goal is
         sent or stream opened, and neither input message is changed.
         """
-        from rosidl_runtime_py.convert import message_to_ordereddict
-
         plan = copy.deepcopy(plan)
         arm_goal, gripper_goal = copy.deepcopy((arm_goal, gripper_goal))
-        self._validate_learned_actuator_goals(arm_goal, gripper_goal)
+        samples = self._learned_actuator_reference_samples(arm_goal, gripper_goal)
+        report = self._check_plan_collision(plan, gripper_goal.trajectory.points[0].positions[0],
+            reference_samples=((name, list(row[:6]), row[6]) for name, row in samples))
+        return {**report, "schema_version": "data_factory.native_actuator_collision_report.v1",
+                "native_pair_digest": self._learned_actuator_pair_digest(arm_goal, gripper_goal),
+                "reference_semantics": "ARM_LINEAR_GRIPPER_NEXT_POINT",
+                "physical_tracking_qualified": False}
+
+    @staticmethod
+    def _learned_actuator_pair_digest(arm_goal, gripper_goal):
+        from rosidl_runtime_py.convert import message_to_ordereddict
+        return canonical_digest({"arm": message_to_ordereddict(arm_goal),
+                                 "gripper": message_to_ordereddict(gripper_goal)})
+
+    def _learned_actuator_reference_samples(self, arm_goal, gripper_goal, *, relative=False):
+        """One shared sampling contract for CPU-native and historical queries."""
+        self._validate_learned_actuator_goals(arm_goal, gripper_goal, relative=relative)
         arm, gripper = arm_goal.trajectory.points, gripper_goal.trajectory.points
         if (len(arm) < 2 or len(arm) != len(gripper)
                 or arm[0].time_from_start.sec != 0 or arm[0].time_from_start.nanosec != 0
@@ -1219,23 +1391,14 @@ class RosMoveItTransport:
                 or any(p.velocities or p.accelerations or p.effort for p in [*arm, *gripper])):
             raise ContractError("COLLISION_NATIVE_INTERPOLATION")
 
-        def references():
-            yield "initial", list(arm[0].positions), gripper[0].positions[0]
-            for index, (prior, current) in enumerate(zip(arm, arm[1:])):
-                # Include interval entry: NONE already selects the next
-                # gripper target while ARM still starts from the prior point.
-                for part in range(6):
-                    joints = [a + (b - a) * part / 5
-                              for a, b in zip(prior.positions, current.positions)]
-                    yield f"reference:{index}:{part}", joints, gripper[index + 1].positions[0]
-
-        report = self._check_plan_collision(plan, gripper[0].positions[0], reference_samples=references())
-        return {**report, "schema_version": "data_factory.native_actuator_collision_report.v1",
-                "native_pair_digest": canonical_digest({
-                    "arm": message_to_ordereddict(arm_goal),
-                    "gripper": message_to_ordereddict(gripper_goal)}),
-                "reference_semantics": "ARM_LINEAR_GRIPPER_NEXT_POINT",
-                "physical_tracking_qualified": False}
+        samples = [("initial", (*arm[0].positions, gripper[0].positions[0]))]
+        for index, (prior, current) in enumerate(zip(arm, arm[1:])):
+            # Include interval entry: NONE already selects the next gripper
+            # target while ARM still starts from the prior point.
+            for part in range(6):
+                joints = tuple(a + (b - a) * part / 5 for a, b in zip(prior.positions, current.positions))
+                samples.append((f"reference:{index}:{part}", (*joints, gripper[index + 1].positions[0])))
+        return tuple(samples)
 
     def poll_learned_actuator_stream(self):
         if not isinstance(self._active, ActuatorStream):

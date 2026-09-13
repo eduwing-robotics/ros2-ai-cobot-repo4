@@ -317,6 +317,74 @@ class NativeGeometryBinaryTest(unittest.TestCase):
                 time.sleep(.001)
         self.assertIsNotNone(adapter._process.poll())
 
+    def test_actual_native_query_binds_the_pair_consumed_by_mock_actuators(self):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from control_msgs.action import FollowJointTrajectory
+        from trajectory_msgs.msg import JointTrajectoryPoint
+        from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+        from tools.data_factory.motion.native_geometry import NativeGeometry
+        from tools.fr5_data_factory import canonical_digest
+
+        plan = {"fixture": "native-pair-query-only"}
+        context = {"schema_version": "data_factory.request_contact_geometry.v1", "status": "PROSPECTIVE",
+                   "physical_success": False, "plan_digest": canonical_digest(plan),
+                   "source_object_id": "source", "planning_frame": "base_link"}
+        context["geometry_digest"] = canonical_digest(context)
+        deadline = time.monotonic() + 5.
+        adapter = NativeGeometry(urdf=XML, srdf=SRDF, scene=scene(), context=context, plan=plan,
+                                 deadline=deadline, command=[str(self.binary)])
+        transport = object.__new__(RosMoveItTransport)
+        transport._active, transport._execution_locked = None, False
+        transport._clock = time.monotonic
+        transport._execute_goal_count = transport._gripper_goal_count = 0
+        transport._FollowJointTrajectory, transport._JointTrajectoryPoint = FollowJointTrajectory, JointTrajectoryPoint
+        arm_client = Mock()
+        arm_client.send_goal_async.return_value = Future()
+        transport.gripper = Mock()
+        transport.gripper.send_goal_async.return_value = Future()
+        transport._ActionClient = Mock(return_value=arm_client)
+        transport.node = object()
+        transport._rclpy = SimpleNamespace(spin_once=Mock())
+        transport.open_learned_actuator_stream(deadline=deadline)
+        try:
+            def wait_for(poll):
+                while time.monotonic() < deadline:
+                    result = poll()
+                    if result is not None:
+                        return result
+                    # Test driver only; production owner never waits here.
+                    time.sleep(.001)
+                self.fail("native query did not finish")
+            transport._native_geometry_ready = wait_for(adapter.poll)
+            transport._native_geometry = adapter
+            transport._native_geometry_context, transport._native_geometry_plan = context, plan
+            transport._native_geometry_deadline = deadline
+            pair = transport.build_learned_actuator_goals([0.] * 6 + [.021],
+                [[.001] * 6 + [.012], [.002] * 6 + [.018]], period_s=.1)
+            scene_binding = {"scene_state_digest": canonical_digest("fixture-scene"), "revision": 1}
+            binding = transport.prepare_learned_revision_geometry(*pair, revision="cpu-revision",
+                scene_binding=scene_binding, assignments=(("source", tuple(range(13))),), deadline=deadline)
+            checked = wait_for(lambda: transport.poll_learned_revision_geometry(binding=binding))
+            self.assertTrue(checked["allowed"])
+            self.assertEqual(checked["sample_count"], 13)
+            arm_client.send_goal_async.assert_not_called()
+            guard = Mock()  # Test-only: no current hardware/Scene authority is asserted.
+            transport.submit_checked_learned_revision(binding=binding, start_time_ns=42_000_000_000,
+                scene_binding=scene_binding, dispatch_guard=guard)
+            for item in pair: item.trajectory.header.stamp.sec = 42
+            self.assertEqual(arm_client.send_goal_async.call_args.args[0], pair[0])
+            self.assertEqual(transport.gripper.send_goal_async.call_args.args[0], pair[1])
+            self.assertEqual(transport.poll_learned_actuator_stream(), [])
+            self.assertEqual((transport._execute_goal_count, transport._gripper_goal_count), (1, 1))
+        finally:
+            limit = time.monotonic()+5.
+            while not adapter.close():
+                if time.monotonic() >= limit:
+                    self.fail("CPU geometry child failed to close")
+                time.sleep(.001)
+
 
 if __name__ == "__main__":
     unittest.main()

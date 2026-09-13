@@ -532,6 +532,221 @@ class TransportActuatorStreamTest(unittest.TestCase):
         self.assertEqual(self.transport._gripper_goal_count, 1)
         self.assertEqual(self.transport.poll_learned_actuator_stream(), [])
 
+    def prepared_revision(self, *, ready=True):
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        helper = Mock()
+        helper.close.return_value = True
+        self.transport._native_geometry = helper
+        self.transport._native_geometry_ready = {
+            "status": "READY", "initialization_digest": canonical_digest("model-scene")}
+        self.transport._native_geometry_context = {"contact": "bound"}
+        self.transport._native_geometry_plan = {"run_id": "run"}
+        self.transport._native_geometry_deadline = 20.
+        scene = {"scene_state_digest": canonical_digest("scene"), "revision": 3}
+        pair = self.transport.build_learned_actuator_goals(
+            [0.] * 6 + [.021], [[.001] * 6 + [.012], [.002] * 6 + [.018]],
+            period_s=.1)
+        binding = self.transport.prepare_learned_revision_geometry(*pair,
+            revision="revision-1", scene_binding=scene,
+            assignments=(("source", tuple(range(13))),), deadline=19.)
+        result = {
+            "status": "CHECKED", "binding": binding,
+            "initialization_digest": canonical_digest("model-scene"),
+            "scene_cdr_digest": canonical_digest("scene-cdr"),
+            "query_digest": canonical_digest("exact-query"),
+            "variants": [{"hypothesis": "source", "samples": [
+                {"allowed": True, "saturated": False} for _ in range(13)]}]}
+        helper.poll.return_value = result if ready else None
+        return helper, scene, pair, binding, result
+
+    def test_async_revision_binds_exact_native_samples_and_submits_retained_pair(self):
+        helper, scene, pair, binding, result = self.prepared_revision()
+        retained = copy.deepcopy(pair)
+        for item in retained: item.trajectory.header.stamp.sec = 42
+        samples = helper.submit.call_args.args[0]
+        self.assertEqual(len(samples[0][1]), 13)
+        self.assertEqual(samples[0][1][0], (0.,) * 6 + (.021,))
+        self.assertEqual(samples[0][1][1], (0.,) * 6 + (.012,))
+        self.assertAlmostEqual(samples[0][1][2][0], .0002)
+        pair[0].trajectory.points[-1].positions[0] = 9.
+        scene["revision"] = 999
+        checked = self.transport.poll_learned_revision_geometry(binding=binding)
+        self.assertIs(checked["allowed"], True)
+        # Caller-owned evidence cannot turn a failed/stale check into authority.
+        checked["allowed"] = False
+        self.client.send_goal_async.assert_not_called()
+        guard = Mock()
+        receipt = self.transport.submit_checked_learned_revision(binding=binding, start_time_ns=42_000_000_000,
+            scene_binding={"scene_state_digest": canonical_digest("scene"), "revision": 3},
+            dispatch_guard=guard)
+        self.assertEqual(self.client.send_goal_async.call_args.args[0], retained[0])
+        self.assertEqual(self.transport.gripper.send_goal_async.call_args.args[0], retained[1])
+        guard.assert_called_once_with({"arm": retained[0], "gripper": retained[1]}, None)
+        self.assertEqual(receipt["selection_revision"], "revision-1")
+        self.assertEqual(receipt["start_time_ns"], 42_000_000_000)
+        self.assertEqual(receipt["revision"], canonical_digest({k: v for k, v in receipt.items() if k != "revision"}))
+        self.assertEqual(self.transport.poll_learned_actuator_stream(), [])  # No invented ACK.
+        with self.assertRaisesRegex(ContractError, "NATIVE_GEOMETRY_NOT_CHECKED"):
+            self.transport.submit_checked_learned_revision(binding=binding, start_time_ns=42_000_000_000,
+                scene_binding=scene, dispatch_guard=guard)
+
+    def test_pending_check_keeps_existing_actuator_poll_and_cancel_live(self):
+        helper, scene, pair, binding, _ = self.prepared_revision(ready=False)
+        current = copy.deepcopy(pair)
+        for item in current: item.trajectory.header.stamp.sec = 41
+        self.transport.submit_learned_actuator_revision(*current, revision="current", dispatch_guard=Mock())
+        arm_handle, gripper_handle = handle(), handle()
+        self.response.set_result(arm_handle)
+        self.gripper_response.set_result(gripper_handle)
+        events = self.transport.poll_learned_actuator_stream()
+        self.assertIn("PAIR_ACCEPTED", [event["event"] for event in events])
+        for _ in range(100):
+            self.assertIsNone(self.transport.poll_learned_revision_geometry(binding=binding))
+            self.assertEqual(self.transport.poll_learned_actuator_stream(), [])
+        arm_handle.cancel_goal_async.assert_not_called()
+        self.transport.fence_learned_actuator_stream()
+        self.transport.poll_learned_actuator_stream()  # Native cancellation is polled, not a blocking call.
+        arm_handle.cancel_goal_async.assert_called_once()
+        gripper_handle.cancel_goal_async.assert_called_once()
+        self.assertEqual(self.transport._execute_goal_count, 1)
+        self.assertEqual(self.transport._gripper_goal_count, 1)
+
+    def test_check_rejects_scene_change_expiry_and_guard_failure_without_send(self):
+        for fault in ("scene", "time", "guard", "guard_time"):
+            with self.subTest(fault=fault):
+                self.setUp()
+                _, scene, _, binding, _ = self.prepared_revision()
+                self.transport.poll_learned_revision_geometry(binding=binding)
+                guard = Mock()
+                if fault == "scene": scene["revision"] += 1
+                if fault == "time": self.transport._clock = lambda: 19.
+                if fault == "guard": guard.side_effect = ContractError("CURRENT_STATE_INVALID")
+                if fault == "guard_time":
+                    guard.side_effect = lambda *_: setattr(self.transport, "_clock", lambda: 19.)
+                with self.assertRaises(ContractError):
+                    self.transport.submit_checked_learned_revision(binding=binding, start_time_ns=42_000_000_000,
+                        scene_binding=scene, dispatch_guard=guard)
+                self.client.send_goal_async.assert_not_called()
+                self.transport.gripper.send_goal_async.assert_not_called()
+                self.assertFalse(self.transport._active.fenced)
+
+    def test_rejected_geometry_cannot_be_promoted_by_modifying_returned_report(self):
+        _, scene, _, binding, result = self.prepared_revision()
+        result["variants"][0]["samples"][5]["allowed"] = False
+        checked = self.transport.poll_learned_revision_geometry(binding=binding)
+        self.assertFalse(checked["allowed"])
+        checked["allowed"] = True
+        with self.assertRaisesRegex(ContractError, "COLLISION_DETECTED"):
+            self.transport.submit_checked_learned_revision(binding=binding, start_time_ns=42_000_000_000,
+                scene_binding=scene, dispatch_guard=Mock())
+        self.client.send_goal_async.assert_not_called()
+        self.assertFalse(self.transport._active.fenced)
+
+    def test_mismatched_query_is_discarded_without_fencing_current_owner(self):
+        helper, scene, pair, binding, _ = self.prepared_revision()
+        helper.poll.side_effect = ContractError("NATIVE_GEOMETRY_SUPERSEDED")
+        with self.assertRaisesRegex(ContractError, "NATIVE_GEOMETRY_SUPERSEDED"):
+            self.transport.poll_learned_revision_geometry(binding=canonical_digest("new"))
+        helper.poll.assert_called_once_with(binding=canonical_digest("new"))
+        self.assertFalse(self.transport._active.fenced)
+        # A settled obsolete query does not poison the next check.
+        helper.poll.side_effect = None
+        self.transport.prepare_learned_revision_geometry(*pair, revision="revision-2",
+            scene_binding=scene, assignments=(("source", tuple(range(13))),), deadline=19.)
+        self.assertEqual(helper.submit.call_count, 2)
+
+    def test_native_check_binding_covers_timing_contact_scene_and_revision(self):
+        bindings = set()
+        for change in ("none", "interval", "scene", "contact", "revision", "hypothesis", "row"):
+            self.setUp()
+            helper, scene, pair, binding, _ = self.prepared_revision()
+            self.transport.poll_learned_revision_geometry(binding=binding)
+            # Consume this candidate without sending; a failed guard retires it.
+            with self.assertRaises(ContractError):
+                self.transport.submit_checked_learned_revision(binding=binding, scene_binding=scene, start_time_ns=42_000_000_000,
+                    dispatch_guard=Mock(side_effect=ContractError("TEST_ONLY")))
+            revision, hypothesis = "revision-1", "source"
+            if change == "interval":
+                for item in pair: item.trajectory.points[-1].time_from_start.nanosec += 100_000_000
+            if change == "scene": scene["revision"] += 1
+            if change == "contact": self.transport._native_geometry_context["contact"] = "different"
+            if change == "revision": revision = "revision-2"
+            if change == "hypothesis": hypothesis = "carried"
+            if change == "row": pair[0].trajectory.points[-1].positions[0] += .1
+            bindings.add(self.transport.prepare_learned_revision_geometry(*pair,
+                revision=revision, scene_binding=scene,
+                assignments=((hypothesis, tuple(range(13))),), deadline=19.))
+        self.assertEqual(len(bindings), 7)
+
+    def test_explicit_sample_assignments_cover_the_pair_without_blanket_hypotheses(self):
+        helper, scene, pair, binding, _ = self.prepared_revision()
+        self.transport.poll_learned_revision_geometry(binding=binding)
+        with self.assertRaises(ContractError):
+            self.transport.submit_checked_learned_revision(binding=binding, scene_binding=scene, start_time_ns=42_000_000_000,
+                dispatch_guard=Mock(side_effect=ContractError("TEST_ONLY")))
+        for assignments in (
+            (("source", tuple(range(12))),),  # Missing the last executable endpoint.
+            (("source", tuple(range(14))),),
+            (("source", (True, *range(1, 13))),),
+            (("source", (1, 0, *range(2, 13))),),
+            (("source", tuple(range(13))), ("source", (0,))),
+        ):
+            with self.subTest(assignments=assignments), self.assertRaisesRegex(ContractError, "NATIVE_GEOMETRY_ASSIGNMENT"):
+                self.transport.prepare_learned_revision_geometry(*pair, revision="second",
+                    scene_binding=scene, assignments=assignments, deadline=19.)
+        self.assertEqual(helper.submit.call_count, 1)
+        assignments = (("source", tuple(range(7))), ("carried", tuple(range(7, 13))))
+        binding = self.transport.prepare_learned_revision_geometry(*pair, revision="second",
+            scene_binding=scene, assignments=assignments, deadline=19.)
+        samples = helper.submit.call_args.args[0]
+        self.assertEqual([(h, len(rows)) for h, rows in samples], [("source", 7), ("carried", 6)])
+        self.assertEqual(samples[1][1][0], (.001,) * 6 + (.018,))
+        # Correct group names with truncated results cannot certify the pair.
+        helper.poll.return_value = {
+            "status": "CHECKED", "binding": binding,
+            "initialization_digest": canonical_digest("model-scene"),
+            "query_digest": canonical_digest("query"), "scene_cdr_digest": canonical_digest("scene"),
+            "variants": [{"hypothesis": h, "samples": [{"allowed": True, "saturated": False}]}
+                         for h, _ in assignments]}
+        with self.assertRaisesRegex(ContractError, "NATIVE_GEOMETRY_BINDING"):
+            self.transport.poll_learned_revision_geometry(binding=binding)
+        self.client.send_goal_async.assert_not_called()
+
+    def test_geometry_template_is_not_dispatchable_and_epoch_changes_executable_identity(self):
+        receipts = []
+        for epoch in (42_000_000_000, 43_000_000_000):
+            self.setUp()
+            helper, scene, pair, binding, _ = self.prepared_revision()
+            with self.assertRaisesRegex(ContractError, "ROS_EXEC_STEP"):
+                self.transport.submit_learned_actuator_revision(*pair, revision="unchecked", dispatch_guard=Mock())
+            self.client.send_goal_async.assert_not_called()
+            self.transport.poll_learned_revision_geometry(binding=binding)
+            receipts.append(self.transport.submit_checked_learned_revision(binding=binding,
+                scene_binding=scene, start_time_ns=epoch, dispatch_guard=Mock()))
+            sent = self.client.send_goal_async.call_args.args[0]
+            self.assertEqual(sent.trajectory.points, pair[0].trajectory.points)
+            self.assertEqual(sent.trajectory.header.stamp.sec, epoch // 1_000_000_000)
+            self.assertEqual(helper.submit.call_count, 1)
+        self.assertEqual(receipts[0]["geometry_binding"], receipts[1]["geometry_binding"])
+        self.assertEqual(receipts[0]["native_template_digest"], receipts[1]["native_template_digest"])
+        self.assertNotEqual(receipts[0]["native_pair_digest"], receipts[1]["native_pair_digest"])
+        self.assertNotEqual(receipts[0]["revision"], receipts[1]["revision"])
+
+    def test_failed_checked_send_retains_final_revision_without_acceptance(self):
+        _, scene, _, binding, _ = self.prepared_revision()
+        self.transport.poll_learned_revision_geometry(binding=binding)
+        original = OSError("native send outcome unknown")
+        self.transport.gripper.send_goal_async.side_effect = original
+        with self.assertRaises(OSError) as raised:
+            self.transport.submit_checked_learned_revision(binding=binding, scene_binding=scene,
+                start_time_ns=42_000_000_000, dispatch_guard=Mock())
+        self.assertIs(raised.exception, original)
+        self.assertEqual(original.native_executable_revision["geometry_binding"], binding)
+        self.assertEqual(original.native_executable_revision["start_time_ns"], 42_000_000_000)
+        self.assertNotIn("accepted", original.native_executable_revision)
+        self.assertEqual((self.transport._execute_goal_count, self.transport._gripper_goal_count), (1, 1))
+        self.assertTrue(self.transport._active.fenced)
+
     def test_builder_preserves_all_rows_and_shared_native_time_without_sending(self):
         initial = [0.] * 6 + [.021]
         actions = [[.001 * i + j / 10 for j in range(6)] + [.012 + i * .0001]

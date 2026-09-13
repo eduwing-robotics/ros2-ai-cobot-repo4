@@ -499,7 +499,9 @@ The owner must still bind checked geometry to the actual selected reference and
 current dispatch conditions. Normal task start now polls full-Scene/model
 acquisition and native helper initialization through the existing transport.
 `OPENING` becomes `WAITING_FOR_POLICY` only on initialization completion; neither
-status proves dispatch. The revision/commit consumer remains unconnected.
+status proves dispatch. The transport now consumes a geometry-checked relative
+template through its native pair submission seam; normal executor/caller
+selection, auto-commit and queue-ACK wiring remain unconnected.
 
 The Scene and model parameter services are read independently, not claimed as an
 atomic snapshot transaction. The captured MoveGroup URDF is checked against the
@@ -514,12 +516,35 @@ helper remain task-owned and close through the existing fence/drain path.
 Current admitted execution, monitoring and cancellation continue while the next
 revision's geometry request is pending. Only the new revision waits for its
 result. The immutable request/result must match the selected revision, full
-Scene/contact model, sampled states and executable timing; the owner rechecks
+Scene/contact model, sampled states and relative timing; the owner rechecks
 current authority/Scene/state at commit. Mismatched/expired results are discarded,
 not relabeled, and the owner prepares a fresh check where still applicable.
 Initialization belongs before fresh inference acquisition; JSON/CDR, collision
 work and contact classification run off the owner loop. The CPU child has no
 ROS node, command or shared-Scene mutation authority; owned teardown is pollable.
+
+Geometry checks a zero-epoch template with unchanged ARM-linear/gripper-next-point
+references. It is not directly dispatchable. At commit, the existing owner supplies
+the current Scene identity and an explicit common start epoch; the transport binds
+`selection_revision + geometry_binding + template_digest + epoch + executable_pair_digest`
+into the actual controller revision. Only that epoch is filled, never point times,
+positions, order or derivatives. The original check deadline still applies through
+the final owner guard. This separates geometric relative-time validity from the
+actual submission epoch rather than renewing an expired check or freezing a start
+time before asynchronous work. No arbitrary controller lead time is selected here;
+current-state/start validity and real native acceptance timing remain to be qualified
+by the normal consumer. Native send failures preserve the executable revision
+identity without acceptance, reference-consumption or physical-outcome claims.
+
+The contact component must explicitly assign prospective hypotheses to selected
+reference samples; the query binding covers that assignment and every sample.
+The transport neither selects a convenient passing hypothesis nor demands all
+three everywhere. A normal applicability rule is still engineering work: aperture,
+queue progress and controller completion are not observed object disposition.
+Do not import the historical stationary-close barriers to supply this rule.
+OneJob/PickupExecutor retain task/start/commit/fault/close decisions; inference,
+queue, geometry, actuator and reference-progress computation remain with their
+existing components. No new lifecycle framework or caller-side motion authority.
 
 Do not infer seamless future-tail blending from the word "replacement". The
 [official Jazzy JTC documentation](https://control.ros.org/jazzy/doc/ros2_controllers/joint_trajectory_controller/doc/trajectory.html#trajectory-replacement)
