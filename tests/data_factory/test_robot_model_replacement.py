@@ -52,6 +52,15 @@ def finger_geometry(root, q):
 
 
 class RobotModelReplacementTest(unittest.TestCase):
+    def test_place_a_contact_sheet_resolves_existing_calibration_identity(self):
+        from tools.data_factory.motion.contact_transition import bound_document
+        config = ROOT / "config/data_factory"
+        cell = json.loads((config / "cells/place-a-yaw0-r003.json").read_text())
+        _, sheet = bound_document(config, "workspace_sheets", cell["yaw0_manifest_digest"])
+        original = json.loads((config / "test_only_physical/goal2-place1/yaw0_sheet.json").read_text())
+        self.assertEqual(sheet, original)
+        self.assertEqual(sheet["place_id"], cell["place_id"])
+
     def test_only_finger_coordinate_expression_changes_and_old_model_is_preserved(self):
         self.assertEqual(hashlib.sha256(ORIGINAL.read_bytes()).hexdigest(), ORIGINAL_SHA)
         old, new = ET.parse(ORIGINAL).getroot(), ET.parse(CANDIDATE).getroot()

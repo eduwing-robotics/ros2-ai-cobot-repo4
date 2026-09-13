@@ -42,8 +42,21 @@ bounded continuity question only; learned task success remains unproven.
   in a later read-only probe, not proven as the original rejection's cause.
   The returned execute-count0 was a fixed failed-start projection, not a retained
   native counter. Empty phase events are consistent with pre-send failure but
-  do not independently restore physical continuity. Cell remains blocked and
-  Scene314 is UNKNOWN; existing recovery inputs are required before a new run.
+  do not independently restore physical continuity.
+  The user's current A-position/workspace confirmation restored Scene315 through
+  existing HUMAN/CAS recovery. Fresh r3 passed the prior freshness boundary, then
+  failed `CONTACT_PROFILE_UNAVAILABLE`; its canonical lifecycle and diagnostic
+  retain empty completed segments/rows and UNKNOWN outcome. Scene316 is UNKNOWN.
+  The missing A yaw0 sheet is now published in the existing digest-resolved
+  workspace_sheets directory, identical to the existing calibration input.
+  Three focused model/sheet tests passed in0.008s. CPU replay then reaches the
+  already-existing `CONTACT_MODEL_GEOMETRY` rejection: original URDF finger axes
+  oppose the qualified opening-positive command convention. The candidate below
+  remains unqualified; no limit, active model, data or approval was changed.
+  r3 artifacts: `outputs/data_factory/runs/learned-scoped-return-20260913-r3/`.
+  Next physical dependency is the existing model/contact replacement boundary,
+  not another unchanged retry or model-quality threshold. Live camera/ROS owners
+  were moved to visible Orca terminals at the user's request.
 - [x] Correct native snapshot acquisition without extending freshness limits:
   `5f4b7ef` waits for original source stamps within the existing deadline
   (13 focused tests PASS0.672s; independent review found no issues). The opted-in
