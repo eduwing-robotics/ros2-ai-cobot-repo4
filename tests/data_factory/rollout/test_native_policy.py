@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +51,47 @@ def saved_processor_fixture(policy_dir, fault=None):
         (policy_dir / (pipeline + ".json")).write_text(json.dumps({"name": pipeline, "steps": steps}))
         save_file(tensors, policy_dir / state_file)
     return {"stats": stats}
+
+
+class _AsyncPipeline:
+    def __init__(self, transform=lambda value: value):
+        self.steps = []
+        self.transform = transform
+        self.reset_calls = 0
+
+    def __call__(self, value):
+        return self.transform(value)
+
+    def reset(self):
+        self.reset_calls += 1
+
+
+class _AsyncPolicy:
+    def __init__(self, *, entered=None, release=None):
+        self.config = SimpleNamespace(
+            input_features={
+                "observation.state": SimpleNamespace(shape=(7,)),
+                "observation.images.camera1": SimpleNamespace(shape=(3, 1, 1)),
+                "observation.images.camera2": SimpleNamespace(shape=(3, 1, 1)),
+            },
+            rtc_config=None,
+        )
+        self.entered = entered
+        self.release = release
+        self.reset_calls = 0
+        self.calls = []
+
+    def reset(self):
+        self.reset_calls += 1
+
+    def predict_action_chunk(self, batch, **kwargs):
+        self.calls.append(({key: value.clone() if isinstance(value, torch.Tensor) else value
+                            for key, value in batch.items()}, kwargs))
+        if self.entered is not None:
+            self.entered.set()
+        if self.release is not None:
+            self.release.wait()
+        return torch.full((1, 2, 7), float(len(self.calls)))
 
 
 class SavedProcessorBypassTest(unittest.TestCase):
@@ -125,6 +167,158 @@ class NativePolicyTest(unittest.TestCase):
         self.offline = mock.patch.dict(os.environ, {'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'})
         self.offline.start()
         self.addCleanup(self.offline.stop)
+
+    def async_native(self, policy, pre=None, post=None):
+        from tools.data_factory.training_receipts import tree_digest
+
+        native = NativeSmolVLA()
+        native.policy = policy
+        native.preprocessor = pre or _AsyncPipeline()
+        native.postprocessor = post or _AsyncPipeline()
+        native.policy_dir = self.policy_dir
+        native.checkpoint = {"tree_digest": tree_digest(self.policy_dir)}
+        native.observation_view = {
+            "representation": "raw", "transform_application": "none",
+        }
+        native.device = "cpu"
+        return native
+
+    def test_task_scope_uses_native_async_queue_and_resets_once_across_chunks(self):
+        from lerobot.rollout.inference.rtc import RTCInferenceEngine
+        from lerobot_strategy_fr5.acknowledged_queue import AcknowledgedActionQueue
+        from tools.data_factory.training_receipts import tree_digest
+
+        policy = _AsyncPolicy()
+        pre, post = _AsyncPipeline(), _AsyncPipeline()
+        native = self.async_native(policy, pre, post)
+        native.observation_view = {
+            "representation": "baked", "transform_application": "rollout_once",
+        }
+        native._transform_raw_up = mock.Mock(return_value=fake_rgb(b"\xff\x00\x00"))
+        value = {
+            "observation.state": [float(index) for index in range(7)],
+            "observation.images.camera1": fake_rgb(),
+            "observation.images.camera2": fake_rgb(b"\x00\x00\xff"),
+        }
+
+        with mock.patch(
+            "tools.data_factory.training_receipts.tree_digest", wraps=tree_digest,
+        ) as digest:
+            with native.prepare_task_inference(
+                instruction="move the block", fps=30, queue_threshold=0,
+            ) as (engine, queue, notify):
+                self.assertIsInstance(engine, RTCInferenceEngine)
+                self.assertIsInstance(queue, AcknowledgedActionQueue)
+                self.assertIs(engine.action_queue, queue)
+                self.assertFalse(engine._rtc_config.enabled)
+                self.assertIsNone(policy.config.rtc_config)
+                notify(value)
+                value["observation.state"][0] = 999.
+                value["observation.images.camera1"] = fake_rgb(b"\x00\xff\x00")
+                engine.resume()
+                deadline = time.monotonic() + 2.
+                while queue.qsize() < 2 and time.monotonic() < deadline:
+                    time.sleep(.005)
+                first = queue.snapshot()
+                self.assertEqual(len(first.rows), 2)
+                queue.advance_if_current(
+                    generation=first.generation,
+                    expected_index=first.queue_index,
+                    count=2,
+                )
+                while len(policy.calls) < 2 and time.monotonic() < deadline:
+                    time.sleep(.005)
+                self.assertGreaterEqual(len(policy.calls), 2)
+                with self.assertRaisesRegex(ContractError, "LEARNED_REENTRANT_INFERENCE"):
+                    with native.prepare_inference():
+                        self.fail("concurrent one-shot scope admitted")
+
+            self.assertEqual(digest.call_count, 1)
+        with self.assertRaisesRegex(ContractError, "LEARNED_INFERENCE_SCOPE"):
+            notify(value)
+        self.assertEqual(policy.reset_calls, 1)
+        self.assertEqual(pre.reset_calls, 1)
+        self.assertEqual(post.reset_calls, 1)
+        self.assertEqual(policy.calls[0][0]["observation.state"][0, 0].item(), 0.)
+        torch.testing.assert_close(
+            policy.calls[0][0]["observation.images.camera1"],
+            torch.tensor([[[[1.]], [[0.]], [[0.]]]]),
+        )
+        native._transform_raw_up.assert_called_once()
+        self.assertTrue(native._inference_lock.acquire(blocking=False))
+        native._inference_lock.release()
+
+    def test_task_scope_retains_loaded_model_owner_after_native_stop_timeout(self):
+        from lerobot.rollout.inference import rtc as rtc_module
+
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        policy = _AsyncPolicy(entered=entered, release=release)
+        native = self.async_native(policy)
+        value = {
+            "observation.state": [0.] * 7,
+            "observation.images.camera1": fake_rgb(),
+            "observation.images.camera2": fake_rgb(),
+        }
+        producer = None
+        with mock.patch.object(rtc_module, "_RTC_JOIN_TIMEOUT_S", .01):
+            with self.assertRaisesRegex(
+                ContractError, "LEARNED_INFERENCE_STOP_UNCONFIRMED",
+            ):
+                with native.prepare_task_inference(
+                    instruction="move the block", fps=30, queue_threshold=0,
+                ) as (engine, _queue, notify):
+                    producer = engine._rtc_thread
+                    notify(value)
+                    engine.resume()
+                    self.assertTrue(entered.wait(1.))
+                    # The caller may request early native stop. Its timeout
+                    # clears the engine's handle, but not model ownership.
+                    engine.stop()
+                    self.assertIsNone(engine._rtc_thread)
+
+        self.assertIsNotNone(producer)
+        self.assertTrue(producer.is_alive())
+        with self.assertRaisesRegex(ContractError, "LEARNED_INFERENCE_SCOPE"):
+            notify(value)
+        with self.assertRaisesRegex(ContractError, "LEARNED_REENTRANT_INFERENCE"):
+            with native.prepare_inference():
+                self.fail("model owner released before producer exited")
+        release.set()
+        producer.join(1.)
+        self.assertFalse(producer.is_alive())
+        with native.prepare_inference():
+            pass
+
+    def test_task_scope_preserves_body_failure_when_stop_is_unconfirmed(self):
+        from lerobot.rollout.inference import rtc as rtc_module
+
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        native = self.async_native(_AsyncPolicy(entered=entered, release=release))
+        value = {
+            "observation.state": [0.] * 7,
+            "observation.images.camera1": fake_rgb(),
+            "observation.images.camera2": fake_rgb(),
+        }
+        producer = None
+        with mock.patch.object(rtc_module, "_RTC_JOIN_TIMEOUT_S", .01):
+            with self.assertRaisesRegex(RuntimeError, "primary task failure") as raised:
+                with native.prepare_task_inference(
+                    instruction="move the block", fps=30, queue_threshold=0,
+                ) as (engine, _queue, notify):
+                    producer = engine._rtc_thread
+                    notify(value)
+                    engine.resume()
+                    self.assertTrue(entered.wait(1.))
+                    raise RuntimeError("primary task failure")
+        self.assertIn(
+            "LEARNED_INFERENCE_STOP_UNCONFIRMED",
+            getattr(raised.exception, "__notes__", []),
+        )
+        self.assertTrue(producer.is_alive())
+        release.set()
+        producer.join(1.)
 
     def test_component_loader_accepts_canonically_admitted_native_image_slots(self):
         from lerobot.configs import FeatureType, PolicyFeature

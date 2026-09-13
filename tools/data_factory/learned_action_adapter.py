@@ -258,6 +258,8 @@ class NativeSmolVLA:
 
     def __init__(self):
         self._inference_lock = threading.Lock()
+        self._inference_guard = threading.Lock()
+        self._retained_inference_thread = None
 
     @classmethod
     def load(cls, checkpoint, *, device="cpu"):
@@ -420,8 +422,7 @@ class NativeSmolVLA:
         from tools.fr5_data_factory import ContractError
         from tools.data_factory.training_receipts import tree_digest
 
-        if not self._inference_lock.acquire(blocking=False):
-            raise ContractError("LEARNED_REENTRANT_INFERENCE")
+        self._acquire_inference()
         available = False
         owner = threading.get_ident()
         try:
@@ -437,6 +438,203 @@ class NativeSmolVLA:
             yield predict
         finally:
             available = False
+            self._release_inference()
+
+    @contextmanager
+    def prepare_task_inference(
+        self,
+        *,
+        instruction,
+        fps,
+        shutdown_event=None,
+        queue_threshold=30,
+    ):
+        """Own one native asynchronous producer for a complete task.
+
+        Yields ``(engine, queue, notify_observation)``. The callback accepts the
+        same canonical FR5 observation as the one-shot API, while the engine
+        retains LeRobot's preprocessing, inference loop, and queue merge.
+        """
+        import numpy as np
+        from types import SimpleNamespace
+        from lerobot.policies.rtc import RTCConfig
+        from lerobot.rollout.inference import RTCInferenceConfig, create_inference_engine
+        from lerobot_strategy_fr5.acknowledged_queue import start_with_acknowledged_queue
+        from tools.fr5_data_factory import ContractError
+        from tools.data_factory.training_receipts import tree_digest
+
+        if (
+            not isinstance(instruction, str)
+            or not instruction.strip()
+            or not _finite_number(fps)
+            or fps <= 0
+            or isinstance(queue_threshold, bool)
+            or not isinstance(queue_threshold, int)
+            or queue_threshold < 0
+        ):
+            raise ContractError("LEARNED_TASK_INFERENCE_INPUT")
+
+        self._acquire_inference()
+        engine = None
+        producer_thread = None
+        retain_owner = False
+        available = False
+        body_error = None
+        notification_lock = threading.Lock()
+        try:
+            # This is the only artifact revalidation in the task scope. It
+            # precedes processor reset, producer start, and observation capture.
+            if tree_digest(self.policy_dir) != self.checkpoint["tree_digest"]:
+                raise ContractError("LEARNED_CHECKPOINT_CHANGED")
+
+            state_names = (
+                "j1.pos", "j2.pos", "j3.pos", "j4.pos", "j5.pos", "j6.pos",
+                "finger_right_joint.pos",
+            )
+            hw_features = {
+                "observation.state": {
+                    "dtype": "float32", "shape": (7,), "names": list(state_names),
+                },
+            }
+            for name in ("camera1", "camera2"):
+                key = f"observation.images.{name}"
+                shape = tuple(self.policy.config.input_features[key].shape)
+                if len(shape) != 3 or shape[0] != 3 or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 1
+                    for value in shape
+                ):
+                    raise ContractError("LEARNED_MODEL_CAMERAS")
+                hw_features[key] = {
+                    "dtype": "image",
+                    "shape": (shape[1], shape[2], shape[0]),
+                    "names": ["height", "width", "channels"],
+                }
+            dataset_features = {
+                **hw_features,
+                "action": {
+                    "dtype": "float32", "shape": (7,), "names": list(state_names),
+                },
+            }
+            robot_view = SimpleNamespace(
+                robot_type="fr5",
+                action_features={name: float for name in state_names},
+            )
+
+            # The loaded policy config remains exactly as saved (rtc_config is
+            # None). RTCConfig(enabled=False) selects only the native async
+            # producer/append queue, with no RTC guidance algorithm.
+            config = RTCInferenceConfig(
+                rtc=RTCConfig(enabled=False), queue_threshold=queue_threshold,
+            )
+            self.policy.reset()
+            self.preprocessor.reset()
+            self.postprocessor.reset()
+            engine = create_inference_engine(
+                config,
+                policy=self.policy,
+                preprocessor=self.preprocessor,
+                postprocessor=self.postprocessor,
+                robot_wrapper=robot_view,
+                hw_features=hw_features,
+                dataset_features=dataset_features,
+                ordered_action_keys=list(state_names),
+                task=instruction,
+                fps=float(fps),
+                device=self.device,
+                use_torch_compile=False,
+                shutdown_event=shutdown_event,
+            )
+            queue = start_with_acknowledged_queue(engine)
+            # Native stop() clears its handle even when join times out. Retain
+            # the actual thread now, including if the caller stops it early.
+            producer_thread = engine._rtc_thread
+
+            def notify_observation(observation):
+                with notification_lock:
+                    if not available:
+                        raise ContractError("LEARNED_INFERENCE_SCOPE")
+                    try:
+                        state = observation["observation.state"]
+                        if not isinstance(state, (list, tuple)) or len(state) != 7 or not all(
+                            _finite_number(value) for value in state
+                        ):
+                            raise ValueError("OBSERVATION_STATE")
+                        raw = {name: float(value) for name, value in zip(state_names, state)}
+                        for name in ("camera1", "camera2"):
+                            key = f"observation.images.{name}"
+                            frame = _rgb(observation[key])
+                            if (
+                                key == "observation.images.camera1"
+                                and self.observation_view.get("representation") == "baked"
+                                and self.observation_view.get("transform_application") == "rollout_once"
+                            ):
+                                frame = self._transform_raw_up(frame)
+                            if tuple(frame["shape"]) != tuple(hw_features[key]["shape"]):
+                                raise ValueError("OBSERVATION_IMAGE_SHAPE")
+                            raw[name] = np.frombuffer(frame["data"], dtype=np.uint8).reshape(
+                                frame["shape"]
+                            ).copy()
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ContractError(str(exc) or "LEARNED_OBSERVATION") from exc
+                    engine.notify_observation(raw)
+
+            available = True
+            try:
+                yield engine, queue, notify_observation
+            except BaseException as exc:
+                body_error = exc
+                raise
+        finally:
+            with notification_lock:
+                available = False
+            stop_error = None
+            try:
+                if engine is not None:
+                    try:
+                        engine.stop()
+                    except BaseException as exc:
+                        stop_error = exc
+                    finally:
+                        retain_owner = (
+                            producer_thread is not None and producer_thread.is_alive()
+                        )
+            finally:
+                if retain_owner:
+                    with self._inference_guard:
+                        self._retained_inference_thread = producer_thread
+                else:
+                    self._release_inference()
+            if retain_owner:
+                note = "LEARNED_INFERENCE_STOP_UNCONFIRMED"
+                if body_error is not None:
+                    body_error.add_note(note)
+                elif stop_error is not None:
+                    stop_error.add_note(note)
+                    raise stop_error
+                else:
+                    raise ContractError(note)
+            elif stop_error is not None:
+                if body_error is not None:
+                    body_error.add_note(
+                        f"LEARNED_INFERENCE_STOP_FAILED: {stop_error!r}"
+                    )
+                else:
+                    raise stop_error
+
+    def _acquire_inference(self):
+        """Acquire the loaded model, reaping a producer that has really exited."""
+        from tools.fr5_data_factory import ContractError
+
+        with self._inference_guard:
+            retained = self._retained_inference_thread
+            if retained is not None and not retained.is_alive():
+                self._retained_inference_thread = None
+                self._inference_lock.release()
+            if not self._inference_lock.acquire(blocking=False):
+                raise ContractError("LEARNED_REENTRANT_INFERENCE")
+
+    def _release_inference(self):
+        with self._inference_guard:
             self._inference_lock.release()
 
     def __call__(self, observation):
