@@ -75,28 +75,39 @@ class AcknowledgedActionQueue(ActionQueue):
         action_index_before_inference: int | None = None,
     ):
         with self.lock:
+            saved_queue = self.queue
+            saved_original_queue = self.original_queue
+            saved_last_index = self.last_index
             retained_rows = self._rows[self.last_index :]
             chunk = self._next_chunk + 1
 
-            result = super().merge(
-                original_actions,
-                processed_actions,
-                real_delay,
-                action_index_before_inference,
-            )
-
-            if self.cfg.enabled:
-                queued = 0 if self.queue is None else len(self.queue)
-                raw_start = len(processed_actions) - queued
-                rows = tuple(RawActionIndex(chunk, raw_start + i) for i in range(queued))
-            else:
-                rows = retained_rows + tuple(
-                    RawActionIndex(chunk, i) for i in range(len(processed_actions))
+            try:
+                result = super().merge(
+                    original_actions,
+                    processed_actions,
+                    real_delay,
+                    action_index_before_inference,
                 )
 
-            queued = 0 if self.queue is None else len(self.queue)
-            if len(rows) != queued:
-                raise RuntimeError("FR5_ACK_QUEUE_NATIVE_LAYOUT_CHANGED")
+                if self.cfg.enabled:
+                    queued = 0 if self.queue is None else len(self.queue)
+                    raw_start = len(processed_actions) - queued
+                    rows = tuple(
+                        RawActionIndex(chunk, raw_start + i) for i in range(queued)
+                    )
+                else:
+                    rows = retained_rows + tuple(
+                        RawActionIndex(chunk, i) for i in range(len(processed_actions))
+                    )
+
+                queued = 0 if self.queue is None else len(self.queue)
+                if len(rows) != queued:
+                    raise RuntimeError("FR5_ACK_QUEUE_NATIVE_LAYOUT_CHANGED")
+            except BaseException:
+                self.queue = saved_queue
+                self.original_queue = saved_original_queue
+                self.last_index = saved_last_index
+                raise
 
             self._rows = rows
             self._next_chunk = chunk

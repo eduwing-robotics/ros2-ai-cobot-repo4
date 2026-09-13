@@ -135,6 +135,36 @@ class AcknowledgedActionQueueTest(unittest.TestCase):
                 count=1,
             )
 
+    def test_failed_native_append_rolls_back_queue_and_metadata(self):
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        original = actions(0, rows=2)
+        processed = actions(100, rows=2)
+        queue.merge(original, processed, real_delay=0)
+        self.assertTrue(torch.equal(queue.get(), processed[0]))
+        before = queue.snapshot()
+
+        with self.assertRaises(RuntimeError):
+            queue.merge(
+                torch.full((2, 7), 999.0),
+                torch.full((2, 6), 999.0),
+                real_delay=0,
+            )
+
+        after = queue.snapshot()
+        self.assertEqual(after.generation, before.generation)
+        self.assertEqual(after.queue_index, before.queue_index)
+        self.assertEqual(after.rows, before.rows)
+        self.assertTrue(torch.equal(after.original_actions, before.original_actions))
+        self.assertTrue(torch.equal(after.processed_actions, before.processed_actions))
+        self.assertEqual(
+            queue.advance_if_current(
+                generation=before.generation,
+                expected_index=before.queue_index,
+                count=1,
+            ),
+            (RawActionIndex(1, 1),),
+        )
+
     def test_clear_invalidates_snapshot_and_keeps_chunk_ids_monotonic(self):
         queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
         queue.merge(actions(0), actions(100), real_delay=0)
