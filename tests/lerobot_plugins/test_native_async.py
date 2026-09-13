@@ -334,6 +334,60 @@ class NativeAsyncTest(unittest.TestCase):
         self.assertIsNone(engine._rtc_thread)
         self.assertIsNone(engine.action_queue)
 
+    def test_prediction_tail_is_not_committed_by_short_controller_submission(self):
+        from control_msgs.action import FollowJointTrajectory
+        from trajectory_msgs.msg import JointTrajectoryPoint
+        from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+        from tools.data_factory.rollout.stream_progress import ReferenceProgress
+
+        policy = SyntheticSampler()
+        engine = self._engine(policy)
+        queue = start_with_acknowledged_queue(engine)
+        thread = engine._rtc_thread
+        try:
+            engine.notify_observation(dict.fromkeys([f"j{i}" for i in range(7)], 0.))
+            engine.resume()
+            deadline = time.monotonic() + 3.
+            while queue.qsize() < 4 and time.monotonic() < deadline:
+                time.sleep(.005)
+            engine.pause()
+            snapshot = queue.snapshot()
+            self.assertEqual(len(snapshot.rows), 4)
+            # A consumer may select less than the prediction without changing
+            # native inference or creating a second cursor/scheduler. These
+            # synthetic values test framing only, not physical admission.
+            committed_rows = snapshot.processed_actions[:2].tolist()
+            transport = object.__new__(RosMoveItTransport)
+            transport._FollowJointTrajectory = FollowJointTrajectory
+            transport._JointTrajectoryPoint = JointTrajectoryPoint
+            arm, gripper = transport.build_learned_actuator_goals(
+                [0.] * 7, committed_rows, period_s=.1, start_time_ns=42_000_000_000,
+            )
+            times = [p.time_from_start.sec * 10**9 + p.time_from_start.nanosec
+                     for p in arm.trajectory.points]
+            self.assertEqual(times, [0, 100_000_000, 200_000_000])
+            self.assertEqual(len(gripper.trajectory.points), 3)
+            progress = ReferenceProgress("short-prefix", times)
+            self.assertEqual(progress.observe({
+                "revision": "short-prefix", "event": "PAIR_ACCEPTED", "predecessor": None,
+            }), 0)
+            self.assertEqual(queue.qsize(), 4)
+            for actuator in ("arm", "gripper"):
+                progress.observe({"revision": "short-prefix", "actuator": actuator,
+                                  "event": "TERMINAL", "result_status": 4, "error_code": 0})
+            self.assertEqual(progress.selected_count, 2)
+            self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=progress.selected_count),
+                             snapshot.rows[:2])
+            remaining = queue.snapshot()
+            self.assertEqual(remaining.rows, snapshot.rows[2:])
+            torch.testing.assert_close(remaining.processed_actions, snapshot.processed_actions[2:])
+            torch.testing.assert_close(remaining.original_actions, snapshot.original_actions[2:])
+            self.assertEqual(policy.calls, 1)
+        finally:
+            policy.release_second.set()
+            engine.stop()
+        self.assertFalse(thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

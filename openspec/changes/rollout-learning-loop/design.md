@@ -483,6 +483,17 @@ physical execution and Pick/release outcomes remain unproven.
 
 ### Native rolling-trajectory migration
 
+Finish one plain normal baseline and a bounded physical rollout before adding
+execution optimizations. Prediction horizon belongs to the saved policy;
+execution/commit horizon belongs to the selected policy-row prefix; controller
+submission horizon belongs to the exact native trajectory pair and its timing.
+These may coincide in the baseline but SHALL NOT be inferred from one another:
+the initial anchor is not a policy row, and controller acceptance is not
+consumption. Preserve row identity at that existing boundary so a later short
+rolling horizon, tail replacement or overlap blending can be evaluated there
+without rebuilding inference or adding another executor. Do not implement a
+strategy registry, scheduler framework or additional prediction model now.
+
 The selected rhythm40 checkpoint is trained for bidirectional pick-and-place,
 not Pick alone. Normal rollout must let the policy consume fresh observations
 through pickup, transfer and placement under its SOURCE/DESTINATION instruction.
