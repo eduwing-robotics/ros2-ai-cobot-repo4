@@ -2,6 +2,30 @@ Session transition: see [handoff.md](handoff.md) for version-scoped evidence.
 The September 11 v5 hold supersedes the September 9 failed candidate for that
 bounded continuity question only; learned task success remains unproven.
 
+## Active product checkpoint — September 13 takeover
+
+- [x] Read main2bab180 handoff against current source and runtime; retain zero
+  learned/gripper sends and UNKNOWN physical Pick. Root owns the existing product
+  Goal again; Thin/Router experimentation is closed.
+- [x] Independently assess temporal responsibility. Select scoped REOPEN as
+  recorded in `design.md`: generation qualification and current execution
+  admission are distinct; the current planning-entry/post-planning TTL is not a
+  true first-action deadline. No deployed check has changed.
+- [ ] Implement and specify the prospective generation-context-bound scoped mode
+  through the existing native caller/OneJob/PickupExecutor, preserving legacy
+  contracts, original timestamps, task budget and all current-state/Scene gates.
+- [ ] Verify the controlled-clock placement discriminator and context/replay,
+  expiry/cancellation, start/hardware/Scene and legacy rejection counterexamples
+  with focused producer/consumer tests, then independently review the cutoff.
+- [ ] Use a fresh qualified runtime and fresh run/grant/Scene binding for the
+  next bounded learned Pick, mechanical release/reset and canonical diagnosis;
+  consume its original-condition recommendation through existing Collection.
+
+Independent preparation uses existing owners: native capture-cost review and
+diagnostic/recollection readiness do not require the temporal implementation,
+GPU or robot ownership. They must not become a global prerequisite. Historical
+checkboxes below are version-scoped evidence, not a new mandatory full audit.
+
 ## Current LeRobot pick-place connection
 
 - [x] Preserve raw/processed chunk and originating observation-bound candidate before the existing proposal validator; replay a distinct read-only preexecution diagnostic without fabricating a terminal lifecycle or task failure. Focused producer/consumer regression covers storage failure, mutation, incomplete logs and unchanged outputs.

@@ -10,6 +10,68 @@ pending; the characterization tests below do not change a deployed threshold.
 
 ## Reuse boundary
 
+### September 13 product takeover: scoped temporal responsibility decision
+
+Decision: **REOPEN temporal responsibility**, limited to the existing bounded
+learned-task path. Main `2bab180` and its retained runtime evidence supersede the
+old coordinator's remembered deployment state. Thin natural-use work is closed;
+this is product work, not a Router experiment or executor replacement.
+
+The current source checks original input age at generation completion and again
+on entry to initial planning. Continuation additionally checks it after planning.
+After admission, however, approved recorder/approval delay already uses fresh
+execution state instead of the original image deadline. Thus `300 ms` is not a
+current observation-to-first-action deadline: placing the same delay on opposite
+sides of initial admission can change the verdict. OpenSpec explicitly required
+that behavior; changing it is a prospective contract change, not a claim that
+the implementation violated its specification.
+
+The last returned-user input reached inference completion at age295.097ms after
+169.110ms inference, then initial planning rejected before any learned/gripper
+send. The historical child admission time remains UNKNOWN. The saved-proposal
+12.442ms CPU observation is neither that missing time nor a latency guarantee.
+Optimizing for the remaining4.903ms alone leaves the semantic asymmetry open.
+
+Selected implementation direction, **not yet deployed or qualified**:
+
+- Preserve legacy proposal/admission semantics and their diagnostic readers.
+  Introduce an explicitly version-bound frozen-at-generation mode for existing
+  scoped task grants; do not silently reinterpret archived proposals.
+- Keep the existing original-stamp capture/pre/post-inference qualification.
+  A qualified immutable full output may become a candidate within its original
+  run, grant, Scene binding and predecessor context, not a motion authorization.
+- Retain generation context before capture and bind it into the proposal digest:
+  run identity, task-grant digest, Scene-binding digest and predecessor plan
+  identity (absent for the initial output). Do not attach that authority later
+  while importing an old output. A mode flag alone does not prevent replay.
+- The existing owner validates the matching grant before granting this temporal
+  interpretation. Initial and continuation planning use the same rule. Planning
+  must not restart the grant's wall/monotonic budget or terminal reserve; exact
+  plan admission and sole-executor dispatch remain separate later operations.
+- Preserve current full-state/start agreement, controller/hardware identity and
+  freshness, collision/contact, Scene/Cell, lease, cancellation and task bounds.
+  A HUMAN_GATED receipt alone cannot authorize the new scoped mode.
+
+This direction relies on the already approved structured Scene domain, just as
+the current post-admission delay does. It does not establish that unchanged
+robot joints or Scene revision detect arbitrary physical object movement. No
+new camera/person-absence approval or visual-validity detector is introduced.
+Unexpected physical changes remain subject to existing Scene/Cell invalidation.
+
+Implementation acceptance is a focused controlled-clock comparison: identical
+generation/context/current evidence with delay before versus after plan entry
+must receive the same new-mode temporal decision. Old output rewrapped under a
+new grant/run/Scene or reused with another predecessor, stale-at-generation or
+future completion, expired/revoked authority, cancelled continuation, changed
+hardware/start/Scene and stale current-state cases must reject with zero sends.
+Preserve original bytes/timestamps, strict JSONL and plan-only zero effects.
+Legacy freshness/rejection fixtures must retain their original meaning.
+
+Native capture/serialization optimization is an independent cost question, not
+a replacement for this decision. LeRobot continues to own loading, processors
+and inference. Only a concrete measured saving warrants an adapter change.
+Fresh physical qualification and Pick/release/recollection remain open.
+
 LeRobot owns policy implementation, saved processors and supported inference
 mechanisms. FR5 already calls `SmolVLAPolicy.from_pretrained`, saved native
 processors and `predict_action_chunk` in `learned_action_adapter.py`. Do not
