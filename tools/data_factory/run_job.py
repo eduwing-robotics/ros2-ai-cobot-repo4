@@ -2619,13 +2619,25 @@ def _infer_native_program(
                 robot_model_trial=robot_model_trial,
             )
 
-        except BaseException:
+        except BaseException as failure:
             if context is not None:
-                _runtime_child_request(child, {
-                    "schema_version": "fr5.pickup_executor.command.v4",
-                    "op_id": "cancel-generation-" + uuid.uuid4().hex, "op": "cancel",
-                    "payload": {"run_id": context["run_id"], "generation_id": context["generation_id"]},
-                }, cancel)
+                cleanup_code = None
+                try:
+                    response = _runtime_child_request(child, {
+                        "schema_version": "fr5.pickup_executor.command.v4",
+                        "op_id": "cancel-generation-" + uuid.uuid4().hex, "op": "cancel",
+                        "payload": {"run_id": context["run_id"], "generation_id": context["generation_id"]},
+                    }, cancel)
+                    if not isinstance(response, dict) or response.get("ok") is not True:
+                        cleanup_code = (response.get("code") or "CANCEL_UNCONFIRMED"
+                                        if isinstance(response, dict) else "CANCEL_UNCONFIRMED")
+                except BaseException as cleanup:
+                    cleanup_code = getattr(cleanup, "code", type(cleanup).__name__)
+                if cleanup_code is not None:
+                    # Preserve the primary exception and its traceback. This is
+                    # evidence about one cleanup attempt, never stop completion.
+                    failure.generation_cleanup = {"status": "UNCONFIRMED", "code": str(cleanup_code)[:128]}
+                    failure.add_note("Generation cancel unconfirmed: " + str(cleanup_code)[:128])
             raise
 
 
@@ -2719,7 +2731,8 @@ def run_learned_plan_only(payload, cancel, publish, *, checkpoint, observation=N
         return run_plan_only(payload, cancel, publish,
                              resolver=lambda _: (validated, program, scene), executor_factory=planning_child)
     except ContractError as exc:
-        return _response(ok=False, code=exc.code, state="BLOCKED", run_id=payload.get("run_id"))
+        return _response(ok=False, code=exc.code, state="BLOCKED", run_id=payload.get("run_id"),
+            data={"generation_cleanup": exc.generation_cleanup} if hasattr(exc, "generation_cleanup") else None)
     except Exception:
         return _response(ok=False, code="LEARNED_PREPARATION_FAILED", state="BLOCKED", run_id=payload.get("run_id"))
     finally:
@@ -2856,7 +2869,8 @@ def run_plan_only(payload, cancel, publish, *, resolver=resolve_inputs, executor
             },
         )
     except ContractError as exc:
-        return _response(ok=False, code=exc.code, state="BLOCKED", run_id=payload.get("run_id"))
+        return _response(ok=False, code=exc.code, state="BLOCKED", run_id=payload.get("run_id"),
+            data={"generation_cleanup": exc.generation_cleanup} if hasattr(exc, "generation_cleanup") else None)
     except Exception as exc:
         return _response(ok=False, code="RUNNER_FAILED", state="BLOCKED", run_id=payload.get("run_id"), data={"detail": str(exc)})
 
@@ -4917,9 +4931,12 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                     summary = _operator_summary(planned)
                 except Exception as exc:
                     cancelled = job.cancel()
+                    diagnostic = learned_run_diagnostic(cancelled, payload=payload)
+                    if hasattr(exc, "generation_cleanup"):
+                        diagnostic = {**(diagnostic or {}), "generation_cleanup": exc.generation_cleanup}
                     return _response(ok=False, code=exc.code if isinstance(exc, ContractError) else "LEARNED_NEXT_PREPARATION_FAILED",
                         state=cancelled["state"], run_id=payload["run_id"], plan_digest=job.plan_digest,
-                        data=learned_run_diagnostic(cancelled, payload=payload))
+                        data=diagnostic)
                 continue
             if result["state"] in {"GRASP_VERDICT", "SEMANTIC_VERDICT", "LEARNED_CHUNK_COMPLETE"}:
                 if pending == "LEARNED_NEXT_PLAN":
@@ -5205,7 +5222,8 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                 continue
             time.sleep(0.05)
     except ContractError as exc:
-        return _response(ok=False, code=exc.code, state="BLOCKED", run_id=payload.get("run_id"))
+        return _response(ok=False, code=exc.code, state="BLOCKED", run_id=payload.get("run_id"),
+            data={"generation_cleanup": exc.generation_cleanup} if hasattr(exc, "generation_cleanup") else None)
     except Exception as exc:
         return _response(ok=False, code="RUNNER_FAILED", state="BLOCKED", run_id=payload.get("run_id"), data={"detail": str(exc)})
     finally:

@@ -701,8 +701,13 @@ class OneJob:
             program = compile_program(motion_program, proposal)
         except ContractError as exc:
             if context is not None:
-                self._request("executor", "cancel", {"run_id": run_id, "generation_id": context["generation_id"]},
-                              allowed_failure=True, update_state=False)
+                try:
+                    cancelled = self._request("executor", "cancel", {"run_id": run_id, "generation_id": context["generation_id"]},
+                                              allowed_failure=True, update_state=False)
+                    if not cancelled["ok"]:
+                        self.cancel_error = cancelled["code"][:128]
+                except BaseException as cleanup:
+                    self.cancel_error = str(getattr(cleanup, "code", type(cleanup).__name__))[:128]
             self.state = "BLOCKED"
             return self._result(False, exc.code)
         return self.plan_only(run_id, program, scene_binding)

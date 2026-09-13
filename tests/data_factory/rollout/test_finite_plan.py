@@ -487,6 +487,20 @@ class FinitePlanTest(unittest.TestCase):
             with self.subTest(failure=failure):
                 self._public_native_consumer("plan_only", causal=True, scoped=True, generation_failure=failure)
 
+    def test_public_scoped_cleanup_failure_keeps_original_generation_error(self):
+        for mode in ("plan_only", "live"):
+            for failure in ("capture", "inference"):
+                for cleanup in ("exception", "rejected"):
+                    with self.subTest(mode=mode, failure=failure, cleanup=cleanup):
+                        self._public_native_consumer(mode, causal=True, scoped=True, granted=mode == "live",
+                            generation_failure=failure, cleanup_failure=cleanup)
+
+    def test_public_scoped_continuation_preserves_failure_and_separate_cleanup_evidence(self):
+        for cleanup in ("exception", "rejected"):
+            with self.subTest(cleanup=cleanup):
+                self._public_native_consumer("live", causal=True, scoped=True, granted=True,
+                    generation_failure="inference", cleanup_failure=cleanup, failure_on_next=True)
+
     def test_public_native_continuation_reuses_owner_and_recorder_with_exact_approval(self):
         self._public_native_consumer("live", causal=True, continuation=True)
 
@@ -502,7 +516,7 @@ class FinitePlanTest(unittest.TestCase):
     def test_public_causal_plan_only_freezes_explicit_percent_representation(self):
         self._public_native_consumer("plan_only", causal=True, reference_mode="serialized_percent_retime")
 
-    def _public_native_consumer(self, mode, *, causal=False, reference_mode=None, continuation=False, next_choice="APPROVE", precontact_cancel=False, granted=False, source_changed=False, scoped=False, generation_failure=None):
+    def _public_native_consumer(self, mode, *, causal=False, reference_mode=None, continuation=False, next_choice="APPROVE", precontact_cancel=False, granted=False, source_changed=False, scoped=False, generation_failure=None, cleanup_failure=None, failure_on_next=False):
         from tools.data_factory import run_job
         from tools.data_factory.learned_action_adapter import NativeSmolVLA
         from tests.data_factory.operator.fixtures import PROFILE, JOB, runtime_validated, payload
@@ -523,7 +537,7 @@ class FinitePlanTest(unittest.TestCase):
         transport.hardware_causal = causal
         transport.hardware_selected = causal
         def capture(topics, age):
-            if generation_failure == "capture":
+            if generation_failure == "capture" and (not failure_on_next or calls.count(("executor", "capture_observation")) == 2):
                 raise ContractError("LEARNED_STALE_OBSERVATION")
             self.assertEqual(topics, {"camera1": "/up", "camera2": "/wrist"})
             self.assertEqual(age, .3)
@@ -539,6 +553,11 @@ class FinitePlanTest(unittest.TestCase):
         def request(value, _cancel):
             calls.append(("executor", value["op"]))
             observed_requests.append(copy.deepcopy(value))
+            if value["op"] == "cancel" and "generation_id" in value["payload"] and cleanup_failure is not None:
+                if cleanup_failure == "exception":
+                    raise ContractError("JSONL_BROKEN_PIPE")
+                value = copy.deepcopy(value)
+                value["payload"]["generation_id"] = "wrong-generation"
             return executor.process(value)
         child = SimpleNamespace(request=request, close=lambda **_: closed.append(True))
         recorder = Recorder(calls)
@@ -559,7 +578,7 @@ class FinitePlanTest(unittest.TestCase):
                 yield self
             checkpoint = CHECKPOINT
             def __call__(self, value):
-                if generation_failure == "inference":
+                if generation_failure == "inference" and (not failure_on_next or calls.count(("native", "prepare")) == 2):
                     raise RuntimeError("synthetic inference failure")
                 self_test.assertEqual(value["task"], "synthetic probe")
                 return [ACTION[:]]
@@ -643,10 +662,19 @@ class FinitePlanTest(unittest.TestCase):
                 result = session.snapshot
             if generation_failure is not None:
                 self.assertEqual(result["code"], "LEARNED_STALE_OBSERVATION" if generation_failure == "capture" else "LEARNED_POLICY_FAILED")
-                self.assertEqual(calls.count(("executor", "cancel")), 1)
-                self.assertTrue(executor._generation["cancelled"])
-                self.assertEqual(transport.sent, [])
-                self.assertFalse(any(target == "recorder" for target, _ in calls))
+                self.assertEqual(calls.count(("executor", "cancel")), 2 if failure_on_next else 1)
+                self.assertEqual(executor._generation["cancelled"], cleanup_failure is None)
+                if cleanup_failure is not None:
+                    self.assertEqual(result["data"]["generation_cleanup"], {"status": "UNCONFIRMED",
+                        "code": "JSONL_BROKEN_PIPE" if cleanup_failure == "exception" else "LEARNED_GENERATION_CONTEXT"})
+                self.assertEqual(len(transport.sent), 1 if failure_on_next else 0)
+                self.assertEqual(calls.count(("recorder", "begin")), 1 if failure_on_next else 0)
+                if failure_on_next:
+                    self.assertTrue(executor.runs["run"]["cancel_event"].is_set())
+                    self.assertFalse(transport.owns_active_goal)
+                    self.assertEqual(result["data"]["task_effectiveness"], "UNKNOWN")
+                else:
+                    self.assertFalse(any(target == "recorder" for target, _ in calls))
                 self.assertEqual(closed, [True])
                 return
             if granted and source_changed:
@@ -2465,6 +2493,34 @@ class FinitePlanTest(unittest.TestCase):
             "op": "plan", "payload": {"run_id": "run", "motion_program": compile_program(source(), p), "scene_binding": SCENE}})
         self.assertEqual(result["code"], "LEARNED_CANCELLED")
         self.assertEqual(transport.sent, [])
+
+    def test_scoped_one_job_preserves_policy_failure_when_cancel_is_unconfirmed(self):
+        from tools.data_factory.rollout.finite_plan import generation_spec
+        for broken_pipe in (False, True):
+            with self.subTest(broken_pipe=broken_pipe):
+                transport, calls = Transport(), []
+                executor = PickupExecutor(transport, source_clock=lambda: 10., monotonic_clock=lambda: 10.)
+                def request(value):
+                    calls.append(value["op"])
+                    if value["op"] == "cancel":
+                        if broken_pipe:
+                            raise BrokenPipeError("synthetic closed transport")
+                        value = copy.deepcopy(value)
+                        value["payload"]["generation_id"] = "wrong-generation"
+                    return executor.process(value)
+                recorder = mock.Mock(side_effect=AssertionError("recorder must not start"))
+                job = OneJob(recorder, request)
+                def failed_policy(_):
+                    raise RuntimeError("original inference failure")
+                inference = FinitePolicyInference(failed_policy, CHECKPOINT, source_clock=lambda: 10.)
+                grant = task_grant(source(), SCENE, generation_spec(CHECKPOINT, **OPTIONS))
+                result = job.plan_learned("run", source(), SCENE, inference, observation(), task_grant=grant, **OPTIONS)
+                self.assertEqual(result["code"], "LEARNED_POLICY_FAILED")
+                self.assertEqual(result["cancel_error"], "EXECUTOR_CALL_FAILED" if broken_pipe else "LEARNED_GENERATION_CONTEXT")
+                self.assertEqual(result["state"], "BLOCKED")
+                self.assertEqual(calls, ["begin_generation", "cancel"])
+                self.assertEqual(transport.sent, [])
+                recorder.assert_not_called()
 
     def start_job(self):
         values = self.make_job()
