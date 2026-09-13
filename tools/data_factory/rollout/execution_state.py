@@ -120,3 +120,49 @@ def current_state(policy, evidence, now, *, steady_now, max_age_s, allow_pending
     wire = check_hardware(evidence, now, steady_now, max_age_s, allow_pending=allow_pending)
     check_runtime_binding(policy, evidence, wire)
     return state
+
+
+def reference_rows(policy, initial_state, actions):
+    """Check the selected native ARM-linear/gripper-next-point references.
+
+    Uses the already admitted model/scaling, without retiming. Gripper speed
+    and force remain native hardware settings, not a fictitious 7D spline.
+    """
+    try:
+        if not isinstance(actions, (list, tuple)) or not actions:
+            raise ContractError("LEARNED_ACTION_7D")
+        rows = [list(_action(row)) for row in (initial_state, *actions)]
+        period = _number(policy["period_s"], "LEARNED_HORIZON")
+        scaling = _number(policy["velocity_scaling"], "LEARNED_LIMITS")
+        if period <= 0 or not 0 < scaling <= 1:
+            raise ContractError("LEARNED_LIMITS")
+        limits = _limits(policy["robot_description"])
+        if any(not low <= value <= high for row in rows
+               for value, (low, high, _) in zip(row, limits)):
+            raise ContractError("LEARNED_JOINT_LIMIT")
+        if any(abs(b - a) / period > velocity * scaling + 1e-9
+               for previous, current in zip(rows, rows[1:])
+               for a, b, (_, _, velocity) in zip(previous[:6], current[:6], limits[:6])):
+            raise ContractError("LEARNED_VELOCITY_LIMIT")
+        return rows
+    except ContractError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ContractError("LEARNED_ACTION_7D") from exc
+
+
+def check_reference_anchor(source, anchor, current, observed, *, prepared_observed):
+    """Check for movement since preparation, not completion of the old target.
+
+    Reference and feedback are different quantities, including during contact.
+    Compare each to its own retained value; never require them to coincide or
+    rewrite the already geometry-checked anchor at commit.
+    """
+    tolerance = source["planning"]["goal_tolerances"]["joint_rad"]
+    gripper_tolerance = next(step["limits"]["completion_tolerance_m"] for step in source["steps"]
+                             if step["phase"] == "GRIPPER_CLOSE")
+    if (any(abs(a - b) > tolerance for a, b in zip(anchor[:6], current[:6]))
+            or abs(anchor[6] - current[6]) > gripper_tolerance
+            or abs(prepared_observed["gripper_controller"]["reference_position_m"]
+                   - observed["gripper_controller"]["reference_position_m"]) > gripper_tolerance):
+        raise ContractError("START_STATE_MISMATCH")

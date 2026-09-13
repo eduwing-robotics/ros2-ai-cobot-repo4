@@ -50,7 +50,7 @@ PHASES = (
 ARM_PHASES = frozenset(PHASES) - {"GRIPPER_CLOSE", "GRIPPER_OPEN"}
 JOINT_ORDER = ["j1", "j2", "j3", "j4", "j5", "j6"]
 COMMAND_FIELDS = {"schema_version", "op_id", "op", "payload"}
-COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "observe_policy", "plan", "plan_stream", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
+COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "prepare_stream_revision", "commit_stream_revision", "preflight", "capture_observation", "observe_policy", "plan", "plan_stream", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
 ACTIVE_STATES = {"EXECUTING", "PRECONTACT_HUMAN", "GRASP_VERDICT", "SEMANTIC_VERDICT", "LEARNED_CHUNK_COMPLETE", "RELEASE_VERDICT"}
 RECYCLE_PHASES = ("RECYCLE_APPROACH_PTP", "LOWER_LIN", "GRIPPER_OPEN", "RETREAT_LIN", "SAFE_POSE_PTP")
 EXECUTION_RESULT_MARGIN_S = 2.0
@@ -1817,6 +1817,349 @@ class PickupExecutor:
             self._fault(run, exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_OPEN")
         return self._execution_response(run, plan["run_id"], run["digest"], "EXECUTING")
 
+    def _stream_revision_owner(self, payload, extra_fields, code):
+        run = self._execution_payload(
+            payload,
+            {"run_id", "plan_digest", "lease_id", *extra_fields},
+            code,
+        )
+        if (not self._native_task(run) or "task_grant" not in run
+                or run["state"] != "EXECUTING" or "mechanical_terminal" in run):
+            raise ContractError("TASK_GRANT_STATE")
+        self._check_task(run)
+        execution = run["execution"]
+        if payload["lease_id"] != execution["lease_id"]:
+            raise ContractError("LEASE_BINDING")
+        if run["cancel_event"].is_set():
+            raise ContractError("LEARNED_CANCELLED")
+        if self.monotonic_clock() >= execution["lease_deadline"]:
+            raise ContractError("HEARTBEAT_TIMEOUT")
+        if execution.get("geometry_initialization", {}).get("status") != "READY":
+            raise ContractError("NATIVE_GEOMETRY_NOT_READY")
+        return run
+
+    def _native_submission_state(self):
+        reader = getattr(self.transport, "learned_actuator_stream_submission_state", None)
+        if not callable(reader):
+            raise ContractError("ROS_EXEC_STREAM_STATUS")
+        state = reader()
+        if (not isinstance(state, dict)
+                or set(state) != {"submission_attempts", "current_revision"}
+                or not isinstance(state["submission_attempts"], dict)
+                or set(state["submission_attempts"]) != {"arm", "gripper"}
+                or any(type(value) is not int or value < 0
+                       for value in state["submission_attempts"].values())
+                or state["current_revision"] is not None
+                and (not isinstance(state["current_revision"], str)
+                     or not DIGEST.fullmatch(state["current_revision"]))):
+            raise ContractError("ROS_EXEC_STREAM_STATUS")
+        return copy.deepcopy(state)
+
+    def _native_current_state(self, run):
+        from tools.data_factory.rollout.execution_state import current_state
+        from tools.data_factory.rollout.gripper_evidence import identity
+
+        source, policy = self._run_program(run), run["plan"]["policy"]
+        observed = self.transport.poll_snapshot(
+            source["planning"]["max_joint_state_age_s"],
+        )
+        now, steady = self.source_clock(), self.monotonic_clock()
+        evidence = {
+            "captured_at_s": now,
+            "captured_monotonic_s": steady,
+            "snapshot": copy.deepcopy(observed),
+        }
+        state = current_state(
+            policy, evidence, now, steady_now=steady,
+            max_age_s=source["planning"]["max_joint_state_age_s"],
+            allow_pending=True,
+        )
+        if (_gripper_settings(observed["gripper_settings"])
+                != run["execution"]["active_gripper_settings"]):
+            raise ContractError("GRIPPER_SETTINGS_MISMATCH")
+        if (identity(observed["gripper_controller"]["hardware_execution"]["wire"])
+                != run["execution"]["initial_hardware_incarnation"]):
+            raise ContractError("LEARNED_HARDWARE_INCARNATION")
+        return observed, state
+
+    @staticmethod
+    def _revision_point_times(arm_goal):
+        try:
+            return [
+                point.time_from_start.sec * 1_000_000_000
+                + point.time_from_start.nanosec
+                for point in arm_goal.trajectory.points
+            ]
+        except (AttributeError, TypeError) as exc:
+            raise ContractError("ROS_EXEC_STEP") from exc
+
+    def _prepare_stream_revision(self, payload):
+        run = self._stream_revision_owner(
+            payload, {"selection"}, "LEARNED_STREAM_REVISION_SCHEMA",
+        )
+        from tools.data_factory.rollout.execution_state import reference_rows
+        from tools.data_factory.rollout.stream_selection import validate_stream_selection
+
+        policy, execution = run["plan"]["policy"], run["execution"]
+        selected = validate_stream_selection(
+            payload["selection"], robot_description=policy["robot_description"],
+            max_observation_age_s=policy["max_observation_age_s"],
+        )
+        revisions = execution.setdefault("native_revisions", [])
+        if run.get("_native_revision_candidate") is not None:
+            raise ContractError("NATIVE_GEOMETRY_BUSY")
+        committed = [item for item in revisions if item["status"] == "SUBMITTED"]
+        if any(item["selection_digest"] == selected["selection_digest"] for item in committed):
+            raise ContractError("LEARNED_STREAM_SELECTION_REUSED")
+        if committed:
+            previous = committed[-1]["selection"]
+            if (selected["source_chunk"] < previous["source_chunk"]
+                    or selected["source_chunk"] == previous["source_chunk"]
+                    and selected["source_row_indices"][0] <= previous["source_row_indices"][-1]):
+                raise ContractError("LEARNED_STREAM_SELECTION_REORDERED")
+        committed_chunks = {item["selection"]["source_chunk"] for item in committed}
+        if (selected["source_chunk"] not in committed_chunks
+                and len(committed_chunks) >= run["task_grant"]["max_outputs"]):
+            raise ContractError("TASK_OUTPUT_LIMIT_REACHED")
+
+        observed, anchor = self._native_current_state(run)
+        rows = reference_rows(policy, anchor, selected["controller_actions"])
+        arm, gripper = self.transport.build_learned_actuator_goals(
+            rows[0], rows[1:], period_s=policy["period_s"],
+        )
+        point_times = self._revision_point_times(arm)
+        submission = self._native_submission_state()
+        previous_intent = next((
+            item["geometry"].get("reference_intent", {}).get("intent")
+            for item in reversed(revisions)
+            if item["status"] == "SUBMITTED"
+            and isinstance(item.get("geometry"), dict)
+            and isinstance(item["geometry"].get("reference_intent"), dict)
+        ), None)
+        scene = {
+            "scene_state_digest": execution["scene_state_digest"],
+            "revision": execution["scene_revision"],
+        }
+        binding = self.transport.prepare_learned_revision_geometry(
+            arm, gripper, revision=selected["selection_digest"],
+            scene_binding=scene, deadline=run["task_deadline"],
+            prior_intent=previous_intent,
+        )
+        record = {
+            "selection_digest": selected["selection_digest"],
+            "selection": copy.deepcopy(selected), "status": "CHECKING",
+            "geometry": None, "reference_consumed_count": 0,
+        }
+        revisions.append(record)
+        run["_native_revision_candidate"] = {
+            "selection": selected, "anchor": anchor,
+            "prepared_observed": copy.deepcopy(observed),
+            "arm": arm, "gripper": gripper,
+            "point_times_ns": point_times, "binding": binding,
+            "expected_predecessor": submission["current_revision"],
+            "record_index": len(revisions) - 1,
+        }
+        return self._execution_response(
+            run, run["plan"]["run_id"], run["digest"],
+            "LEARNED_REVISION_CHECKING",
+        )
+
+    def _commit_stream_revision(self, payload):
+        run = self._stream_revision_owner(
+            payload, {"selection_digest", "start_time_ns"},
+            "LEARNED_STREAM_REVISION_SCHEMA",
+        )
+        digest = payload["selection_digest"]
+        if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+            raise ContractError("LEARNED_STREAM_REVISION_SCHEMA")
+        candidate = run.get("_native_revision_candidate")
+        execution = run["execution"]
+        if (not isinstance(candidate, dict)
+                or candidate["selection"]["selection_digest"] != digest):
+            raise ContractError("NATIVE_GEOMETRY_NOT_CHECKED")
+        record = execution["native_revisions"][candidate["record_index"]]
+        if record["status"] != "CHECKED":
+            raise ContractError("NATIVE_GEOMETRY_NOT_CHECKED")
+        before = self._native_submission_state()
+        executable = None
+        entered_submit = False
+        try:
+            with self._learned_dispatch_scene(run):
+                def guard(pair, predecessor):
+                    # The transport has already bound the unchanged relative
+                    # template and fills only its explicit common epoch.
+                    if predecessor != candidate["expected_predecessor"]:
+                        raise ContractError("LEARNED_STREAM_PREDECESSOR")
+                    self._check_learned_dispatch(run)
+                    cell = self.cell_state_store.read() if self.cell_state_store is not None else {}
+                    source = self._run_program(run)
+                    if (cell.get("robot_system_id") != source["robot_system_id"]
+                            or cell.get("cell_ready") is not False
+                            or cell.get("reason_code") != "EXECUTION_IN_PROGRESS"
+                            or cell.get("run_id") != run["plan"]["run_id"]
+                            or cell.get("plan_digest") != run["digest"]):
+                        raise ContractError("LEARNED_NEXT_CELL_BINDING")
+                    try:
+                        headers = [
+                            goal.trajectory.header.stamp.sec * 1_000_000_000
+                            + goal.trajectory.header.stamp.nanosec
+                            for goal in (pair["arm"], pair["gripper"])
+                        ]
+                    except (KeyError, AttributeError, TypeError) as exc:
+                        raise ContractError("ROS_EXEC_STEP") from exc
+                    if headers != [payload["start_time_ns"]] * 2:
+                        raise ContractError("ROS_EXEC_STEP")
+                    observed, current = self._native_current_state(run)
+                    from tools.data_factory.rollout.execution_state import check_reference_anchor
+                    check_reference_anchor(
+                        source, candidate["anchor"], current,
+                        observed, prepared_observed=candidate["prepared_observed"],
+                    )
+                    # No guessed lead: merely reject an epoch already expired
+                    # after all cached current-state validation completed.
+                    if payload["start_time_ns"] <= round(self.source_clock() * 1_000_000_000):
+                        raise ContractError("ROS_EXEC_STEP")
+
+                entered_submit = True
+                executable = self.transport.submit_checked_learned_revision(
+                    binding=candidate["binding"],
+                    scene_binding={
+                        "scene_state_digest": execution["scene_state_digest"],
+                        "revision": execution["scene_revision"],
+                    },
+                    start_time_ns=payload["start_time_ns"],
+                    dispatch_guard=guard,
+                )
+            after = self._native_submission_state()
+            delta = {
+                actuator: after["submission_attempts"][actuator]
+                - before["submission_attempts"][actuator]
+                for actuator in ("arm", "gripper")
+            }
+            if delta != {"arm": 1, "gripper": 1}:
+                raise ContractError("ROS_EXEC_STREAM_STATUS")
+        except Exception as exc:
+            code = exc.code if isinstance(exc, ContractError) else "ROS_EXEC_GOAL_FAILED"
+            retained = getattr(exc, "native_executable_revision", None)
+            if executable is None and isinstance(retained, dict):
+                executable = copy.deepcopy(retained)
+            uncertain = False
+            attempted = False
+            if entered_submit:
+                try:
+                    after = self._native_submission_state()
+                    attempted = any(
+                        after["submission_attempts"][actuator]
+                        > before["submission_attempts"][actuator]
+                        for actuator in ("arm", "gripper")
+                    )
+                except Exception:
+                    uncertain = True
+                    attempted = True
+            record["status"] = "REJECTED"
+            if executable is not None:
+                record["executable"] = copy.deepcopy(executable)
+            run.pop("_native_revision_candidate", None)
+            if attempted:
+                execution["motion_dispatch_attempted"] = True
+                if uncertain:
+                    execution["actuator_stream_drain_error"] = "ROS_EXEC_STREAM_STATUS"
+                self._fault(run, code)
+                return self._execution_response(
+                    run, run["plan"]["run_id"], run["digest"], code,
+                )
+            return _response(
+                code=code, run_id=run["plan"]["run_id"],
+                plan_digest=run["digest"], state=run["state"],
+                data=self._execution_data(run),
+            )
+
+        record.update(status="SUBMITTED", executable=copy.deepcopy(executable))
+        run.pop("_native_revision_candidate", None)
+        execution["motion_dispatch_attempted"] = True
+        from tools.data_factory.rollout.stream_progress import ReferenceProgress
+        run.setdefault("_native_revision_progress", {})[executable["revision"]] = {
+            "progress": ReferenceProgress(executable["revision"], candidate["point_times_ns"]),
+            "record_index": candidate["record_index"],
+            "expected_predecessor": candidate["expected_predecessor"],
+            "retired_actuators": set(),
+        }
+        return self._execution_response(
+            run, run["plan"]["run_id"], run["digest"],
+            "LEARNED_REVISION_SUBMITTED",
+        )
+
+    def _poll_stream_revision_geometry(self, run):
+        candidate = run.get("_native_revision_candidate")
+        if candidate is None:
+            return
+        record = run["execution"]["native_revisions"][candidate["record_index"]]
+        if record["status"] != "CHECKING":
+            return
+        try:
+            report = self.transport.poll_learned_revision_geometry(
+                binding=candidate["binding"],
+            )
+            if report is None:
+                return
+            record.update(status="CHECKED", geometry=copy.deepcopy(report))
+        except Exception as exc:
+            record.update(
+                status="REJECTED",
+                geometry={"status": "REJECTED", "code": (
+                    exc.code if isinstance(exc, ContractError)
+                    else "NATIVE_GEOMETRY_FAILED"
+                )},
+            )
+            run.pop("_native_revision_candidate", None)
+
+    def _observe_stream_progress(self, run, events):
+        tracked = run.get("_native_revision_progress", {})
+        revisions = run["execution"].get("native_revisions", [])
+        # A child successor can be accepted before the sibling and therefore
+        # before pair-wide acceptance. Recognize that exact actuator relation
+        # first, so its canceled retiring handle is not mistaken for a failure
+        # of current motion even when both facts arrive in the same poll.
+        for event in events:
+            owned = tracked.get(event.get("revision")) if isinstance(event, dict) else None
+            if owned is None:
+                continue
+            if event.get("event") == "PAIR_ACCEPTED":
+                predecessor = event.get("predecessor")
+                if predecessor != owned["expected_predecessor"]:
+                    raise ContractError("LEARNED_STREAM_PREDECESSOR")
+                actuators = {"arm", "gripper"}
+            elif event.get("event") == "ACCEPTED" and event.get("actuator") in {"arm", "gripper"}:
+                predecessor = owned["expected_predecessor"]
+                actuators = {event["actuator"]}
+            else:
+                continue
+            retired = tracked.get(predecessor)
+            if retired is not None:
+                retired["retired_actuators"].update(actuators)
+        for event in events:
+            owned = tracked.get(event.get("revision")) if isinstance(event, dict) else None
+            if owned is None:
+                continue
+            progress = owned["progress"]
+            count = progress.observe(event)
+            revisions[owned["record_index"]]["reference_consumed_count"] = count
+            expected_retirement = (
+                event.get("actuator") in owned["retired_actuators"]
+                and event.get("event") == "TERMINAL"
+                and event.get("result_status") == 5
+                and event.get("error_code") == 0
+            )
+            if (event.get("event") == "REJECTED"
+                    or event.get("event") == "TERMINAL"
+                    and not expected_retirement
+                    and (event.get("result_status") != 4 or event.get("error_code") != 0)):
+                raise ContractError("ROS_EXEC_RESULT_FAILED")
+        run["execution"]["native_stream"]["reference_consumed_count"] = sum(
+            item["reference_consumed_count"] for item in revisions
+            if item["status"] == "SUBMITTED"
+        )
+
     def _execution_response(self, run, run_id, plan_digest, success_code):
         if run["state"] == "BLOCKED":
             response = _response(code=run["failure_code"], run_id=run_id, plan_digest=plan_digest, state="BLOCKED", data=self._execution_data(run))
@@ -1841,7 +2184,7 @@ class PickupExecutor:
             data["terminal_verification"] = copy.deepcopy(execution["terminal_verification"])
         if "scene_preservation" in execution:
             data["scene_preservation"] = copy.deepcopy(execution["scene_preservation"])
-        for key in ("native_stream", "actuator_stream_events", "actuator_stream_feedback", "actuator_stream_drain", "actuator_stream_drain_error"):
+        for key in ("native_stream", "native_revisions", "actuator_stream_events", "actuator_stream_feedback", "actuator_stream_drain", "actuator_stream_drain_error"):
             if key in execution:
                 data[key] = copy.deepcopy(execution[key])
         if run.get("recycle_plan_digest") is not None:
@@ -2446,7 +2789,9 @@ class PickupExecutor:
                     self._fault(run, {"PRECONTACT_HUMAN": "PRECONTACT_TIMEOUT", "GRASP_VERDICT": "GRASP_VERDICT_TIMEOUT", "SEMANTIC_VERDICT": "SEMANTIC_TIMEOUT", "LEARNED_CHUNK_COMPLETE": "LEARNED_CHUNK_TIMEOUT", "RELEASE_VERDICT": "RELEASE_VERDICT_TIMEOUT"}[run["state"]])
             elif self._native_task(run):
                 try:
-                    self._retain_actuator_stream_events(execution, self.transport.poll_learned_actuator_stream())
+                    events = self.transport.poll_learned_actuator_stream()
+                    self._retain_actuator_stream_events(execution, events)
+                    self._observe_stream_progress(run, events)
                     if execution["native_stream"]["status"] == "OPENING":
                         geometry = self.transport.poll_learned_geometry()
                         if geometry is not None:
@@ -2456,11 +2801,18 @@ class PickupExecutor:
                                 raise ContractError("NATIVE_GEOMETRY_INITIALIZATION")
                             execution["geometry_initialization"] = copy.deepcopy(geometry)
                             execution["native_stream"]["status"] = "WAITING_FOR_POLICY"
+                    # Reuse initialized, nonblocking controller caches while
+                    # geometry is pending; this is the task watchdog, not a
+                    # per-row completion or recorder acknowledgement barrier.
+                    self._native_current_state(run)
+                    self._poll_stream_revision_geometry(run)
                 except Exception as exc:
                     # Native polling may already have removed acceptance/result
                     # facts before raising. Draining cannot recover that batch.
+                    attached = getattr(exc, "actuator_stream_events", [])
                     try:
-                        self._retain_actuator_stream_events(execution, getattr(exc, "actuator_stream_events", []))
+                        self._retain_actuator_stream_events(execution, attached)
+                        self._observe_stream_progress(run, attached)
                     except Exception as retention_error:
                         execution["actuator_stream_drain_error"] = (
                             retention_error.code if isinstance(retention_error, ContractError)

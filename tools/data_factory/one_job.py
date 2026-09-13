@@ -1252,6 +1252,33 @@ class OneJob:
         self.state = "EXECUTING"
         return self._result(True, "GRASP_VERDICT_ACCEPTED")
 
+    def prepare_stream_revision(self, selection):
+        """Request asynchronous checking by the existing task's motion owner."""
+        return self._stream_revision_request("prepare_stream_revision", {"selection": selection})
+
+    def commit_stream_revision(self, selection_digest, start_time_ns):
+        """Request commit of a checked selection; this caller grants no authority.
+
+        The epoch is explicit, not guessed from prediction horizon or freshness.
+        The executor still checks the exact candidate and current execution
+        boundary before its sole native actuator port can submit anything.
+        """
+        return self._stream_revision_request("commit_stream_revision", {
+            "selection_digest": selection_digest, "start_time_ns": start_time_ns})
+
+    def _stream_revision_request(self, op, values):
+        from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA
+        if (self.state != "EXECUTING" or self.approval_scope != "SCOPED_TASK_GRANT"
+                or not self.plan_envelope or self.plan_envelope["plan"]["schema_version"] != PLAN_SCHEMA):
+            return self._result(False, "TASK_GRANT_STATE")
+        try:
+            response = self._request("executor", op, {
+                "run_id": self.run_id, "plan_digest": self.plan_digest,
+                "lease_id": self.lease_id, **copy.deepcopy(values)}, allowed_failure=True)
+            return self._result(response["ok"], response["code"])
+        except ContractError as exc:
+            return self._result(False, exc.code)
+
     def observe_policy(self, camera_topics, max_observation_age_s=.3):
         """Poll task-scoped inputs independently of reference completion.
 

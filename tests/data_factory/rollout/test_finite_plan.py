@@ -8,6 +8,7 @@ import time
 import json
 import tempfile
 import unittest
+from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -351,6 +352,54 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
                 "checkpoint": copy.deepcopy(CHECKPOINT), **OPTIONS,
                 "velocity_scaling": .1, "max_observation_age_s": .3}
 
+    @staticmethod
+    def selection(*, chunk=1, index=0):
+        from tools.data_factory.rollout.action_projection import project_gripper_position
+        from tools.data_factory.rollout.stream_selection import SELECTION_SCHEMA
+
+        source_observation = {
+            "observation_digest": canonical_digest(["observation", chunk]),
+            "source_clock": "SYSTEM_TIME",
+            "source_timestamps_s": dict.fromkeys(("camera1", "camera2", "state"), 10.),
+        }
+        eligibility = {
+            "schema_version": "data_factory.native_generation_eligibility.v1",
+            "chunk_id": chunk,
+            **copy.deepcopy(source_observation),
+            "sampling_started_at_s": 10.,
+            "sampling_started_monotonic_s": 10.,
+            "merge_completed_at_s": 10.1,
+            "merge_completed_monotonic_s": 10.1,
+            "max_observation_age_s": .3,
+            "eligible": True,
+        }
+        eligibility["receipt_digest"] = canonical_digest(eligibility)
+        controller = [
+            *ACTION[:6],
+            project_gripper_position(
+                ACTION[6], upper_m=.02, projection_quanta=2,
+            )["projected_m"],
+        ]
+        selected = {
+            "schema_version": SELECTION_SCHEMA,
+            "snapshot_generation": chunk,
+            "snapshot_queue_index": index,
+            "source_chunk": chunk,
+            "source_row_indices": [index],
+            "source_observation": source_observation,
+            "generation_eligibility": eligibility,
+            "joint_order": list(JOINTS),
+            "units": ["rad"] * 6 + ["m"],
+            "action_semantics": "ABSOLUTE_JOINT_POSITION",
+            "raw_actions": [ACTION[:]],
+            "processed_actions": [ACTION[:]],
+            "controller_actions": [controller],
+            "robot_description_digest": "sha256:" + hashlib.sha256(XML.encode()).hexdigest(),
+            "gripper_projection": {"upper_m": .02, "projection_quanta": 2},
+        }
+        selected["selection_digest"] = canonical_digest(selected)
+        return selected
+
     def owners(self):
         transport, recorder, cell = mock.Mock(), mock.Mock(), mock.Mock()
         executor = PickupExecutor(transport, source_clock=lambda: 10., monotonic_clock=lambda: 10.)
@@ -406,34 +455,196 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
         self.assertEqual(job.plan_stream("run", src, SCENE, policy)["code"], "EXECUTOR_RESPONSE")
         self.assertIsNone(job.approval_scope)
 
-    def started_owner(self, *, prepare_error=None, geometry_ready=True):
+    def started_owner(self, *, prepare_error=None, geometry_ready=True,
+                      actual_pair=False):
         """Real OneJob/executor lifecycle; native transport and geometry are synthetic."""
-        class Port(Transport):
+        from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+
+        class Port(Transport, RosMoveItTransport):
             def __init__(self):
                 super().__init__()
+                self.actual_pair = actual_pair
                 self.hardware = True
                 self.stream = None
                 self.polls = 0
                 self.settle = True
+                self.revision_candidate = None
+                self.revision_events = []
+                self.revision_check_pending = False
+                self.submission_attempts = {"arm": 0, "gripper": 0}
+                self.current_revision = None
+                if actual_pair:
+                    from control_msgs.action import FollowJointTrajectory
+                    from trajectory_msgs.msg import JointTrajectoryPoint
+                    self._active = None
+                    self._execution_locked = False
+                    self._execute_goal_count = self._gripper_goal_count = 0
+                    self._clock = lambda: 10.
+                    self._FollowJointTrajectory = FollowJointTrajectory
+                    self._JointTrajectoryPoint = JointTrajectoryPoint
+                    self._rclpy = SimpleNamespace(spin_once=mock.Mock())
+                    self.node = object()
+                    self.arm_client, self.gripper_client = mock.Mock(), mock.Mock()
+                    self.arm_response, self.gripper_response = Future(), Future()
+                    self.arm_client.send_goal_async.return_value = self.arm_response
+                    self.gripper_client.send_goal_async.return_value = self.gripper_response
+                    self.gripper = self.gripper_client
             def open_learned_actuator_stream(self, *, deadline):
+                if self.actual_pair:
+                    from tools.data_factory.motion.actuator_stream import ActuatorStream
+                    self._active = ActuatorStream(
+                        self.arm_client, self.gripper_client,
+                        deadline=deadline, clock=self._clock,
+                    )
+                    return
                 self.stream = {"active": True, "fenced": False, "owns_goals": False}
             def start_learned_geometry(self, plan, context, *, deadline):
                 self.geometry = {"status": "READY", "initialization_digest": canonical_digest("cpu-fixture")} if geometry_ready else None
+                if self.actual_pair:
+                    self._native_geometry_ready = copy.deepcopy(self.geometry)
+                    self._native_geometry_context = copy.deepcopy(context)
+                    self._native_geometry_plan = copy.deepcopy(plan)
+                    self._native_geometry_deadline = deadline
+                    self._native_geometry_candidate = None
+                    self._native_geometry_capture = None
+                    self._native_geometry = mock.Mock()
             def poll_learned_geometry(self):
                 return self.geometry
             def poll_learned_actuator_stream(self):
                 self.polls += 1
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.poll_learned_actuator_stream(self)
                 if self.stream and self.stream["fenced"] and self.settle:
                     self.stream["owns_goals"] = False
-                return []
+                events, self.revision_events = self.revision_events, []
+                for event in events:
+                    if event.get("event") == "PAIR_ACCEPTED":
+                        self.current_revision = event["revision"]
+                return events
             def learned_actuator_stream_status(self):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.learned_actuator_stream_status(self)
                 return self.stream or {"active": False, "fenced": False, "owns_goals": False}
             def fence_learned_actuator_stream(self):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.fence_learned_actuator_stream(self)
                 self.stream["fenced"] = True
             def close_learned_actuator_stream(self):
                 if not self.stream["fenced"] or self.stream["owns_goals"]:
                     raise ContractError("ROS_EXEC_ACTIVE")
                 self.stream = None
+            def poll_snapshot(self, max_age_s):
+                return self.snapshot(max_age_s)
+            def learned_actuator_stream_submission_state(self):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.learned_actuator_stream_submission_state(self)
+                return {"submission_attempts": copy.deepcopy(self.submission_attempts),
+                        "current_revision": self.current_revision}
+            def build_learned_actuator_goals(self, initial_state, actions, *, period_s, start_time_ns=None):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.build_learned_actuator_goals(
+                        self, initial_state, actions, period_s=period_s,
+                        start_time_ns=start_time_ns,
+                    )
+                def goal(rows):
+                    points = []
+                    for row, seconds in zip(rows, (index * period_s for index in range(len(rows)))):
+                        stamp = round(seconds * 1_000_000_000)
+                        points.append(SimpleNamespace(
+                            positions=list(row),
+                            time_from_start=SimpleNamespace(
+                                sec=stamp // 1_000_000_000,
+                                nanosec=stamp % 1_000_000_000,
+                            ),
+                        ))
+                    return SimpleNamespace(trajectory=SimpleNamespace(
+                        header=SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0)),
+                        points=points,
+                    ))
+                rows = [initial_state, *actions]
+                return goal([row[:6] for row in rows]), goal([row[6:] for row in rows])
+            def prepare_learned_revision_geometry(self, arm, gripper, *, revision,
+                                                  scene_binding, deadline, assignments=None,
+                                                  prior_intent=None):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.prepare_learned_revision_geometry(
+                        self, arm, gripper, revision=revision,
+                        scene_binding=scene_binding, deadline=deadline,
+                        assignments=assignments, prior_intent=prior_intent,
+                    )
+                binding = canonical_digest({"revision": revision, "scene": scene_binding,
+                                            "prior_intent": prior_intent})
+                self.revision_candidate = {
+                    "arm": arm, "gripper": gripper, "revision": revision,
+                    "binding": binding, "scene_binding": copy.deepcopy(scene_binding),
+                }
+                return binding
+            def poll_learned_revision_geometry(self, *, binding):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    candidate = self._native_geometry_candidate
+                    if candidate is not None and candidate["report"] is None:
+                        assignments = (("source", tuple(range(candidate["sample_count"]))),)
+                        self._native_geometry.poll.return_value = {
+                            "status": "CHECKED", "binding": binding,
+                            "initialization_digest": candidate["initialization_digest"],
+                            "scene_cdr_digest": canonical_digest("scene-cdr"),
+                            "query_digest": canonical_digest("query"),
+                            "source_query_digest": canonical_digest("source-query"),
+                            "assignments": assignments,
+                            "reference_intent": {
+                                "assignments": assignments,
+                                "intent": {"fixture": "source"},
+                            },
+                            "variants": [{"hypothesis": "source", "samples": [
+                                {"allowed": True, "saturated": False}
+                                for _ in range(candidate["sample_count"])
+                            ]}],
+                        }
+                    return RosMoveItTransport.poll_learned_revision_geometry(
+                        self, binding=binding,
+                    )
+                if self.revision_check_pending:
+                    return None
+                if self.revision_candidate is None or binding != self.revision_candidate["binding"]:
+                    raise ContractError("NATIVE_GEOMETRY_NOT_CHECKED")
+                return {"status": "CHECKED", "binding": binding,
+                        "allowed": True, "reference_intent": {
+                            "intent": {"fixture": "source"},
+                        }}
+            def submit_checked_learned_revision(self, *, binding, scene_binding,
+                                                start_time_ns, dispatch_guard):
+                if self.actual_pair:
+                    from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+                    return RosMoveItTransport.submit_checked_learned_revision(
+                        self, binding=binding, scene_binding=scene_binding,
+                        start_time_ns=start_time_ns,
+                        dispatch_guard=dispatch_guard,
+                    )
+                candidate = self.revision_candidate
+                if candidate is None or binding != candidate["binding"]:
+                    raise ContractError("NATIVE_GEOMETRY_NOT_CHECKED")
+                self.revision_candidate = None
+                arm, gripper = copy.deepcopy((candidate["arm"], candidate["gripper"]))
+                for goal in (arm, gripper):
+                    goal.trajectory.header.stamp.sec, goal.trajectory.header.stamp.nanosec = divmod(
+                        start_time_ns, 1_000_000_000,
+                    )
+                dispatch_guard({"arm": arm, "gripper": gripper}, self.current_revision)
+                self.submission_attempts["arm"] += 1
+                self.submission_attempts["gripper"] += 1
+                executable = {
+                    "selection_revision": candidate["revision"],
+                    "geometry_binding": binding, "start_time_ns": start_time_ns,
+                }
+                executable["revision"] = canonical_digest(executable)
+                return executable
             def poll_active(self):
                 raise AssertionError("Normal stream must not poll finite completion")
         transport, calls, cell, scene = Port(), [], Cell(), Scene()
@@ -490,6 +701,223 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
         self.assertEqual(execution["geometry_initialization"], transport.geometry)
         self.assertFalse(execution["motion_dispatch_attempted"])
         self.assertEqual(transport.sent, [])
+
+    def test_normal_revision_prepare_is_async_and_cancel_poll_remains_live(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+        transport.revision_check_pending = True
+        selected = self.selection()
+        prepared = job.prepare_stream_revision(selected)
+        self.assertTrue(prepared["ok"], prepared)
+        self.assertEqual(prepared["code"], "LEARNED_REVISION_CHECKING")
+        before = transport.polls
+        self.assertTrue(job.poll()["ok"])
+        self.assertGreater(transport.polls, before)
+        revision = executor.runs["run"]["execution"]["native_revisions"][0]
+        self.assertEqual((revision["selection_digest"], revision["status"]),
+                         (selected["selection_digest"], "CHECKING"))
+        job.cancel()
+        self.assertTrue(transport.stream["fenced"])
+
+    def test_normal_revision_commit_rechecks_anchor_before_any_native_send(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+        selected = self.selection()
+        self.assertTrue(job.prepare_stream_revision(selected)["ok"])
+        self.assertTrue(job.poll()["ok"])
+        transport.current[0] = .5
+        rejected = job.commit_stream_revision(selected["selection_digest"], 11_000_000_000)
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["code"], "START_STATE_MISMATCH")
+        execution = executor.runs["run"]["execution"]
+        self.assertEqual(transport.submission_attempts, {"arm": 0, "gripper": 0})
+        self.assertFalse(execution["motion_dispatch_attempted"])
+        self.assertEqual(execution["native_revisions"][0]["status"], "REJECTED")
+        self.assertEqual(scene.updates, [])
+        self.assertEqual(executor.runs["run"]["state"], "EXECUTING")
+        transport.current = INITIAL[:]
+        retried = job.prepare_stream_revision(selected)
+        self.assertTrue(retried["ok"], retried)
+        self.assertEqual(transport.submission_attempts, {"arm": 0, "gripper": 0})
+
+    def test_normal_revision_commit_requires_current_cell_and_future_epoch(self):
+        for mode, code in (("cell", "LEARNED_NEXT_CELL_BINDING"),
+                           ("slow_epoch", "ROS_EXEC_STEP")):
+            with self.subTest(mode=mode):
+                job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+                self.assertTrue(started["ok"], started)
+                selected = self.selection()
+                self.assertTrue(job.prepare_stream_revision(selected)["ok"])
+                self.assertTrue(job.poll()["ok"])
+                if mode == "cell":
+                    cell.ready = True
+                elif mode == "slow_epoch":
+                    original_poll = transport.poll_snapshot
+                    polls = [0]
+
+                    def advances_clock_during_current_state(max_age_s):
+                        polls[0] += 1
+                        if polls[0] == 2:
+                            reads = iter((10., 11.1))
+                            executor.source_clock = lambda: next(reads)
+                        result = original_poll(max_age_s)
+                        # process() polls once before handling the command; the
+                        # dispatch guard then validates a second current sample.
+                        return result
+
+                    transport.poll_snapshot = advances_clock_during_current_state
+                epoch = 11_000_000_000
+                rejected = job.commit_stream_revision(selected["selection_digest"], epoch)
+                self.assertEqual((rejected["ok"], rejected["code"]), (False, code))
+                self.assertEqual(transport.submission_attempts, {"arm": 0, "gripper": 0})
+                self.assertFalse(executor.runs["run"]["execution"]["motion_dispatch_attempted"])
+                self.assertEqual(scene.updates, [])
+
+    def test_pair_acceptance_is_not_reference_progress(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+        selected = self.selection()
+        self.assertTrue(job.prepare_stream_revision(selected)["ok"])
+        self.assertTrue(job.poll()["ok"])
+        committed = job.commit_stream_revision(selected["selection_digest"], 11_000_000_000)
+        self.assertTrue(committed["ok"], committed)
+        revision = executor.runs["run"]["execution"]["native_revisions"][0]["executable"]["revision"]
+        transport.revision_events = [{"revision": revision, "event": "PAIR_ACCEPTED", "predecessor": None}]
+        self.assertTrue(job.poll()["ok"])
+        evidence = job.execution_evidence
+        self.assertEqual(evidence["native_revisions"][0]["reference_consumed_count"], 0)
+        self.assertEqual(evidence["native_stream"]["reference_consumed_count"], 0)
+        for actuator, names, positions, goal_id in (
+            ("arm", JOINTS[:6], ACTION[:6], [1] * 16),
+            ("gripper", JOINTS[6:], ACTION[6:], [2] * 16),
+        ):
+            transport.revision_events.append({
+                "revision": revision, "event": "FEEDBACK", "actuator": actuator,
+                "goal_id": goal_id, "received_monotonic_s": 10.2,
+                "samples_since_poll": 1,
+                "feedback": {"joint_names": names, "desired": {
+                    "positions": positions,
+                    "time_from_start": {"sec": 0, "nanosec": 100_000_000},
+                }},
+            })
+        self.assertTrue(job.poll()["ok"])
+        self.assertEqual(job.execution_evidence["native_revisions"][0]["reference_consumed_count"], 1)
+
+    def test_retired_predecessor_cancel_does_not_fault_accepted_successor(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+
+        def submit(selected):
+            self.assertTrue(job.prepare_stream_revision(selected)["ok"])
+            self.assertTrue(job.poll()["ok"])
+            self.assertTrue(job.commit_stream_revision(
+                selected["selection_digest"], 11_000_000_000,
+            )["ok"])
+            return executor.runs["run"]["execution"]["native_revisions"][-1]["executable"]["revision"]
+
+        first = submit(self.selection(chunk=1))
+        transport.revision_events = [
+            {"revision": first, "event": "PAIR_ACCEPTED", "predecessor": None},
+            *[
+                {"revision": first, "event": "FEEDBACK", "actuator": actuator,
+                 "goal_id": goal_id, "received_monotonic_s": 10.2,
+                 "samples_since_poll": 1,
+                 "feedback": {"joint_names": names, "desired": {
+                     "positions": positions,
+                     "time_from_start": {"sec": 0, "nanosec": 100_000_000},
+                 }}}
+                for actuator, names, positions, goal_id in (
+                    ("arm", JOINTS[:6], ACTION[:6], [1] * 16),
+                    ("gripper", JOINTS[6:], ACTION[6:], [2] * 16),
+                )
+            ],
+        ]
+        self.assertTrue(job.poll()["ok"])
+        self.assertEqual(job.execution_evidence["native_revisions"][0]["reference_consumed_count"], 1)
+
+        second = submit(self.selection(chunk=2))
+        # One native child can accept its successor and retire the old handle
+        # while the sibling successor remains pending.
+        transport.revision_events = [
+            {"revision": second, "event": "ACCEPTED", "actuator": "arm"},
+            {"revision": first, "event": "TERMINAL", "actuator": "arm",
+             "result_status": 5, "error_code": 0},
+        ]
+        self.assertTrue(job.poll()["ok"])
+        self.assertEqual(job.execution_evidence["native_revisions"][0]["reference_consumed_count"], 1)
+
+        transport.revision_events = [
+            {"revision": second, "event": "ACCEPTED", "actuator": "gripper"},
+            {"revision": first, "event": "TERMINAL", "actuator": "gripper",
+             "result_status": 5, "error_code": 0},
+            {"revision": second, "event": "PAIR_ACCEPTED", "predecessor": first},
+        ]
+        self.assertTrue(job.poll()["ok"])
+        evidence = job.execution_evidence
+        self.assertEqual([item["reference_consumed_count"] for item in evidence["native_revisions"]],
+                         [1, 0])
+        self.assertEqual(evidence["native_stream"]["reference_consumed_count"], 1)
+        self.assertEqual(executor.runs["run"]["state"], "EXECUTING")
+
+        transport.revision_events = [
+            {"revision": second, "event": "TERMINAL", "actuator": "arm",
+             "result_status": 6, "error_code": -4},
+        ]
+        failed = job.poll()
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["code"], "ROS_EXEC_RESULT_FAILED")
+        self.assertEqual(job.execution_evidence["native_revisions"][1]["reference_consumed_count"], 0)
+
+    def test_owner_commit_uses_actual_native_pair_fill_and_send_seam(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner(
+            actual_pair=True,
+        )
+        self.assertTrue(started["ok"], started)
+        selected = self.selection()
+        self.assertTrue(job.prepare_stream_revision(selected)["ok"])
+        self.assertTrue(job.poll()["ok"])
+        epoch = 11_000_000_000
+        committed = job.commit_stream_revision(selected["selection_digest"], epoch)
+        self.assertTrue(committed["ok"], committed)
+        arm = transport.arm_client.send_goal_async.call_args.args[0]
+        gripper = transport.gripper_client.send_goal_async.call_args.args[0]
+        self.assertEqual((arm.trajectory.header.stamp.sec, arm.trajectory.header.stamp.nanosec),
+                         (11, 0))
+        self.assertEqual(arm.trajectory.header, gripper.trajectory.header)
+        self.assertEqual(len(arm.trajectory.points), 2)
+        self.assertEqual(len(gripper.trajectory.points), 2)
+        self.assertEqual(list(arm.trajectory.points[1].positions)
+                         + list(gripper.trajectory.points[1].positions),
+                         selected["controller_actions"][0])
+        self.assertEqual(transport._execute_goal_count, 1)
+        self.assertEqual(transport._gripper_goal_count, 1)
+        self.assertEqual(job.execution_evidence["native_revisions"][0]["reference_consumed_count"], 0)
+
+    def test_normal_revision_rejects_reuse_reordering_and_distinct_chunk_budget(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+
+        def commit(selected):
+            self.assertTrue(job.prepare_stream_revision(selected)["ok"])
+            self.assertTrue(job.poll()["ok"])
+            self.assertTrue(job.commit_stream_revision(
+                selected["selection_digest"], 11_000_000_000,
+            )["ok"])
+
+        first = self.selection(chunk=1)
+        commit(first)
+        reused = job.prepare_stream_revision(first)
+        self.assertEqual((reused["ok"], reused["code"]),
+                         (False, "LEARNED_STREAM_SELECTION_REUSED"))
+        second = self.selection(chunk=2)
+        commit(second)
+        reordered = job.prepare_stream_revision(self.selection(chunk=1, index=1))
+        self.assertEqual((reordered["ok"], reordered["code"]),
+                         (False, "LEARNED_STREAM_SELECTION_REORDERED"))
+        exhausted = job.prepare_stream_revision(self.selection(chunk=3))
+        self.assertEqual((exhausted["ok"], exhausted["code"]),
+                         (False, "TASK_OUTPUT_LIMIT_REACHED"))
+        self.assertEqual(transport.submission_attempts, {"arm": 2, "gripper": 2})
 
     def test_normal_cancel_retains_recording_only_after_native_drain(self):
         job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()

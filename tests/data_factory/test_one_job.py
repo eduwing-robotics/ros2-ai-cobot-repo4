@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import threading
@@ -27,6 +28,68 @@ RELEASE_SCENE = {**SCENE, "release_slot": release_slot(
 PLAN = {"run_id":"run", "motion_program":PROGRAM, "scene_binding":SCENE, "setup_approval":SETUP_APPROVAL}
 RELEASE_PLAN = {**PLAN, "scene_binding":RELEASE_SCENE}
 MOTION_APPROVAL = {"source":"HUMAN", "approval_id":"a", "approved_by":"operator", "approval_expiry":"2099-01-01T00:00:00Z", "approval_scope":"HUMAN_GATED"}
+
+
+class StreamRevisionRequestTest(unittest.TestCase):
+    def owner(self, *, ok=True, code="STREAM_REVISION_CHECKING"):
+        from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA
+        calls = []
+
+        def executor(request):
+            calls.append(copy.deepcopy(request))
+            # Model a callee mutating its own detached request, never the caller's
+            # retained selected native rows.
+            if "selection" in request["payload"]:
+                request["payload"]["selection"]["rows"][0] = 999
+            return {"schema_version": "fr5.pickup_executor.response.v3",
+                    "mode": "PRE_LIVE", "op_id": request["op_id"], "op": request["op"],
+                    "ok": ok, "code": code, "run_id": "run", "plan_digest": RESOLVED,
+                    "state": "EXECUTING", "data": {"native_stream": {"status": code},
+                    "native_revisions": [], "task_outcome": "UNKNOWN"}}
+
+        def no_effect(_):
+            raise AssertionError("Revision request must not touch recorder or Cell")
+
+        job = OneJob(no_effect, executor, no_effect)
+        job.state, job.approval_scope = "EXECUTING", "SCOPED_TASK_GRANT"
+        job.run_id, job.plan_digest, job.lease_id = "run", RESOLVED, "lease"
+        job.plan_envelope = {"plan": {"schema_version": PLAN_SCHEMA}}
+        return job, calls
+
+    def test_prepare_and_commit_use_same_bound_owner_without_ack_or_recorder_effect(self):
+        job, calls = self.owner()
+        selection = {"rows": [1]}
+        self.assertTrue(job.prepare_stream_revision(selection)["ok"])
+        self.assertEqual(selection, {"rows": [1]})
+        epoch = 123_456_789_012
+        self.assertTrue(job.commit_stream_revision(RESOLVED, epoch)["ok"])
+        self.assertEqual([call["op"] for call in calls],
+                         ["prepare_stream_revision", "commit_stream_revision"])
+        for call in calls:
+            self.assertEqual({key: call["payload"][key] for key in
+                              ("run_id", "plan_digest", "lease_id")},
+                             {"run_id": "run", "plan_digest": RESOLVED, "lease_id": "lease"})
+        self.assertEqual(calls[-1]["payload"]["start_time_ns"], epoch)
+        self.assertEqual(job.execution_evidence["native_revisions"], [])
+        self.assertEqual(job.execution_evidence["task_outcome"], "UNKNOWN")
+
+    def test_candidate_rejection_does_not_abort_current_task(self):
+        job, calls = self.owner(ok=False, code="START_STATE_MISMATCH")
+        result = job.commit_stream_revision(RESOLVED, 123_456_789_012)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "START_STATE_MISMATCH")
+        self.assertEqual(job.state, "EXECUTING")
+        self.assertEqual(len(calls), 1)
+
+    def test_not_executing_normal_scoped_task_never_reaches_owner(self):
+        for field, value in (("state", "PLANNED"), ("approval_scope", "HUMAN_GATED"),
+                             ("plan_envelope", {"plan": {"schema_version": "fr5.pickup_plan.v3"}})):
+            with self.subTest(field=field):
+                job, calls = self.owner()
+                setattr(job, field, value)
+                self.assertEqual(job.prepare_stream_revision({})["code"], "TASK_GRANT_STATE")
+                self.assertEqual(job.commit_stream_revision(RESOLVED, 10)["code"], "TASK_GRANT_STATE")
+                self.assertEqual(calls, [])
 
 
 class OneJobTest(unittest.TestCase):

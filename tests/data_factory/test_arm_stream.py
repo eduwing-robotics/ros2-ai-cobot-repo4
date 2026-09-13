@@ -532,6 +532,29 @@ class TransportActuatorStreamTest(unittest.TestCase):
         self.assertEqual(self.transport._gripper_goal_count, 1)
         self.assertEqual(self.transport.poll_learned_actuator_stream(), [])
 
+    def test_submission_state_reports_send_calls_and_logical_predecessor_only(self):
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        self.assertEqual(self.transport.learned_actuator_stream_submission_state(), {
+            "submission_attempts": {"arm": 0, "gripper": 0},
+            "current_revision": None,
+        })
+        arm, gripper = self.goals()
+        revision = canonical_digest("one")
+        self.transport.submit_learned_actuator_revision(
+            arm, gripper, revision=revision, dispatch_guard=Mock(),
+        )
+        self.assertEqual(self.transport.learned_actuator_stream_submission_state(), {
+            "submission_attempts": {"arm": 1, "gripper": 1},
+            "current_revision": None,
+        })
+        self.response.set_result(handle())
+        self.gripper_response.set_result(handle())
+        self.transport.poll_learned_actuator_stream()
+        self.assertEqual(
+            self.transport.learned_actuator_stream_submission_state()["current_revision"],
+            revision,
+        )
+
     def prepared_revision(self, *, ready=True):
         self.transport.open_learned_actuator_stream(deadline=20.)
         helper = Mock()

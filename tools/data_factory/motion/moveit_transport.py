@@ -1443,6 +1443,16 @@ class RosMoveItTransport:
             "owns_goals": active.owns_goals,
         }
 
+    def learned_actuator_stream_submission_state(self):
+        """Expose existing send-call and logical predecessor facts only."""
+        active = getattr(self, "_active", None)
+        if not isinstance(active, ActuatorStream):
+            raise ContractError("ROS_EXEC_NO_ACTIVE")
+        return {
+            "submission_attempts": active.submission_attempts,
+            "current_revision": active.current_revision,
+        }
+
     def close_learned_actuator_stream(self):
         """Release only a fenced stream whose native handles are all terminal."""
         if not isinstance(self._active, ActuatorStream):

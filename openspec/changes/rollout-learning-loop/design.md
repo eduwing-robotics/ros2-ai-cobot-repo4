@@ -552,6 +552,11 @@ rejected candidates cannot update it. Both source/FK and final query digests are
 retained. These sampled models establish neither continuous collision coverage
 nor capture, arbitrary slip, landing or Scene truth; no stationary-close or
 row-terminal barrier supplies their applicability.
+Keep this representation provisional and collision-consumer-owned: extend it
+only when an actual query counterexample needs the additional occupied volume.
+MoveIt's attached/world objects are geometric hypotheses, not grasp/release
+verdicts or authority to update SceneStateStore. Prefer the smallest representation
+that retains those obligations; do not grow a second task/phase model here.
 
 Native queue selection retains originating raw/processed rows, observation and
 row identity, plus the existing bounded gripper projection. Only cumulative
@@ -565,8 +570,8 @@ sampling-start/merge-completion clocks. The immutable receipt follows the native
 rows through selection and conditional ACK; rejected merges preserve the prior
 queue and native error path. Legacy source-only consumers remain metadata-only.
 This is host generation evidence, not CUDA synchronization or physical timing.
-The normal owner must require the configured bound when validating a selection;
-normal caller/owner commit integration remains open. In particular, do not
+The normal owner requires the configured bound when validating a selection;
+public caller producer/selection/commit/ACK integration remains open. In particular, do not
 introduce a300ms dispatch TTL for every queued row:
 an eligible horizon intentionally outlives acquisition, and rejecting its tail
 can prevent queue draining. No production controller lead time is inferred from
@@ -574,6 +579,18 @@ that TTL or the policy period; physical timing still needs its own evidence.
 OneJob/PickupExecutor retain task/start/commit/fault/close decisions; inference,
 queue, geometry, actuator and reference-progress computation remain with their
 existing components. No new lifecycle framework or caller-side motion authority.
+
+The OneJob request surface now forwards exact run/plan/lease-bound prepare and
+commit requests to that owner. Preparation retains the native rows and their
+current-state anchor while the existing geometry component checks asynchronously.
+Commit consumes the retained check, revalidates Scene/Cell/grant/hardware and the
+anchor, and fills one explicit common future epoch through the native transport.
+It does not derive a production start margin. A pre-send candidate rejection
+leaves current execution and Scene continuity intact; an attempted or ambiguous
+send follows the existing fault/drain path. Native ARM/gripper reference progress
+is projected for conditional queue ACK; acceptance is not consumption or task
+success. The public caller still exits with `LEARNED_STREAM_COMMIT_UNAVAILABLE`;
+the owner seam is not a claim of complete normal rollout or physical readiness.
 
 Do not infer seamless future-tail blending from the word "replacement". The
 [official Jazzy JTC documentation](https://control.ros.org/jazzy/doc/ros2_controllers/joint_trajectory_controller/doc/trajectory.html#trajectory-replacement)
