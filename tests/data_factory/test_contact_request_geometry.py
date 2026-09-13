@@ -12,7 +12,8 @@ from moveit_msgs.srv import GetStateValidity
 
 from tools.data_factory.run_job import resolve_inputs
 from tools.data_factory.motion.contact_transition import (
-    TIPS, bind_request_contacts, intended_request_contact, prepare_request_geometry, request_geometry,
+    TIPS, bind_native_request_geometry, bind_request_contacts, intended_request_contact,
+    prepare_request_geometry, request_geometry,
 )
 from tools.fr5_data_factory import ContractError, TASK_CONTRACTS, canonical_digest, compose_rigid_transform
 
@@ -98,6 +99,26 @@ class RequestContactGeometryTest(unittest.TestCase):
                 plan["scene_binding"]["object_instance_id"] = plan["source_program"]["planning_scene"]["floor"]["id"]
             with self.subTest(change=change), self.assertRaises(ContractError):
                 prepare_request_geometry(self.transport, plan, obj)
+
+    def test_native_batch_keeps_released_proxy_in_private_world(self):
+        build = bind_native_request_geometry(self.context, self.plan)
+        state, world = build("released", [0.] * 6, .012)
+        self.assertTrue(state.is_diff)
+        self.assertEqual(state.attached_collision_objects, [])
+        self.assertEqual(len(world), 1)
+        self.assertEqual(world[0].id, self.context["proxies"]["released"]["object_id"])
+        self.assertEqual(world[0].header.frame_id, "base_link")
+        old = copy.deepcopy(world)
+        self.context["proxies"]["released"]["dimensions_m"][0] = 2.
+        self.plan["policy"]["robot_description"] = "changed"
+        world[0].id = "caller-mutated"
+        self.assertEqual(build("released", [0.] * 6, .012)[1], old)
+        state, world = build("carried", [0.] * 6, .012)
+        self.assertEqual(world, [])
+        self.assertEqual(state.attached_collision_objects[0].link_name, "gripper_link")
+        self.assertEqual(state.attached_collision_objects[0].touch_links, TIPS)
+        with self.assertRaisesRegex(ContractError, "CONTACT_REQUEST_BINDING"):
+            build("success", [0.] * 6, .012)
 
     def test_malformed_attachment_or_changed_context_never_reaches_native_conversion(self):
         for key, value in (("dimensions_m", []), ("dimensions_m", [-.024, .024, .024]),
@@ -202,8 +223,14 @@ class RequestContactGeometryTest(unittest.TestCase):
         contact.depth = .003
         args = dict(gripper_pose=gripper, gripper_m=.01176)
         self.assertTrue(intended_request_contact(self.context, self.plan, "released", contact, **args))
+        native = bind_request_contacts(self.context, self.plan, released_world=True)
+        self.assertFalse(native("released", contact, **args))
+        contact.body_type_1 = C.WORLD_OBJECT
+        self.assertTrue(native("released", contact, **args))
+        self.assertFalse(intended_request_contact(self.context, self.plan, "released", contact, **args))
         contact.normal.x, contact.normal.y, contact.normal.z = datum["rotation_columns"][2]
         self.assertFalse(intended_request_contact(self.context, self.plan, "released", contact, **args))
+        self.assertFalse(native("released", contact, **args))
         changed = copy.deepcopy(self.context)
         changed["proxies"]["released"]["touch_links"] = TIPS[:]
         changed["geometry_digest"] = canonical_digest({k: v for k, v in changed.items() if k != "geometry_digest"})

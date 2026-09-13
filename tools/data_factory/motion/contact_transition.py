@@ -266,11 +266,36 @@ def _request_geometry_binding(context, plan, hypothesis):
 
 def request_geometry(context, plan, joints, gripper_m, *, hypothesis):
     """Build one additive /check_state_validity request; caller owns the query."""
+    _request_geometry_binding(context, plan, hypothesis)
+    return _request_geometry(context, joints, gripper_m, hypothesis=hypothesis)
+
+
+def bind_native_request_geometry(context, plan):
+    """Bind once; return private RobotState/world additions for the native batch.
+
+    A stationary released model is a world object, not a robot attachment.
+    The historical service-request representation is intentionally unchanged.
+    """
+    retained, selected = copy.deepcopy((context, plan))
+    _request_geometry_binding(retained, selected, "source")
+
+    def build(hypothesis, joints, gripper_m):
+        if hypothesis not in {"source", "carried", "released"}:
+            raise ContractError("CONTACT_REQUEST_BINDING")
+        request = _request_geometry(retained, joints, gripper_m, hypothesis=hypothesis)
+        world = []
+        if hypothesis == "released":
+            world = [request.robot_state.attached_collision_objects[0].object]
+            request.robot_state.attached_collision_objects = []
+        return request.robot_state, world
+    return build
+
+
+def _request_geometry(context, joints, gripper_m, *, hypothesis):
     from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
     from moveit_msgs.srv import GetStateValidity
     from shape_msgs.msg import SolidPrimitive
     from geometry_msgs.msg import Pose
-    _request_geometry_binding(context, plan, hypothesis)
     values = [*joints, gripper_m]
     if len(joints) != 6 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
         raise ContractError("CONTACT_REQUEST_GEOMETRY")
@@ -323,7 +348,7 @@ def intended_request_contact(context, plan, hypothesis, contact, *, gripper_pose
                                      gripper_pose=gripper_pose, gripper_m=gripper_m)
 
 
-def bind_request_contacts(context, plan):
+def bind_request_contacts(context, plan, *, released_world=False):
     """Bind a detached batch once, rather than rehash its plan per contact.
 
     The returned classifier owns its copy. It has no execution authority and
@@ -337,11 +362,13 @@ def bind_request_contacts(context, plan):
         if hypothesis not in {"source", "carried", "released"}:
             raise ContractError("CONTACT_REQUEST_BINDING")
         return _intended_request_contact(retained, hypothesis, contact,
-                                        gripper_pose=gripper_pose, gripper_m=gripper_m)
+                                        gripper_pose=gripper_pose, gripper_m=gripper_m,
+                                        released_world=released_world)
     return classify
 
 
-def _intended_request_contact(context, hypothesis, contact, *, gripper_pose, gripper_m):
+def _intended_request_contact(context, hypothesis, contact, *, gripper_pose, gripper_m,
+                              released_world=False):
     source = context["source_object_id"]
     bodies = {(contact.contact_body_1, contact.body_type_1), (contact.contact_body_2, contact.body_type_2)}
     values = [contact.depth, contact.position.x, contact.position.y, contact.position.z,
@@ -351,14 +378,17 @@ def _intended_request_contact(context, hypothesis, contact, *, gripper_pose, gri
         return False
     if hypothesis != "source":
         proxy = context["proxies"][hypothesis]["object_id"]
-        if bodies == {(source, contact.WORLD_OBJECT), (proxy, contact.ROBOT_ATTACHED)}:
+        proxy_type = contact.WORLD_OBJECT if hypothesis == "released" and released_world else contact.ROBOT_ATTACHED
+        if bodies == {(source, contact.WORLD_OBJECT), (proxy, proxy_type)}:
             return True
     object_body = (source, contact.WORLD_OBJECT)
     datum = context["source_datum"]
     if hypothesis == "released" and any(
-            bodies == {(context["proxies"]["released"]["object_id"], contact.ROBOT_ATTACHED), (tip, contact.ROBOT_LINK)}
+            bodies == {(context["proxies"]["released"]["object_id"],
+                        contact.WORLD_OBJECT if released_world else contact.ROBOT_ATTACHED), (tip, contact.ROBOT_LINK)}
             for tip in TIPS):
-        object_body = (context["proxies"]["released"]["object_id"], contact.ROBOT_ATTACHED)
+        object_body = (context["proxies"]["released"]["object_id"],
+                       contact.WORLD_OBJECT if released_world else contact.ROBOT_ATTACHED)
         datum = context["released_datum"]
     tip = next((tip for tip in TIPS if bodies == {object_body, (tip, contact.ROBOT_LINK)}), None)
     if tip is None or gripper_pose is None or type(gripper_m) not in (int, float) or not 0 <= gripper_m <= context["open_m"]:

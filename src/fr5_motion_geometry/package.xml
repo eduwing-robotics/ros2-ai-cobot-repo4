@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fr5_motion_geometry</name>
+  <version>0.1.0</version>
+  <description>Task-local native MoveIt geometry queries without ROS graph or actuator access.</description>
+  <maintainer email="maintainer@example.invalid">FR5 project</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>moveit_core</depend>
+  <depend>moveit_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>urdf</depend>
+  <depend>srdfdom</depend>
+  <depend>geometric_shapes</depend>
+  <depend>nlohmann_json</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

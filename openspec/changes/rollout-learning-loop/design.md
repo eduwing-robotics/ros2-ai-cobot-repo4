@@ -496,7 +496,25 @@ by the existing owner. It has no actuator or Scene-write authority. Initialize
 the bound model before fresh inference inputs; preserve world, attachments, ACM,
 transforms, octomap and padding/scaling rather than reconstructing a weaker scene.
 The owner must still bind checked geometry to the actual selected reference and
-current dispatch conditions. This consumer is not yet implemented/deployed.
+current dispatch conditions. The CPU helper and pollable Python adapter are
+implemented separately from normal runtime integration; neither enables dispatch.
+
+Current admitted execution, monitoring and cancellation continue while the next
+revision's geometry request is pending. Only the new revision waits for its
+result. The immutable request/result must match the selected revision, full
+Scene/contact model, sampled states and executable timing; the owner rechecks
+current authority/Scene/state at commit. Mismatched/expired results are discarded,
+not relabeled, and the owner prepares a fresh check where still applicable.
+Initialization belongs before fresh inference acquisition; JSON/CDR, collision
+work and contact classification run off the owner loop. The CPU child has no
+ROS node, command or shared-Scene mutation authority; owned teardown is pollable.
+
+Do not infer seamless future-tail blending from the word "replacement". The
+[official Jazzy JTC documentation](https://control.ros.org/jazzy/doc/ros2_controllers/joint_trajectory_controller/doc/trajectory.html#trajectory-replacement)
+states that the implementation forgets the old trajectory. Installed 4.40.1 and
+the separately staged result-delivery fix do not by themselves qualify smooth
+retargeting. Keep the plain baseline and verify the actual handover semantics
+before adopting a rolling replacement strategy.
 
 Two CPU-only r7 probes support this choice, not physical qualification. Existing
 bounded gripper projection exactly reproduced retained actions. Across 301
@@ -514,9 +532,11 @@ model initialization (1.56/1.31 s). These are single-run feasibility observation
 not latency guarantees. The original Python classifier took about 1.97 s for
 1,204 contacts because it rebound the full context/plan per contact; the new
 owned batch classifier performs that binding once without changing predicates.
-Production still needs full-scene equivalence, explicit native-to-ROS body-type
-mapping (native WORLD/ATTACHED enums differ), complete/non-saturated contacts,
-released WORLD_OBJECT side-contact semantics and asynchronous consumer wiring.
+The native helper now maps native-to-ROS body types explicitly (WORLD/ATTACHED
+enums differ), retains contact saturation, and the adapter classifies released
+WORLD_OBJECT side contact without relaxing top-contact checks. Production still
+needs actual full-scene acquisition/binding and normal asynchronous consumer
+wiring. CPU tests are not a control-cadence or loaded-system latency guarantee.
 
 Evidence is retained in `.agent-local/work/lerobot-fr5/` as
 `request-geometry-batch-probe{.py,.cpp,-result.json}` and
@@ -527,6 +547,8 @@ The original negative probe's enum adapter is not reusable for general contact
 classification; its sole forbidden proxy/floor result is unaffected, and the
 variant maps enums explicitly. Current local SRDF, default ACM and reconstructed
 floor/wall/source geometry are not evidence of a retained live full scene.
+
+#### Baseline boundaries
 
 Finish one plain normal baseline and a bounded physical rollout before adding
 execution optimizations. Prediction horizon belongs to the saved policy;
