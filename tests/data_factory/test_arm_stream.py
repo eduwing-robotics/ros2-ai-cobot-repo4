@@ -1,8 +1,10 @@
 """Native FJT message/future seam; no ROS node, model or hardware calls."""
 from concurrent.futures import Future
+import gc
 from itertools import count
 from types import SimpleNamespace
 import unittest
+import weakref
 from unittest.mock import Mock, patch
 
 from control_msgs.action import FollowJointTrajectory
@@ -176,6 +178,24 @@ class ArmStreamTest(unittest.TestCase):
             {"revision": "first", "event": "TERMINAL", "result_status": 6, "error_code": -1}])
         self.assertFalse(self.stream.fenced)
         second.cancel_goal_async.assert_not_called()
+
+    def test_native_orphan_callback_does_not_retain_rejected_attempt_payloads(self):
+        callbacks, submissions = [], []
+        for i in range(3):
+            response = Future()
+            self.client.send_goal_async.return_value = response
+            self.stream.submit(goal(), revision=str(i), dispatch_guard=self.guard)
+            callbacks.append(self.client.send_goal_async.call_args.kwargs["feedback_callback"])
+            submissions.append(weakref.ref(self.stream._pending))
+            response.set_result(SimpleNamespace(accepted=False))
+            self.assertEqual(self.stream.poll()[0]["event"], "REJECTED")
+        owner = weakref.ref(self.stream)
+        self.stream = None
+        gc.collect()
+        self.assertIsNone(owner())
+        self.assertTrue(all(ref() is None for ref in submissions))
+        for callback in callbacks:
+            callback(feedback(handle()))  # A late native callback is harmless.
 
     def test_replacement_does_not_invent_predecessor_terminal(self):
         first = self.initial()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
+import weakref
 from dataclasses import dataclass
 
 from tools.fr5_data_factory import ContractError
@@ -93,9 +94,16 @@ class ArmStream:
         # Own even a synchronously failed/ambiguous send; no implicit retry follows.
         pending = _Submission(revision, retained, None)
         self._pending = pending
+        # rclpy can retain rejected-goal callbacks (no result request follows).
+        # Such a registration must not retain this attempt or its trajectories.
+        owner_ref, item_ref = weakref.ref(self), weakref.ref(pending)
+        def receive_feedback(message):
+            owner, item = owner_ref(), item_ref()
+            if owner is not None and item is not None:
+                owner._receive_feedback(item, message)
         try:
             pending.response = self._client.send_goal_async(copy.deepcopy(retained),
-                feedback_callback=lambda message: self._receive_feedback(pending, message))
+                feedback_callback=receive_feedback)
         except Exception:
             self._fenced = True
             raise
