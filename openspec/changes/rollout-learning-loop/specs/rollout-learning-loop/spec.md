@@ -1304,13 +1304,17 @@ policy, plan or condition lineage.
 
 ### Requirement: Robot-model replacement preserves historical learning coordinates
 
-A stopped initial `CONTACT_PROFILE_UNAVAILABLE` attempt may correct its exact
+A stopped initial `CONTACT_PROFILE_UNAVAILABLE` or `CONTACT_MODEL_BINDING` attempt may correct its exact
 erroneous UNKNOWN Scene write using retained canonical failure, preapproval and
 original observation evidence proving failure before the first dispatch. The
 correction SHALL preserve the original observation provenance, CAS the exact
 failed Scene/Cell, retain a correction receipt and restore readiness last. It
 SHALL NOT fabricate fresh human confirmation, apply to ambiguous or dispatched
 attempts, or replace the next run's current hardware/Scene/plan admission.
+For model binding, the retained prospective-contact context SHALL be absent:
+the same error after preparation is not eligible. A prior correction may supply
+continuity only through its exact retained, digest-checked receipt; preserve the
+original observation and chain that receipt rather than issuing a new human claim.
 
 A correction to robot geometry SHALL distinguish the model used for collision
 checking from the controller-reference and measured-feedback coordinates stored
@@ -1330,6 +1334,13 @@ independent gripper-geometry constants. No generic adapter or compatibility
 registry is required for this bounded replacement. A genuinely changed actuator
 coordinate contract SHALL be treated as a separate migration, not silently
 declared compatible because feature names and tensor shapes match.
+
+Native xacro expansion SHALL be bound to the digest-pinned source model by
+canonical equality of the entire model after separating its single native
+`FR5System` ros2_control extension. Hardware settings keep their existing
+independent admission. The prepared contact context SHALL pin the actual expanded
+XML digest for subsequent consumers; a runtime model change SHALL still reject.
+This representation binding does not transfer historical collision verdicts.
 
 #### Scenario: Corrected finger geometry retains a recorded opening command
 

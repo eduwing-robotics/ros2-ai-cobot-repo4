@@ -57,6 +57,14 @@ bounded continuity question only; learned task success remains unproven.
   Next physical dependency is the existing model/contact replacement boundary,
   not another unchanged retry or model-quality threshold. Live camera/ROS owners
   were moved to visible Orca terminals at the user's request.
+  r5 selected the normal opening-coordinate successor and reached recorder
+  readiness, then failed initial `CONTACT_MODEL_BINDING` before dispatch:
+  source URDF bytes were compared to native xacro-expanded runtime XML.
+  Canonical full-model comparison now separates the native control extension
+  and pins expanded bytes for subsequent contact consumers. Narrow stopped-run
+  recovery accepts this initial prepare failure only with absent contact context
+  and the retained prior correction chain. Combined model/launch/Scene/native
+  continuation tests:21 PASS1.842s. Physical Pick remains UNKNOWN.
 - [x] Correct native snapshot acquisition without extending freshness limits:
   `5f4b7ef` waits for original source stamps within the existing deadline
   (13 focused tests PASS0.672s; independent review found no issues). The opted-in

@@ -18,14 +18,30 @@ class SceneStateTest(unittest.TestCase):
         # a separate existing boundary, explicitly substituted in this fixture.
         for fault in (None, "cell", "scene", "prior_pose", "other_failure", "dispatched",
                       "history", "predecessor", "selected", "incarnation", "phase",
-                      "preapproval", "canonical", "receipt_io", "scene_io", "cell_io"):
+                      "preapproval", "canonical", "receipt_io", "scene_io", "cell_io",
+                      "model", "model_null", "model_context", "model_history", "model_phase",
+                      "other_contact", "chain", "chain_tamper", "chain_missing"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                success = fault in (None, "model", "chain")
+                model_failure = str(fault).startswith(("model", "chain")) or fault == "other_contact"
+                failure = ("CONTACT_MODEL_GEOMETRY" if fault == "other_contact" else
+                           "CONTACT_MODEL_BINDING" if model_failure else "CONTACT_PROFILE_UNAVAILABLE")
                 store = scene_state.SceneStateStore(directory, "fr5-lab-a")
                 initial = store.update_object(instance_id="cube", object_profile_id="cube-24mm",
                     state="ON_SURFACE", source="HUMAN", updated_by="original-operator",
                     pose={"place_id":"PLACE_A", "yaw_deg":0, "x_mm":10, "y_mm":20})
                 prior_cell = store._cell.acknowledge_ready("original-operator")
                 confirmation = {"after_scene":initial, "after_cell":prior_cell}
+                if str(fault).startswith("chain"):
+                    prior_cell = {**prior_cell, "run_id":"synthetic-prior-recovery", "reason_code":"NO_DISPATCH_CONTINUITY"}
+                    confirmation = {"schema_version":"data_factory.no_dispatch_recovery.v1",
+                        "basis":"INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE",
+                        "prior_confirmation_digest":canonical_digest(confirmation),
+                        "after_scene":initial["scene_state"], "after_cell":prior_cell,
+                        "new_human_confirmation":False, "execution_authorized":False}
+                    confirmation["receipt_digest"] = canonical_digest(confirmation)
+                    retained = store._cell.runtime_path("no_dispatch_recovery-synthetic-prior-recovery.json")
+                    scene_state.write_json_atomic(retained, confirmation)
                 binding = {"scene_state_digest":initial["scene_state_digest"],
                            "revision":initial["scene_state"]["revision"], "object_instance_id":"cube"}
                 clock = {"schema_version":"fr5.gripper_temporal_policy.v2", "incarnation":[1,2,3,4]}
@@ -41,28 +57,33 @@ class SceneStateTest(unittest.TestCase):
                 phase.write_bytes(b"")
                 failed = store.update_object(instance_id="cube", object_profile_id="cube-24mm",
                     state="UNKNOWN", source="ROBOT_ACTION", updated_by="pickup-executor")
-                cell = store._cell.mark_blocked("CONTACT_PROFILE_UNAVAILABLE", plan["run_id"], canonical_digest(plan))
+                cell = store._cell.mark_blocked(failure, plan["run_id"], canonical_digest(plan))
                 wire = dict.fromkeys(("generation", "active_generation", "completed_generation", "selected_generation",
                                       "selected_valid", "error", "device_main_error", "device_sub_error"), 0)
                 wire.update(version=5, **{f"incarnation_{i}":i+1 for i in range(4)})
-                trace = {"status":"FAILED", "failure_code":"CONTACT_PROFILE_UNAVAILABLE", "segments":[],
+                trace = {"status":"FAILED", "failure_code":failure, "segments":[],
                          "terminal_phases":[], "terminal_state":None}
                 result = {"run_id":plan["run_id"], "plan_digest":canonical_digest(plan), "plan_envelope":envelope,
-                    "scene_binding":binding, "code":"CONTACT_PROFILE_UNAVAILABLE", "state":"ABORTED", "executor_state":"BLOCKED",
-                    "execution_evidence":{"failure_code":"CONTACT_PROFILE_UNAVAILABLE", "step_index":0,
+                    "scene_binding":binding, "code":failure, "state":"ABORTED", "executor_state":"BLOCKED",
+                    "execution_evidence":{"failure_code":failure, "step_index":0,
                         "prospective_contact":{"status":"UNAVAILABLE", "code":"CONTACT_PROFILE_UNAVAILABLE"},
                         "scene_transition":failed, "phase_events_path":str(phase),
                         "snapshot":{"gripper_controller":{"hardware_execution":{"wire":wire,"clock_binding":clock}}}}}
+                if model_failure: result["execution_evidence"].pop("prospective_contact")
+                if fault == "model_null": result["execution_evidence"]["prospective_contact"] = None
+                if fault == "model_context": result["execution_evidence"]["prospective_contact"] = {"status":"PROSPECTIVE"}
+                if fault == "chain_tamper": confirmation["after_cell"]["acknowledged_by"] = "forged"
+                if fault == "chain_missing": retained.rename(retained.with_suffix(".unavailable"))
                 if fault == "cell": store._cell.mark_blocked("OTHER_OWNER", "other", canonical_digest("other"))
                 if fault == "scene": store.update_object(instance_id="cube", object_profile_id="cube-24mm", state="UNKNOWN", source="HUMAN", updated_by="other")
                 if fault == "prior_pose": confirmation["after_scene"]["scene_state"]["objects"]["cube"]["pose"]["x_mm"] = 99
                 if fault == "other_failure": result["code"] = "CANCEL_UNCONFIRMED"
                 if fault == "dispatched": result["execution_evidence"]["step_index"] = 1
-                if fault == "history": result["execution_evidence"]["learned_history"] = [{}]
+                if fault in ("history", "model_history"): result["execution_evidence"]["learned_history"] = [{}]
                 if fault == "predecessor": plan["learned_proposal"]["generation_context"]["predecessor_plan_digest"] = canonical_digest("prior")
                 if fault == "selected": wire["selected_valid"] = 1
                 if fault == "incarnation": wire["incarnation_0"] = 99
-                if fault == "phase": phase.write_text('{"event":"DISPATCH_REQUESTED"}\n')
+                if fault in ("phase", "model_phase"): phase.write_text('{"event":"DISPATCH_REQUESTED"}\n')
                 if fault == "preapproval": preapproval["plan_digest"] = canonical_digest("other")
                 before_scene, before_cell = copy.deepcopy(store.read()), store._cell.read()
                 original_observation = copy.deepcopy(initial["scene_state"]["objects"]["cube"])
@@ -77,7 +98,7 @@ class SceneStateTest(unittest.TestCase):
                 with mock.patch("tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
                                 side_effect=ContractError("SYNTHETIC_CANONICAL_REJECTION") if fault == "canonical" else None,
                                 return_value=diagnostic) as canonical, mock.patch.object(scene_state, "write_json_atomic", side_effect=write):
-                    if fault is not None:
+                    if not success:
                         with self.assertRaises((ContractError, OSError)):
                             store.recover_initial_contact_rejection(prior_confirmation=confirmation,
                                 lifecycle_result=result, preapproval_evidence=preapproval, expected_cell=cell)
@@ -93,6 +114,9 @@ class SceneStateTest(unittest.TestCase):
                         self.assertTrue(store._cell.read()["cell_ready"])
                         self.assertFalse(receipt["new_human_confirmation"])
                         self.assertFalse(receipt["execution_authorized"])
+                        self.assertEqual(receipt["prior_confirmation_digest"], canonical_digest(confirmation))
+                        self.assertEqual(receipt["basis"], "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE" if model_failure
+                                         else "INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE")
                         self.assertEqual(json.loads(store._cell.runtime_path(writes[0]).read_text()), receipt)
                         self.assertEqual(writes[1:], ["scene_state.json", "state.json"])
                         with self.assertRaises(ContractError):

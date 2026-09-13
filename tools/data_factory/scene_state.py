@@ -219,7 +219,7 @@ class SceneStateStore:
         self, *, prior_confirmation: dict, lifecycle_result: dict,
         preapproval_evidence: dict, expected_cell: dict,
     ) -> dict:
-        """Correct the initial CONTACT_PROFILE_UNAVAILABLE bookkeeping fault.
+        """Correct an initial profile/model prepare rejection's bookkeeping.
 
         Trusted retained executor evidence, not a public operator assertion.
         Caller must have ended the lifecycle owner and frozen its retained
@@ -230,7 +230,6 @@ class SceneStateStore:
         """
         from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
         code = "SCENE_NO_DISPATCH_RECOVERY"
-        failure = "CONTACT_PROFILE_UNAVAILABLE"
         prior_confirmation, result, preapproval, expected_cell = copy.deepcopy(
             (prior_confirmation, lifecycle_result, preapproval_evidence, expected_cell))
         try:
@@ -239,8 +238,32 @@ class SceneStateStore:
             evidence = result["execution_evidence"]
             trace = diagnostic["execution_trace"]
             binding = validate_scene_binding(plan["scene_binding"])
-            prior = _validate(prior_confirmation["after_scene"]["scene_state"], self.robot_system_id)
+            failure = result["code"]
+            # A MODEL_BINDING failure in before()/consume() is not eligible:
+            # those paths already have a retained prospective_contact context.
+            prepare_failed = (
+                failure == "CONTACT_PROFILE_UNAVAILABLE"
+                and evidence.get("prospective_contact") == {"status": "UNAVAILABLE", "code": failure}
+            ) or (failure == "CONTACT_MODEL_BINDING" and "prospective_contact" not in evidence)
             prior_cell = self._cell._validate(prior_confirmation["after_cell"])
+            if prior_confirmation.get("schema_version") == "data_factory.no_dispatch_recovery.v1":
+                retained_path = self._cell.runtime_path(f"no_dispatch_recovery-{prior_cell['run_id']}.json")
+                if (decode_json_strict(retained_path.read_text(), code, retained_path) != prior_confirmation
+                        or prior_confirmation["receipt_digest"] != canonical_digest({
+                            k:v for k,v in prior_confirmation.items() if k != "receipt_digest"})
+                        or prior_confirmation["basis"] not in {
+                            "INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE",
+                            "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE"}
+                        or prior_confirmation["new_human_confirmation"] is not False
+                        or prior_confirmation["execution_authorized"] is not False):
+                    raise ContractError(code)
+                prior = _validate(prior_confirmation["after_scene"], self.robot_system_id)
+                prior_reason = "NO_DISPATCH_CONTINUITY"
+            else:
+                prior = _validate(prior_confirmation["after_scene"]["scene_state"], self.robot_system_id)
+                if prior_confirmation["after_scene"]["scene_state_digest"] != canonical_digest(prior):
+                    raise ContractError(code)
+                prior_reason = "HUMAN_ACKNOWLEDGED"
             failed = _validate(evidence["scene_transition"]["scene_state"], self.robot_system_id)
             self._cell._validate(expected_cell)
             item = prior["objects"][binding["object_instance_id"]]
@@ -248,12 +271,11 @@ class SceneStateStore:
             hardware = evidence["snapshot"]["gripper_controller"]["hardware_execution"]
             wire = hardware["wire"]
             generation = plan["learned_proposal"]["generation_context"]
-            if (result["code"] != failure or evidence["failure_code"] != failure
+            if (not prepare_failed or evidence["failure_code"] != failure
                     or result["state"] != "ABORTED" or result["executor_state"] != "BLOCKED"
                     or result.get("cancel_error") is not None or evidence.get("cancel_error") is not None
                     or evidence["step_index"] != 0 or evidence.get("learned_history", []) != []
                     or "mechanical_terminal" in evidence or "task_handoff" in evidence or "task_handoff" in result
-                    or evidence["prospective_contact"] != {"status": "UNAVAILABLE", "code": failure}
                     or trace["status"] != "FAILED" or trace["failure_code"] != failure
                     or trace.get("segments", []) != [] or trace["terminal_phases"] != []
                     or trace["terminal_state"] is not None
@@ -264,11 +286,10 @@ class SceneStateStore:
                     or preapproval["plan_digest"] != result["plan_digest"]
                     or preapproval["plan_envelope"]["plan"] != plan
                     or preapproval["plan_envelope_digest"] != canonical_digest(preapproval["plan_envelope"])
-                    or prior_confirmation["after_scene"]["scene_state_digest"] != canonical_digest(prior)
                     or binding["scene_state_digest"] != canonical_digest(prior)
                     or binding["revision"] != prior["revision"]
                     or item["state"] != "ON_SURFACE" or item["source"] != "HUMAN"
-                    or not prior_cell["cell_ready"] or prior_cell["reason_code"] != "HUMAN_ACKNOWLEDGED"
+                    or not prior_cell["cell_ready"] or prior_cell["reason_code"] != prior_reason
                     or expected_cell["cell_ready"] or expected_cell["reason_code"] != failure
                     or expected_cell["run_id"] != result["run_id"]
                     or expected_cell["plan_digest"] != result["plan_digest"]
@@ -291,7 +312,7 @@ class SceneStateStore:
             if (failed != expected_failed or phase_path.name != "phase_events.jsonl"
                     or phase_path.parent.name != result["run_id"] or phase_path.read_bytes() != b""):
                 raise ContractError(code)
-        except (KeyError, TypeError, ValueError, OSError) as exc:
+        except (KeyError, TypeError, ValueError, OSError, RecoveryError) as exc:
             raise ContractError(code) from exc
 
         # Same Scene -> Cell lock order as update_object. Publish the receipt
@@ -312,7 +333,8 @@ class SceneStateStore:
             ready = {**prior_cell, "reason_code": "NO_DISPATCH_CONTINUITY", "updated_at": now,
                      "run_id": result["run_id"], "plan_digest": result["plan_digest"]}
             receipt = {"schema_version": "data_factory.no_dispatch_recovery.v1",
-                       "basis": "INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE",
+                       "basis": ("INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE" if failure == "CONTACT_PROFILE_UNAVAILABLE"
+                                 else "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE"),
                        "prior_confirmation_digest": canonical_digest(prior_confirmation),
                        "lifecycle_result_digest": diagnostic["lifecycle_result_digest"],
                        "preapproval_evidence_digest": canonical_digest(preapproval),

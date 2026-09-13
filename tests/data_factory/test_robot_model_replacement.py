@@ -52,6 +52,33 @@ def finger_geometry(root, q):
 
 
 class RobotModelReplacementTest(unittest.TestCase):
+    def test_native_expansion_binds_full_model_not_xml_format_or_control_settings(self):
+        from tools.data_factory.motion.contact_transition import bound_robot_description
+        source = CANDIDATE.read_text()
+        plan = {"learned_source_program": {"binding_digests": {
+            "robot_description_digest": "sha256:" + hashlib.sha256(source.encode()).hexdigest()}},
+            "learned_proposal": {"robot_description": source}}
+        root = ET.fromstring(source)
+        control = ET.SubElement(root, "ros2_control", name="FR5System", type="system")
+        ET.SubElement(ET.SubElement(control, "hardware"), "plugin").text = "fairino_hardware/FairinoHardwareInterface"
+        ET.indent(root)
+        xml = ET.tostring(root, encoding="unicode")
+        self.assertEqual(bound_robot_description(SimpleNamespace(_robot_description=xml), plan), xml)
+        self.assertEqual(bound_robot_description(SimpleNamespace(_robot_description=source), plan), source)
+        for fault in ("arm", "finger", "collision", "tcp", "missing_joint", "extra_control", "root", "source"):
+            with self.subTest(fault=fault):
+                changed, proposal = copy.deepcopy(root), copy.deepcopy(plan)
+                if fault == "arm": changed.find("joint[@name='j1']/limit").set("upper", "1.2")
+                if fault == "finger": changed.find("joint[@name='finger_right_joint']/axis").set("xyz", "-1 0 0")
+                if fault == "collision": changed.find("link[@name='finger_tip_left_link']/collision/geometry/box").set("size", "0.001 0.001 0.001")
+                if fault == "tcp": changed.find("joint[@name='gripper_adapter_joint']/origin").set("xyz", "0 0 0.199")
+                if fault == "missing_joint": changed.remove(changed.find("joint[@name='finger_left_joint']"))
+                if fault == "extra_control": changed.append(copy.deepcopy(control))
+                if fault == "root": changed.set("name", "other_robot")
+                if fault == "source": proposal["learned_proposal"]["robot_description"] = ORIGINAL.read_text()
+                with self.assertRaisesRegex(ContractError, "CONTACT_MODEL_BINDING"):
+                    bound_robot_description(SimpleNamespace(_robot_description=ET.tostring(changed, encoding="unicode")), proposal)
+
     def test_successor_qualifications_resolve_normal_contact_without_trial_bypass(self):
         from tools.data_factory.run_job import resolve_inputs
         from tools.data_factory.motion.contact_transition import prepare

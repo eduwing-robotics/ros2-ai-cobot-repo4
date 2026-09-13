@@ -37,6 +37,32 @@ def bound_document(root, folder, digest):
     raise ContractError("CONTACT_PROFILE_UNAVAILABLE")
 
 
+def bound_robot_description(transport, plan):
+    """Bind source URDF geometry to native xacro output, not its serialization.
+
+    ros2_control settings belong to the existing hardware/settings admission.
+    Every link, joint, collision shape and other model element remains exact.
+    """
+    actual = transport._robot_description
+    expected_digest = plan["learned_source_program"]["binding_digests"]["robot_description_digest"]
+    if "sha256:" + hashlib.sha256(actual.encode()).hexdigest() == expected_digest:
+        return actual
+    try:
+        source = plan["learned_proposal"]["robot_description"]
+        if "sha256:" + hashlib.sha256(source.encode()).hexdigest() != expected_digest:
+            raise ContractError("CONTACT_MODEL_BINDING")
+        deployed = ET.fromstring(actual)
+        controls = deployed.findall("ros2_control")
+        if len(controls) != 1 or controls[0].attrib != {"name": "FR5System", "type": "system"}:
+            raise ContractError("CONTACT_MODEL_BINDING")
+        deployed.remove(controls[0])
+        if ET.canonicalize(ET.tostring(deployed, encoding="unicode"), strip_text=True) != ET.canonicalize(source, strip_text=True):
+            raise ContractError("CONTACT_MODEL_BINDING")
+    except (KeyError, AttributeError, TypeError, ET.ParseError) as exc:
+        raise ContractError("CONTACT_MODEL_BINDING") from exc
+    return actual
+
+
 def prepare(transport, plan, scene_object):
     """Resolve only existing pinned qualified inputs before the first command."""
     source = plan["learned_source_program"]
@@ -81,9 +107,7 @@ def prepare(transport, plan, scene_object):
     if (canonical_digest(expected) != canonical_digest(target["base_tcp"])
             or canonical_digest(expected_tool) != canonical_digest(target["base_tool"])):
         raise ContractError("CONTACT_SCENE_BINDING")
-    xml = transport._robot_description
-    if "sha256:" + hashlib.sha256(xml.encode()).hexdigest() != pins["robot_description_digest"]:
-        raise ContractError("CONTACT_MODEL_BINDING")
+    xml = bound_robot_description(transport, plan)
     model = ET.fromstring(xml)
     dimensions = [v / 1000 for v in obj["dimensions_mm"]]
     opened = grasp["gripper_open"]["command_position_m"]
@@ -110,6 +134,7 @@ def prepare(transport, plan, scene_object):
             or gap(grasp["gripper_close"]["command_position_m"]) > dimensions[0]):
         raise ContractError("CONTACT_MODEL_GEOMETRY")
     return {"status": "PROSPECTIVE", "plan_digest": canonical_digest(plan), "source_program_digest": canonical_digest(source),
+            "runtime_robot_description_digest": "sha256:" + hashlib.sha256(xml.encode()).hexdigest(),
             "capture_capability": "SOURCE_CONTACT_POSE_TRACKING_ONLY",
             "invariant_semantics": "SAMPLED_MODEL_NO_EARLIER_CONTACT",
             "scene_object": copy.deepcopy(scene_object), "scene_binding": copy.deepcopy(plan["scene_binding"]),
@@ -124,7 +149,7 @@ def before(transport, plan, step, observation, context):
     from tools.data_factory.rollout.gripper_evidence import check_transition
     if context["plan_digest"] != canonical_digest(plan):
         raise ContractError("CONTACT_PREFIX_BINDING")
-    if "sha256:" + hashlib.sha256(transport._robot_description.encode()).hexdigest() != plan["binding_digests"]["robot_description_digest"]:
+    if "sha256:" + hashlib.sha256(transport._robot_description.encode()).hexdigest() != context["runtime_robot_description_digest"]:
         raise ContractError("CONTACT_MODEL_BINDING")
     prior = context["checked_segments"]
     if prior:
@@ -222,7 +247,7 @@ def consume(transport, plan, scene_object, snapshot, context):
     current = {"snapshot": snapshot, "captured_at_s": now, "captured_monotonic_s": steady}
     from tools.data_factory.rollout.finite_plan import _execution_state
     _execution_state(plan["steps"][0], current, now)
-    if "sha256:" + hashlib.sha256(transport._robot_description.encode()).hexdigest() != plan["binding_digests"]["robot_description_digest"]:
+    if "sha256:" + hashlib.sha256(transport._robot_description.encode()).hexdigest() != context["runtime_robot_description_digest"]:
         raise ContractError("CONTACT_MODEL_BINDING")
     close = context["close"]
     check_transition(context["checked_segments"][-1]["terminal_observation"], current, command=False)
