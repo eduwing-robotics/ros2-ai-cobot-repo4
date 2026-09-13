@@ -1222,6 +1222,19 @@ class RosMoveItTransport:
             for subscription in subscriptions:
                 self.node.destroy_subscription(subscription)
 
+    def _source_samples_fresh(self, max_age_s):
+        """A just-dispatched DDS callback does not renew its source timestamp."""
+        now = time.time()
+        for message in (self._joint_state, self._arm_controller_state, self._gripper_controller_state):
+            if message is None:
+                return False
+            stamp = message.header.stamp
+            if (type(stamp.sec) is not int or type(stamp.nanosec) is not int
+                    or not 0 <= stamp.sec < 2**31 or not 0 <= stamp.nanosec < 10**9
+                    or not 0 <= now - (stamp.sec * 1_000_000_000 + stamp.nanosec) / 1e9 <= max_age_s):
+                return False
+        return True
+
     def snapshot(self, max_age_s):
         """Return a fresh, complete observation for execution safety checks."""
         if (
@@ -1233,6 +1246,10 @@ class RosMoveItTransport:
             raise ContractError("ROS_SNAPSHOT_AGE")
         max_age_s = float(max_age_s)
         self._prepare_native_clock(max_age_s)
+        # The configured native LIVE path already requires SYSTEM_TIME stamps
+        # at learned admission. Drain queued old-source samples within the same
+        # acquisition deadline; legacy unconfigured readers retain their contract.
+        native = getattr(self, "_native_clock_configured_age", None) is not None
         # New DDS participants need discovery time, not a relaxed sample age.
         # After one complete snapshot, retain the short live observation budget.
         timeout = (
@@ -1246,7 +1263,7 @@ class RosMoveItTransport:
             or self._arm_controller_received_at is None
             or self._gripper_controller_received_at is None
             or self._robot_description is None
-            or (getattr(self, "_native_clock_configured_age", None) is not None and not self._native_current_ready(max_age_s))
+            or (native and (not self._native_current_ready(max_age_s) or not self._source_samples_fresh(max_age_s)))
             or any(
                 self._clock() - received_at > max_age_s
                 for received_at in (
@@ -1331,6 +1348,8 @@ class RosMoveItTransport:
             observation["gripper_controller"]["feedback_position_m"] = wire["feedback_m"]
         for key in ("arm_controller", "gripper_controller"):
             validate_controller_sample(observation[key])
+        if native and not self._source_samples_fresh(max_age_s):
+            raise ContractError("LEARNED_STALE_STATE")
         self._initial_snapshot_complete = True
         return observation
 

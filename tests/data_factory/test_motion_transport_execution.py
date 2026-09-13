@@ -18,6 +18,90 @@ from tools.data_factory.motion.moveit_transport import RosMoveItTransport
 
 
 class TestExecutionTransport(unittest.TestCase):
+    def test_native_snapshot_drains_old_source_samples_within_original_budget(self):
+        from tools.data_factory.rollout.finite_plan import check_execution_start
+        description = (
+            "<robot><ros2_control><hardware>"
+            "<plugin>fairino_hardware/FairinoHardwareInterface</plugin>"
+            "<param name='gripper_velocity'>20</param><param name='gripper_force'>20</param>"
+            "<param name='gripper_settle_time_ms'>500</param>"
+            "</hardware><joint name='finger_right_joint'/></ros2_control></robot>"
+        )
+        model = '<robot>' + ''.join(
+            f'<joint name="{name}" type="{kind}"><limit lower="-3" upper="3" velocity="1"/></joint>'
+            for name, kind in [(f'j{i}', 'revolute') for i in range(1, 7)]
+            + [('finger_right_joint', 'prismatic')]) + '</robot>'
+        step = {"max_joint_state_age_s": .1, "joint_tolerance_rad": .001,
+                "gripper_tolerance_m": .001, "start_joint_state": [0.] * 6,
+                "learned_proposal": {"robot_description": model, "initial_state": [0.] * 6 + [.01]}}
+        for mode in ("queued_then_current", "paused_joint", "paused_arm", "paused_gripper",
+                     "future_source", "expires_during_snapshot", "legacy"):
+            with self.subTest(mode=mode):
+                clock, spins = [10.], []
+                transport = object.__new__(RosMoveItTransport)
+                transport._clock = lambda: clock[0]
+                transport.graph_timeout_s = .2
+                transport.preflight_timeout_s = 1.
+                transport._initial_snapshot_complete = True
+                transport._robot_description = description
+                transport._robot_description_client = None
+                transport._native_clock_configured_age = None if mode == "legacy" else .1
+                # Isolate ROS source acquisition: native SDK delivery/command
+                # validation has its own tests and is not hardware-qualified here.
+                transport._native_current_ready = lambda _: True
+                kind = ["control_msgs/msg/JointTrajectoryControllerState"]
+                def topics():
+                    if mode == "expires_during_snapshot":
+                        clock[0] += .11
+                    return [("/fairino5_controller/controller_state", kind),
+                            ("/gripper_controller/controller_state", kind)]
+                transport.node = SimpleNamespace(count_publishers=lambda _: 1,
+                    get_topic_names_and_types=topics)
+
+                def publish(stamp_s):
+                    joint = JointState(name=[f"j{i}" for i in range(1, 7)], position=[0.] * 6)
+                    arm = JointTrajectoryControllerState(joint_names=["j1"], speed_scaling_factor=1.)
+                    gripper = JointTrajectoryControllerState(joint_names=["finger_right_joint"], speed_scaling_factor=1.)
+                    for name, message, position, callback in (
+                            ("joint", joint, None, transport._on_joint_state),
+                            ("arm", arm, 0., transport._on_arm_controller_state),
+                            ("gripper", gripper, .01, transport._on_gripper_controller_state)):
+                        source_s = (9. if mode == "paused_" + name else clock[0] - .01) if mode.startswith("paused_") else stamp_s
+                        message.header.stamp.sec = int(source_s)
+                        message.header.stamp.nanosec = round((source_s - int(source_s)) * 1e9)
+                        if position is not None:
+                            message.reference.positions = [position]
+                            message.feedback.positions = [position]
+                        callback(deserialize_message(serialize_message(message), type(message)))
+
+                def spin(*_, timeout_sec):
+                    spins.append(timeout_sec)
+                    clock[0] += timeout_sec
+                    publish(clock[0] - .01 if mode == "queued_then_current" and len(spins) >= 3
+                            else 11. if mode == "future_source" else 9.)
+
+                transport._rclpy = SimpleNamespace(spin_once=spin)
+                publish(11. if mode == "future_source" else 9.99 if mode == "expires_during_snapshot" else 9.)
+                with mock.patch("tools.data_factory.motion.moveit_transport.time.monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch("tools.data_factory.motion.moveit_transport.time.time", side_effect=lambda: clock[0]):
+                    if mode.startswith("paused_") or mode in ("future_source", "expires_during_snapshot"):
+                        with self.assertRaisesRegex(ContractError, "LEARNED_STALE_STATE"):
+                            transport.snapshot(.1)
+                        self.assertLessEqual(clock[0], 10.2)
+                        continue
+                    observed = transport.snapshot(.1)
+                    evidence = {"snapshot": observed, "captured_at_s": clock[0]}
+                    if mode == "legacy":
+                        self.assertEqual(spins, [])
+                        with self.assertRaisesRegex(ContractError, "LEARNED_STALE_STATE"):
+                            check_execution_start(step, evidence, clock[0], steady_now=clock[0])
+                    else:
+                        self.assertEqual(len(spins), 3)
+                        self.assertEqual(observed["joint_state_stamp_ns"], round((clock[0] - .01) * 1e9))
+                        with mock.patch("tools.data_factory.rollout.gripper_evidence.check_hardware", return_value={"version": 5}):
+                            self.assertEqual(check_execution_start(step, evidence, clock[0], steady_now=clock[0]),
+                                             [0.] * 6 + [.01])
+
     def test_initial_snapshot_discovery_budget_does_not_relax_live_freshness(self):
         description = (
             "<robot><ros2_control><hardware>"
