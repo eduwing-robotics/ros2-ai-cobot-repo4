@@ -21,9 +21,17 @@
 
 [공간 표본화](../tools/data_factory/workspace_geometry.py) · [각도 배정](../tools/data_factory/state_space.py) · [접근 궤적](../tools/data_factory/motion/trajectory_variants.py)
 
-## Acquisition Strategy · 다음 수집 조건
+## 작업영역과 시연 분포 설계
 
-![현재 조건과 기존 기록을 바탕으로 다음 위치·각도를 제안하고 Collection 초안과 실행 계획에 연결한다.](portfolio/acquisition.drawio.svg)
+볼록 polygon으로 작업영역을 정의하고, 물체 외곽·경계 여유를 반영해 위치·yaw를 생성한다. 각 시연의 원본 조건과 판정을 보존해 같은 작업·물체·보정 조건의 수집량을 집계하고 다음 계획에 연결한다.
+
+![볼록 작업영역의 위치·yaw 표본화, 원본 조건별 기록과 판정, 현재 위치를 유지하는 다음 수집안을 함께 보여주는 설명용 예시](portfolio/condition-coverage.drawio.svg)
+
+설명용 기하·판정 예시
+
+[기하·표본화와 연결 근거](portfolio/sources/collection-catalog.html#workspace-acquisition)
+
+## Acquisition Strategy · 다음 수집 조건
 
 | 추천 경로 | 사용하는 근거 | 제안의 의미 |
 | --- | --- | --- |

@@ -18,11 +18,11 @@ Pick & Place · 21.1초
 
 | 핵심 기능 | 설계 목적 |
 | --- | --- |
-| 조건·궤적 설계 | [위치·각도 분포와 접근 경로를 정해, 물체 정렬 과정을 포함한 실물 시연을 생성한다.](docs/data-factory.md#시연-조건과-접근-궤적) |
+| 조건·궤적 설계 | [볼록 작업영역과 물체 외곽을 반영해 위치·yaw와 접근 경로를 설계한다.](docs/data-factory.md#시연-조건과-접근-궤적) |
 | 동기 기록 | [영상·관절 상태·그리퍼 명령을 같은 시각의 학습 표본으로 정렬한다.](docs/dataset-quality.md#필수-자동-기준) |
 | 데이터 선별 | [선택한 데이터의 원본과 학습·평가 배정을 유지해 데이터 변경의 영향을 비교한다.](docs/training-and-evaluation.md) |
 | 정책 비교 | [같은 관측에서 생성한 동작을 관절·그리퍼 단위로 비교한다.](docs/training-and-evaluation.md#오프라인-평가) |
-| 조건 피드백 | [실행 근거를 원래 조건에 대응시켜 다음 수집 추천에 사용한다.](docs/architecture.md#task--evidence-contracts) |
+| 조건 피드백 | [수집·실행 기록을 원래 조건에 대응시켜 다음 수집 계획에 연결한다.](docs/architecture.md#task--evidence-contracts) |
 
 <details>
 <summary>직접 실행하기 · 기술 문서 · 라이선스</summary>
