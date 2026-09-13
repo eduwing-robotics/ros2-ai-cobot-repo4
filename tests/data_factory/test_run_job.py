@@ -216,6 +216,59 @@ class RunJobTest(unittest.TestCase):
             self.assertIsNone(run_job.learned_run_diagnostic({}, payload=request))
             self.assertEqual(list(root.iterdir()), [])
 
+    def test_failed_start_retains_canonical_lifecycle_without_inventing_dispatch(self):
+        started = {
+            "run_id": "run-1", "code": "LEARNED_STALE_STATE",
+            "execution_evidence": {"learned_execution": {}},
+            "readiness_failure_evidence": None,
+        }
+        diagnostic = {
+            "schema_version": "data_factory.rollout_run_diagnostic.v1",
+            "execution_trace": {
+                "status": "FAILED", "failure_code": "LEARNED_STALE_STATE",
+            },
+            "task_effectiveness": "UNKNOWN", "physical_qualification": "UNKNOWN",
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
+            return_value=diagnostic,
+        ):
+            request = {"run_root": directory, "run_id": "run-1"}
+            run_job._prepare_run_dir(request)
+            self.assertEqual(run_job._failed_start_data(started, request), diagnostic)
+            self.assertEqual(
+                run_job.load_json_strict(
+                    Path(directory) / "run-1" / "learned_lifecycle_result.json"
+                ),
+                started,
+            )
+
+        readiness = {"code": "RECORDER_READINESS_TIMEOUT"}
+        with mock.patch.object(run_job, "learned_run_diagnostic", return_value=None):
+            self.assertEqual(
+                run_job._failed_start_data(
+                    {"readiness_failure_evidence": readiness}, {"run_id": "run-1"},
+                ),
+                {
+                    "mode": "live", "readiness_failure": readiness,
+                    "recorder_goal_count": 1, "execute_goal_count": 0,
+                    "camera_semantic_authority": False, "training_authorized": False,
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
+            side_effect=run_job.ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING"),
+        ):
+            request = {"run_root": directory, "run_id": "run-1"}
+            run_job._prepare_run_dir(request)
+            fallback = run_job._failed_start_data(started, request)
+            self.assertNotIn("execute_goal_count", fallback)
+            self.assertFalse(
+                (Path(directory) / "run-1" / "learned_lifecycle_result.json").exists()
+            )
+            self.assertEqual(started["code"], "LEARNED_STALE_STATE")
+
     def test_native_load_mapping_or_cancel_failure_precedes_live_children_and_run_writes(self):
         from tools.data_factory.learned_action_adapter import NativeSmolVLA
         for failure in ("load", "mapping", "cancel", "warmup", "warmup_cancel"):

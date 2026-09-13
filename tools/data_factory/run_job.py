@@ -2778,6 +2778,25 @@ def learned_run_diagnostic(result, *, payload=None):
     return diagnostic
 
 
+def _failed_start_data(started, payload):
+    """Retain canonical execution evidence; report zero dispatch only pre-execute."""
+    try:
+        diagnostic = learned_run_diagnostic(started, payload=payload)
+    except ContractError:
+        diagnostic = None
+    if diagnostic is not None:
+        return diagnostic
+    readiness_failure = started.get("readiness_failure_evidence")
+    data = {
+        "mode": "live", "readiness_failure": copy.deepcopy(readiness_failure),
+        "recorder_goal_count": 1,
+        "camera_semantic_authority": False, "training_authorized": False,
+    }
+    if isinstance(readiness_failure, dict):
+        data["execute_goal_count"] = 0
+    return data
+
+
 def run_plan_only(payload, cancel, publish, *, resolver=resolve_inputs, executor_factory=_executor):
     """Resolve and plan once; recorder, dataset, camera, and robot execution stay absent."""
     try:
@@ -4563,14 +4582,7 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
             return _response(
                 ok=False, code=started["code"], state=started["state"],
                 run_id=payload["run_id"], plan_digest=planned["plan_digest"],
-                data={
-                    "mode": "live",
-                    "readiness_failure": copy.deepcopy(readiness_failure),
-                    "recorder_goal_count": 1,
-                    "execute_goal_count": 0,
-                    "camera_semantic_authority": False,
-                    "training_authorized": False,
-                },
+                data=_failed_start_data(started, payload),
             )
         publish(_response(
             ok=True, code="EXECUTING", state="RUNNING",
