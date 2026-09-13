@@ -1,5 +1,58 @@
 # Coordinator handoff — 2026-09-09
 
+## Portable owner bootstrap — September 13 product resumption
+
+Start with the current Goal and [active acceptance](tasks.md#active-product-checkpoint--september-13-takeover),
+then the [current responsibility decision](design.md#september-13-product-takeover-scoped-temporal-responsibility-decision).
+The older sections below preserve evidence, not a queue of instructions to rerun.
+This bootstrap is navigation and operating context, not another approval layer.
+
+### Reusable lessons from consequential work
+
+- **A diagnostic/plugin path looked like the next executor.** The recorded native
+  architecture comparison found the full-chunk caller already connected while
+  the per-row plugin still rejected physical actions → interface similarity is
+  not actual consumption → begin at the next real consumer; keep native LeRobot
+  model/processors/inference and the existing FR5 physical owner. The detailed
+  ownership decision is in `tasks.md`, not duplicated here.
+- **A 295.097ms observation passed generation but failed initial planning; later
+  dispatch intentionally used current state instead.** The 300ms label concealed
+  different timing responsibilities → identify the clock, acquisition event and
+  consuming action before optimizing or relaxing a number → use the scoped
+  decision above; do not make historical timing observations permanent limits.
+- **External review assumed repeated personal approval and user steering had
+  to correct it.** Assisted exact-plan approval and bounded task grants are
+  different existing paths → read the actual caller's authority → reuse its
+  valid system grant without inventing a human verdict or bypassing its scope.
+- **A 1,368-test run took 1,859s, with two reproduced baseline failures; GPU/RAM
+  deferral was repeatedly mistaken for global dependency.** Verification and
+  resource ownership are scoped → choose affected producer/consumer checks,
+  delegate independent judgment/software work, and serialize actual shared
+  resources. Do not reproduce the old coordinator topology or full suite by habit.
+- **Two real attempts produced policy output but zero learned/gripper sends;
+  later CPU replay could not recover the missing live admission timestamp.**
+  Evidence belongs to its actual boundary → preserve UNKNOWN rather than turn
+  model output, controller completion or a retrospective measurement into task
+  success or a measured historical cause. The receipts below already hold details.
+
+### Volatile checkpoint — refresh, do not inherit as authority
+
+As recorded here, main `a46f159` selected scoped temporal responsibility and
+`c6e84da` bounded S/D research; both were pushed. Temporal implementation and
+completed-scoped-attempt → Collection validation advice are under owner review,
+not yet a qualified live path. Current status belongs in `tasks.md` and Git, not
+in these stable lessons. The user has authorized physical return; old pause text
+is superseded, while fresh runtime/Scene/exact authority still belongs to its
+existing consumer. Physical Pick remains UNKNOWN.
+
+The first new S/D run has now finished in 87.25s and released its single model/GPU
+allocation; interpretation is being recorded in Learning's existing OpenSpec.
+Old D's NOT_RUN record remains historical. Check live resource ownership rather
+than inheriting old PID, free-memory or usage-limit screens. Preserve unrelated
+dirty files. Thin natural use is closed; its receipts below are provenance, not
+a reason to resume Router maintenance. No new tests or session simulation were
+created for this documentation-only bootstrap.
+
 ## September 13 bounded close of Thin natural use
 
 The user ended this experiment. Do not continue it by opening architecture
