@@ -340,6 +340,71 @@ class AdmissionFreshnessEvidenceTest(unittest.TestCase):
         self.assertEqual(transport.mock_calls, [])
 
 
+class NativeTaskPlanConsumerTest(unittest.TestCase):
+    """Reuse source fixtures, not finite compilation or its execution protocol."""
+
+    @staticmethod
+    def policy():
+        return {"schema_version": "data_factory.native_learned_policy.v1",
+                "checkpoint": copy.deepcopy(CHECKPOINT), **OPTIONS,
+                "velocity_scaling": .1, "max_observation_age_s": .3}
+
+    def owners(self):
+        transport, recorder, cell = mock.Mock(), mock.Mock(), mock.Mock()
+        executor = PickupExecutor(transport, source_clock=lambda: 10., monotonic_clock=lambda: 10.)
+        job = OneJob(recorder, executor.process, cell)
+        return job, executor, transport, recorder, cell
+
+    def test_configuration_and_task_grant_do_not_compile_or_consume_a_prediction(self):
+        job, executor, transport, recorder, cell = self.owners()
+        src, policy, scene = cross_workspace_source(), self.policy(), copy.deepcopy(SCENE)
+        result = job.plan_stream("run", src, scene, policy)
+        self.assertTrue(result["ok"], result)
+        plan = result["plan_envelope"]["plan"]
+        self.assertEqual(result["plan_digest"], canonical_digest(plan))
+        self.assertIsNone(result["dry_run_digest"])
+        self.assertIsNone(result["execution_evidence"])
+        self.assertEqual(plan["source_program"]["endpoint_bindings"], src["endpoint_bindings"])
+        for key in ("steps", "learned_proposal", "learned_history", "precommit_safety"):
+            self.assertNotIn(key, plan)
+        grant = task_grant(src, scene, policy)
+        self.assertTrue(job.admit_task(grant)["ok"])
+        self.assertEqual(job.state, "APPROVED")
+        self.assertNotIn("execution", executor.runs["run"])
+        self.assertEqual((transport.mock_calls, recorder.mock_calls, cell.mock_calls), ([], [], []))
+        src["endpoint_bindings"][0]["workspace_id"] = "MUTATED"
+        policy["instruction"] = "MUTATED"
+        scene["revision"] += 1
+        self.assertEqual(executor.runs["run"]["plan"], plan)
+        self.assertFalse(job.plan_stream("another", src, scene, policy)["ok"])
+
+    def test_mismatched_grant_and_response_cannot_authorize_normal_task(self):
+        from tools.data_factory.rollout.task_authority import check_grant
+
+        job, executor, transport, recorder, cell = self.owners()
+        src, policy = cross_workspace_source(), self.policy()
+        self.assertTrue(job.plan_stream("run", src, SCENE, policy)["ok"])
+        grant = task_grant(src, SCENE, {**policy, "instruction": "different task"})
+        rejected = job.admit_task(grant)
+        self.assertEqual(rejected["code"], "TASK_GRANT_SCOPE")
+        self.assertEqual((job.state, executor.runs["run"]["state"]), ("PLANNED", "PLANNED"))
+        expired = task_grant(src, SCENE, policy, deadline_s=9.)
+        with self.assertRaisesRegex(ContractError, "TASK_DEADLINE_EXHAUSTED"):
+            check_grant(expired, executor.runs["run"]["plan"], 10.)
+        self.assertEqual((transport.mock_calls, recorder.mock_calls, cell.mock_calls), ([], [], []))
+
+        def tampered(request):
+            response = executor.process(request)
+            response["data"]["plan"]["policy"]["instruction"] = "different task"
+            response["plan_digest"] = canonical_digest(response["data"]["plan"])
+            return response
+
+        executor = PickupExecutor(transport, source_clock=lambda: 10., monotonic_clock=lambda: 10.)
+        job = OneJob(recorder, tampered, cell)
+        self.assertEqual(job.plan_stream("run", src, SCENE, policy)["code"], "EXECUTOR_RESPONSE")
+        self.assertIsNone(job.approval_scope)
+
+
 class FinitePlanTest(unittest.TestCase):
     def setUp(self):
         # Legacy lifecycle tests isolate contact just as they isolate planning.

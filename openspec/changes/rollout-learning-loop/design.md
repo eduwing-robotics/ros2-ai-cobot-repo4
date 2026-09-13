@@ -494,6 +494,23 @@ rolling horizon, tail replacement or overlap blending can be evaluated there
 without rebuilding inference or adding another executor. Do not implement a
 strategy registry, scheduler framework or additional prediction model now.
 
+Bind the normal task's source/destination, Scene and saved policy configuration
+once, independently of generated action rows. The same OneJob/PickupExecutor
+owns that plan and its existing task grant; revisions bind their own selected
+rows, native timing and consumption facts. Do not manufacture a finite plan,
+precommit trajectory report or row-terminal history to enter the normal path.
+Configuration admission alone proves neither current hardware readiness nor
+permission to submit an unchecked revision.
+
+Successive policy runs reuse that runtime, not independent actuator stacks.
+Each has its own run identity, policy state, recording and outcome. Previous-run
+optional semantic review, diagnosis and model comparison are not prerequisites
+for the next run. Actual motion ownership must be settled and the next physical
+starting condition established; a policy's completed queue is not object-pose
+evidence. Preserve the existing recorder's durability and bounded resource
+contracts until an actual sealed-record handoff supports asynchronous saving;
+this decision does not claim that current finalization already overlaps runs.
+
 The selected rhythm40 checkpoint is trained for bidirectional pick-and-place,
 not Pick alone. Normal rollout must let the policy consume fresh observations
 through pickup, transfer and placement under its SOURCE/DESTINATION instruction.

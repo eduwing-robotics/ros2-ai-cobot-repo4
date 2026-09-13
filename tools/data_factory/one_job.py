@@ -455,7 +455,7 @@ class OneJob:
                 raise ContractError("EXECUTOR_BINDING")
             if op != "observe_policy":
                 self.executor_state = response["state"]
-            if op not in {"plan", "observe_policy"} and isinstance(response.get("data"), dict):
+            if op not in {"plan", "plan_stream", "observe_policy"} and isinstance(response.get("data"), dict):
                 if self.plan_envelope and "learned_proposal" in self.plan_envelope["plan"]:
                     from tools.data_factory.rollout.finite_plan import validate_execution_trace
                     from tools.data_factory.rollout.finite_plan import validate_execution_history
@@ -683,6 +683,42 @@ class OneJob:
         """Compile a non-moving plan without manufacturing a human approval."""
         return self._prepare_plan(run_id, motion_program, scene_binding)
 
+    def plan_stream(self, run_id, source_program, scene_binding, policy):
+        """Plan one normal learned task, independently of its future outputs.
+
+        The canonical plan builder is replayed at the existing owner boundary.
+        No finite completion, precommit collision report, recorder transaction,
+        or motion permission is manufactured by this configuration-only step.
+        """
+        from tools.data_factory.rollout.stream_plan import build_stream_plan
+
+        if self.state != "IDLE":
+            return self._result(False, "ONE_JOB_ONLY")
+        try:
+            expected = build_stream_plan(run_id=run_id, source_program=source_program,
+                                         scene_binding=scene_binding, policy=policy)
+            response = self._request("executor", "plan_stream", {
+                "run_id": run_id, "source_program": expected["source_program"],
+                "scene_binding": expected["scene_binding"], "policy": expected["policy"],
+            }, allowed_failure=True)
+            if not response["ok"]:
+                self.state = "BLOCKED"
+                return self._result(False, response["code"])
+            digest = canonical_digest(expected)
+            if (response["state"] != "PLANNED" or response["plan_digest"] != digest
+                    or response["data"] != {"plan": expected}):
+                raise ContractError("EXECUTOR_RESPONSE")
+        except ContractError as exc:
+            self.state = "BLOCKED"
+            return self._result(False, exc.code)
+        self.run_id, self.plan_digest = run_id, digest
+        self._program = copy.deepcopy(expected["source_program"])
+        self.scene_binding = copy.deepcopy(expected["scene_binding"])
+        self.plan_envelope = {"plan": copy.deepcopy(expected)}
+        self.state = "PLANNED"
+        # A configuration-only task plan is not the old dry-run trajectory.
+        return self._result(True, "PLANNED")
+
     def plan_learned(self, run_id, motion_program, scene_binding, inference, observation, *, task_grant=None, **options):
         """Consume a native inference session through the existing zero-motion planner."""
         from tools.data_factory.rollout.finite_plan import compile_program, generation_spec
@@ -719,7 +755,7 @@ class OneJob:
         return self._prepare_plan(plan["run_id"], plan["motion_program"], plan["scene_binding"], plan["setup_approval"])
 
     def admit_task(self, grant=None):
-        """Admit an exact finite output using explicit authority, without human fiction."""
+        """Bind explicit task authority to the planned scope, not a human verdict."""
         initial = self.state == "PLANNED" and grant is not None
         if not initial and (self.state != "LEARNED_CHUNK_COMPLETE" or self.pending_learned_plan is None or self.approval_scope != "SCOPED_TASK_GRANT"):
             return self._result(False, "TASK_GRANT_STATE")

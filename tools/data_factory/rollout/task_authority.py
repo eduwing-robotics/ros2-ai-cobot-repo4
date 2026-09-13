@@ -8,6 +8,74 @@ SCOPE = "SCOPED_TASK_GRANT"
 GENERATION_SCHEMA = "data_factory.learned_generation_context.v1"
 
 
+def _number(value, code):
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ContractError(code)
+        return float(value)
+    except OverflowError as exc:
+        raise ContractError(code) from exc
+
+
+def validate_runtime_inputs(value, *, period_s, instruction,
+                            serialized_references=False, quantized_gripper=False):
+    """Validate the shared native deployment inputs, without reading their paths."""
+    inputs = copy.deepcopy(value)
+    causal = isinstance(inputs, dict) and inputs.get("hardware_wire_version") in (3, 4, 5)
+    hardware_key = "gripper_temporal_policy" if causal else "gripper_source_clock"
+    if (not isinstance(inputs, dict)
+            or set(inputs) - {"warmup", "hardware_wire_version", "reference_mode"}
+            != {"checkpoint", "device", hardware_key, "clock_binding", "camera_topics", "camera_mapping", "fps"}
+            or any(not isinstance(inputs[key], str) or not inputs[key] for key in ("checkpoint", hardware_key))
+            or not isinstance(inputs["device"], str) or inputs["device"] not in {"cpu", "cuda"}
+            or not isinstance(inputs["camera_topics"], dict) or set(inputs["camera_topics"]) != {"camera1", "camera2"}
+            or any(not isinstance(topic, str) or not topic.startswith("/") for topic in inputs["camera_topics"].values())
+            or not isinstance(inputs["camera_mapping"], dict) or len(inputs["camera_mapping"]) != 2
+            or any(not isinstance(key, str) or not key.startswith("observation.images.") or not isinstance(target, str)
+                   for key, target in inputs["camera_mapping"].items())
+            or set(inputs["camera_mapping"].values()) != {"observation.images.camera1", "observation.images.camera2"}
+            or abs(_number(inputs["fps"], "LEARNED_HORIZON") * _number(period_s, "LEARNED_HORIZON") - 1) > 1e-9):
+        raise ContractError("LEARNED_RUNTIME_INPUTS")
+    if "reference_mode" in inputs:
+        mode = inputs["reference_mode"]
+        if (not isinstance(mode, str)
+                or mode not in {"serialized_retime", "serialized_percent_retime"}
+                or not serialized_references
+                or (mode == "serialized_percent_retime") != quantized_gripper):
+            raise ContractError("LEARNED_RUNTIME_INPUTS")
+    if "warmup" in inputs:
+        warmup = inputs["warmup"]
+        if (not isinstance(warmup, dict)
+                or set(warmup) != {"input_kind", "image_shape", "instruction_digest", "device", "model_calls", "output_disposition", "rng_state_restored", "duration_s", "inference_duration_s"}
+                or warmup["input_kind"] != "SYNTHETIC_ZERO_RGB_STATE"
+                or not isinstance(warmup["image_shape"], list) or len(warmup["image_shape"]) != 3
+                or any(type(size) is not int or size < 1 for size in warmup["image_shape"])
+                or warmup["image_shape"][-1] != 3
+                or warmup["instruction_digest"] != canonical_digest(instruction)
+                or warmup["device"] != inputs["device"]
+                or type(warmup["model_calls"]) is not int or warmup["model_calls"] != 1
+                or warmup["output_disposition"] != "DISCARDED" or warmup["rng_state_restored"] is not True
+                or not 0 <= _number(warmup["inference_duration_s"], "LEARNED_WARMUP_INPUT")
+                <= _number(warmup["duration_s"], "LEARNED_WARMUP_INPUT")):
+            raise ContractError("LEARNED_WARMUP_INPUT")
+    if "hardware_wire_version" in inputs and (
+            type(inputs["hardware_wire_version"]) is not int
+            or inputs["hardware_wire_version"] not in (2, 3, 4, 5)):
+        raise ContractError("LEARNED_HARDWARE_SCHEMA")
+    if causal:
+        from .gripper_evidence import validate_temporal_policy
+        binding = validate_temporal_policy(inputs["clock_binding"])
+        expected_schema = ("fr5.gripper_temporal_policy.v2"
+                           if inputs["hardware_wire_version"] == 5
+                           else "fr5.gripper_temporal_policy.v1")
+        if binding["schema_version"] != expected_schema:
+            raise ContractError("LEARNED_HARDWARE_SCHEMA")
+    else:
+        from .gripper_evidence import validate_clock_binding
+        validate_clock_binding(inputs["clock_binding"])
+    return inputs
+
+
 def validate_generation_context(value):
     from tools.fr5_data_factory import DIGEST
     fields = {"schema_version", "generation_id", "run_id", "task_grant_digest",
@@ -98,6 +166,17 @@ def check_grant(grant, plan, now):
         raise ContractError("TASK_GRANT_REVOKED")
     if now >= grant["deadline_s"]:
         raise ContractError("TASK_DEADLINE_EXHAUSTED")
+    if plan.get("schema_version") == "data_factory.native_learned_task_plan.v1":
+        # The private plan was validated on admission. Its immutable policy
+        # settings bind the grant without freezing an inference output or
+        # compiling a finite row-by-row executable on every revision.
+        try:
+            expected = task_scope(plan["source_program"], plan["scene_binding"], plan["policy"])
+            if grant["run_id"] != plan["run_id"] or grant["scope"] != expected:
+                raise ContractError("TASK_GRANT_SCOPE")
+        except (KeyError, TypeError) as exc:
+            raise ContractError("TASK_GRANT_SCOPE") from exc
+        return
     if (grant["run_id"] != plan["run_id"] or "learned_proposal" not in plan
             or grant["scope"] != task_scope(plan["learned_source_program"], plan["scene_binding"], plan["learned_proposal"])):
         raise ContractError("TASK_GRANT_SCOPE")

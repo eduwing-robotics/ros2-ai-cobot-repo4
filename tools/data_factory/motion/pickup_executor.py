@@ -50,7 +50,7 @@ PHASES = (
 ARM_PHASES = frozenset(PHASES) - {"GRIPPER_CLOSE", "GRIPPER_OPEN"}
 JOINT_ORDER = ["j1", "j2", "j3", "j4", "j5", "j6"]
 COMMAND_FIELDS = {"schema_version", "op_id", "op", "payload"}
-COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "observe_policy", "plan", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
+COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "observe_policy", "plan", "plan_stream", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
 ACTIVE_STATES = {"EXECUTING", "PRECONTACT_HUMAN", "GRASP_VERDICT", "SEMANTIC_VERDICT", "LEARNED_CHUNK_COMPLETE", "RELEASE_VERDICT"}
 RECYCLE_PHASES = ("RECYCLE_APPROACH_PTP", "LOWER_LIN", "GRIPPER_OPEN", "RETREAT_LIN", "SAFE_POSE_PTP")
 EXECUTION_RESULT_MARGIN_S = 2.0
@@ -721,6 +721,35 @@ class PickupExecutor:
                 "precommit_evidence": copy.deepcopy(envelope["precommit_evidence"]),
                 "recycle_plan_digest": envelope["operator_summary"].get("recycle", {}).get("plan_digest"),
                 "envelope": copy.deepcopy(envelope), "state": "PLANNED"}
+
+    def _plan_stream(self, payload):
+        """Bind task configuration without compiling or dispatching policy rows.
+
+        This is the normal task's immutable scope, not a finite executable or
+        a claim of hardware/Scene readiness. Actual revision admission belongs
+        to this same owner at submission, under the separately admitted grant.
+        """
+        from tools.data_factory.rollout.stream_plan import build_stream_plan
+
+        _exact(payload, {"run_id", "source_program", "scene_binding", "policy"}, "PLAN_SCHEMA")
+        run_id = payload["run_id"]
+        if not isinstance(run_id, str) or not SAFE_ID.fullmatch(run_id):
+            raise ContractError("PLAN_SCHEMA")
+        if run_id in self.runs:
+            raise ContractError("RUN_ID_REUSED")
+        if self.runs or self._generation is not None:
+            raise ContractError("ONE_JOB_ONLY")
+        if self.motion_only_binding_digest is not None:
+            raise ContractError("LEARNED_SCENE_SCOPE")
+        plan = build_stream_plan(**payload)
+        digest = canonical_digest(plan)
+        envelope = {"plan": plan}
+        self.runs[run_id] = {
+            "plan": copy.deepcopy(plan), "digest": digest,
+            "envelope": copy.deepcopy(envelope), "state": "PLANNED",
+        }
+        return _response(ok=True, code="PLANNED", state="PLANNED", run_id=run_id,
+                         plan_digest=digest, data=envelope)
 
     def _compile_plan(self, payload, *, chunk_binding=None):
         # Compilation may read/serialize/check collision but never replaces the

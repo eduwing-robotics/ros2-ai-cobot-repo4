@@ -117,51 +117,11 @@ def validate_proposal(value):
     if p["proposal_digest"] != canonical_digest({k: v for k, v in p.items() if k != "proposal_digest"}):
         raise ContractError("LEARNED_PROPOSAL_DIGEST")
     if "runtime_inputs" in p:
-        inputs = p["runtime_inputs"]
-        causal = isinstance(inputs, dict) and inputs.get("hardware_wire_version") in (3, 4, 5)
-        hardware_key = "gripper_temporal_policy" if causal else "gripper_source_clock"
-        if (not isinstance(inputs, dict) or set(inputs) - {"warmup", "hardware_wire_version", "reference_mode"} != {"checkpoint", "device", hardware_key, "clock_binding", "camera_topics", "camera_mapping", "fps"}
-                or any(not isinstance(inputs[k], str) or not inputs[k] for k in ("checkpoint", hardware_key))
-                or not isinstance(inputs["device"], str) or inputs["device"] not in {"cpu", "cuda"}
-                or not isinstance(inputs["camera_topics"], dict) or set(inputs["camera_topics"]) != {"camera1", "camera2"}
-                or any(not isinstance(t, str) or not t.startswith("/") for t in inputs["camera_topics"].values())
-                or not isinstance(inputs["camera_mapping"], dict) or len(inputs["camera_mapping"]) != 2
-                or any(not isinstance(k, str) or not k.startswith("observation.images.") or not isinstance(v, str)
-                       for k, v in inputs["camera_mapping"].items())
-                or set(inputs["camera_mapping"].values()) != {"observation.images.camera1", "observation.images.camera2"}
-                or abs(_number(inputs["fps"], "LEARNED_HORIZON") * _number(p["period_s"], "LEARNED_HORIZON") - 1) > 1e-9):
-            raise ContractError("LEARNED_RUNTIME_INPUTS")
-        if "reference_mode" in inputs and (inputs["reference_mode"] not in {"serialized_retime", "serialized_percent_retime"} or not reference
-                or (inputs["reference_mode"] == "serialized_percent_retime") != ("raw_actions" in p)):
-            raise ContractError("LEARNED_RUNTIME_INPUTS")
-        if "warmup" in inputs:
-            warmup = inputs["warmup"]
-            if (not isinstance(warmup, dict) or set(warmup) != {"input_kind", "image_shape", "instruction_digest", "device", "model_calls", "output_disposition", "rng_state_restored", "duration_s", "inference_duration_s"}
-                    or warmup["input_kind"] != "SYNTHETIC_ZERO_RGB_STATE"
-                    or not isinstance(warmup["image_shape"], list) or len(warmup["image_shape"]) != 3
-                    or any(type(n) is not int or n < 1 for n in warmup["image_shape"]) or warmup["image_shape"][-1] != 3
-                    or warmup["instruction_digest"] != canonical_digest(p["instruction"])
-                    or warmup["device"] != inputs["device"] or type(warmup["model_calls"]) is not int or warmup["model_calls"] != 1
-                    or warmup["output_disposition"] != "DISCARDED" or warmup["rng_state_restored"] is not True
-                    or not 0 <= _number(warmup["inference_duration_s"], "LEARNED_WARMUP_INPUT") <= _number(warmup["duration_s"], "LEARNED_WARMUP_INPUT")):
-                raise ContractError("LEARNED_WARMUP_INPUT")
-        if "hardware_wire_version" in inputs and (
-                type(inputs["hardware_wire_version"]) is not int
-                or inputs["hardware_wire_version"] not in (2, 3, 4, 5)):
-            raise ContractError("LEARNED_HARDWARE_SCHEMA")
-        if causal:
-            from .gripper_evidence import validate_temporal_policy
-            binding = validate_temporal_policy(inputs["clock_binding"])
-            expected_schema = (
-                "fr5.gripper_temporal_policy.v2"
-                if inputs["hardware_wire_version"] == 5
-                else "fr5.gripper_temporal_policy.v1"
-            )
-            if binding["schema_version"] != expected_schema:
-                raise ContractError("LEARNED_HARDWARE_SCHEMA")
-        else:
-            from .gripper_evidence import validate_clock_binding
-            validate_clock_binding(inputs["clock_binding"])
+        from .task_authority import validate_runtime_inputs
+        p["runtime_inputs"] = validate_runtime_inputs(
+            p["runtime_inputs"], period_s=p["period_s"], instruction=p["instruction"],
+            serialized_references=reference, quantized_gripper="raw_actions" in p,
+        )
     if (p["joint_order"] != JOINTS or p["units"] != UNITS or p["action_semantics"] != "ABSOLUTE_JOINT_POSITION"
             or p["source_clock"] != "SYSTEM_TIME"):
         raise ContractError("LEARNED_ACTION_CONTRACT")
