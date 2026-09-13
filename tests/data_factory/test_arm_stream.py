@@ -1,5 +1,6 @@
 """Native FJT message/future seam; no ROS node, model or hardware calls."""
 from concurrent.futures import Future
+import copy
 import gc
 from itertools import count
 from types import SimpleNamespace
@@ -431,72 +432,157 @@ class ArmStreamTest(unittest.TestCase):
         self.assertEqual(self.stream.poll(), [])
 
 
-class TransportArmStreamTest(unittest.TestCase):
+class TransportActuatorStreamTest(unittest.TestCase):
     def setUp(self):
         self.transport = object.__new__(RosMoveItTransport)
         self.transport._active = None
         self.transport._execution_locked = False
         self.transport._execute_goal_count = 0
+        self.transport._gripper_goal_count = 0
         self.transport._clock = lambda: 10.
         self.transport.node = object()
         self.transport._FollowJointTrajectory = FollowJointTrajectory
         self.client = Mock()
         self.response = Future()
         self.client.send_goal_async.return_value = self.response
+        self.gripper_response = Future()
+        self.transport.gripper = Mock()
+        self.transport.gripper.send_goal_async.return_value = self.gripper_response
         self.transport._ActionClient = Mock(return_value=self.client)
         self.transport._rclpy = SimpleNamespace(spin_once=Mock())
 
-    def test_same_transport_slot_excludes_legacy_goals_and_only_one_native_client(self):
-        self.transport.open_learned_arm_stream(deadline=20.)
+    @staticmethod
+    def goals():
+        arm = goal()
+        arm.trajectory.header.stamp.sec = 42
+        gripper = FollowJointTrajectory.Goal()
+        gripper.trajectory.header = copy.deepcopy(arm.trajectory.header)
+        gripper.trajectory.joint_names = ["finger_right_joint"]
+        point = JointTrajectoryPoint(positions=[.012])
+        point.time_from_start.nanosec = 100_000_000
+        gripper.trajectory.points = [point]
+        return arm, gripper
+
+    def test_same_transport_slot_excludes_legacy_and_reuses_gripper_client(self):
+        self.transport.open_learned_actuator_stream(deadline=20.)
         self.transport._ActionClient.assert_called_once_with(
             self.transport.node, FollowJointTrajectory, "/fairino5_controller/follow_joint_trajectory")
         self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
         self.assertTrue(self.transport.owns_active_goal)
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_ACTIVE"):
             self.transport.start_phase({})
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_ACTIVE"):
-            self.transport.open_learned_arm_stream(deadline=20.)
-        value = goal()
-        self.transport.submit_learned_arm_trajectory(value, revision="one", dispatch_guard=Mock())
-        self.assertEqual(self.client.send_goal_async.call_args.args[0], value)
+            self.transport.open_learned_actuator_stream(deadline=20.)
+        arm, gripper = self.goals()
+        guard = Mock()
+        self.transport.submit_learned_actuator_revision(arm, gripper, revision="one", dispatch_guard=guard)
+        self.assertEqual(self.client.send_goal_async.call_args.args[0], arm)
+        self.assertEqual(self.transport.gripper.send_goal_async.call_args.args[0], gripper)
+        guard.assert_called_once_with({"arm": arm, "gripper": gripper}, None)
         self.assertEqual(self.transport._execute_goal_count, 1)
-        self.assertEqual(self.transport.poll_learned_arm_stream(), [])
+        self.assertEqual(self.transport._gripper_goal_count, 1)
+        self.assertEqual(self.transport.poll_learned_actuator_stream(), [])
 
     def test_generic_cancel_never_reports_async_fence_as_completed_stop(self):
-        self.transport.open_learned_arm_stream(deadline=20.)
-        self.transport.submit_learned_arm_trajectory(goal(), revision="one", dispatch_guard=Mock())
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        self.transport.submit_learned_actuator_revision(*self.goals(), revision="one", dispatch_guard=Mock())
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_CANCEL_UNCERTAIN"):
             self.transport.cancel_active(.1)
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_ACTIVE"):
-            self.transport.close_learned_arm_stream()
-        item = handle()
+            self.transport.close_learned_actuator_stream()
+        item, gripper = handle(), handle()
         self.response.set_result(item)
-        self.transport.poll_learned_arm_stream()
+        self.gripper_response.set_result(gripper)
+        self.transport.poll_learned_actuator_stream()
         item.cancel_goal_async.assert_called_once()
+        gripper.cancel_goal_async.assert_called_once()
         self.assertTrue(self.transport.owns_active_goal)
         finish(item, 5)
-        self.assertEqual(self.transport.poll_learned_arm_stream()[0]["result_status"], 5)
-        self.transport.close_learned_arm_stream()
+        events = self.transport.poll_learned_actuator_stream()
+        self.assertTrue(any(e["event"] == "TERMINAL" and e["actuator"] == "arm" and e["result_status"] == 5 for e in events))
+        with self.assertRaisesRegex(ContractError, "ROS_EXEC_ACTIVE"):
+            self.transport.close_learned_actuator_stream()
+        finish(gripper, 5)
+        self.transport.poll_learned_actuator_stream()
+        self.transport.close_learned_actuator_stream()
         self.assertFalse(self.transport.owns_active_goal)
         self.assertTrue(self.transport._execution_locked)
+
+    def test_native_send_failure_preserves_actual_attempt_counts(self):
+        for failed_actuator, expected in (("arm", (1, 0)), ("gripper", (1, 1))):
+            with self.subTest(actuator=failed_actuator):
+                self.setUp()
+                self.transport.open_learned_actuator_stream(deadline=20.)
+                client = self.client if failed_actuator == "arm" else self.transport.gripper
+                error = OSError("native send outcome unknown")
+                client.send_goal_async.side_effect = error
+                with self.assertRaises(OSError) as raised:
+                    self.transport.submit_learned_actuator_revision(
+                        *self.goals(), revision="one", dispatch_guard=Mock())
+                self.assertIs(raised.exception, error)
+                self.assertEqual((self.transport._execute_goal_count,
+                                  self.transport._gripper_goal_count), expected)
+                self.assertTrue(self.transport._active.fenced)
+                self.assertTrue(self.transport.owns_active_goal)
+
+    def test_rejected_guard_does_not_increment_native_attempt_counts(self):
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        with self.assertRaisesRegex(ContractError, "SCENE_CHANGED"):
+            self.transport.submit_learned_actuator_revision(*self.goals(), revision="one",
+                dispatch_guard=Mock(side_effect=ContractError("SCENE_CHANGED")))
+        self.assertEqual((self.transport._execute_goal_count,
+                          self.transport._gripper_goal_count), (0, 0))
+        self.assertFalse(self.transport._active.owns_goals)
+        self.transport.fence_learned_actuator_stream()
+        self.transport.close_learned_actuator_stream()
+        self.assertFalse(self.transport.owns_active_goal)
 
     def test_stream_cannot_replace_an_existing_collection_motion_owner(self):
         existing = object()
         self.transport._active = existing
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_ACTIVE"):
-            self.transport.open_learned_arm_stream(deadline=20.)
+            self.transport.open_learned_actuator_stream(deadline=20.)
         self.assertIs(self.transport._active, existing)
         self.transport._ActionClient.assert_not_called()
 
     def test_no_open_stream_or_wrong_native_joint_contract_cannot_send(self):
         with self.assertRaises(ContractError):
-            self.transport.submit_learned_arm_trajectory(goal(), revision="one", dispatch_guard=Mock())
-        self.transport.open_learned_arm_stream(deadline=20.)
-        value = goal()
-        value.trajectory.joint_names.append("finger_right_joint")
-        with self.assertRaisesRegex(ContractError, "ROS_EXEC_STEP"):
-            self.transport.submit_learned_arm_trajectory(value, revision="one", dispatch_guard=Mock())
+            self.transport.submit_learned_actuator_revision(*self.goals(), revision="one", dispatch_guard=Mock())
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        for actuator in (0, 1):
+            with self.subTest(actuator=actuator):
+                goals = self.goals()
+                goals[actuator].trajectory.joint_names.append("wrong_joint")
+                with self.assertRaisesRegex(ContractError, "ROS_EXEC_STEP"):
+                    self.transport.submit_learned_actuator_revision(*goals, revision="one", dispatch_guard=Mock())
         self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+
+    def test_pair_timing_and_structure_reject_before_either_send(self):
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        def wrong_stamp(arm, gripper):
+            gripper.trajectory.header.stamp.nanosec = 1
+        def zero_stamp(arm, gripper):
+            arm.trajectory.header.stamp.sec = gripper.trajectory.header.stamp.sec = 0
+        def dimension(arm, gripper):
+            gripper.trajectory.points[0].positions = [.01, .02]
+        def nonfinite(arm, gripper):
+            arm.trajectory.points[0].positions[0] = float("nan")
+        def repeated_time(arm, gripper):
+            arm.trajectory.points[1].time_from_start = copy.deepcopy(arm.trajectory.points[0].time_from_start)
+        def derivative_dimension(arm, gripper):
+            gripper.trajectory.points[0].velocities = [.1, .2]
+        for change in (wrong_stamp, zero_stamp, dimension, nonfinite, repeated_time, derivative_dimension):
+            with self.subTest(change=change.__name__):
+                goals = self.goals()
+                change(*goals)
+                guard = Mock()
+                with self.assertRaisesRegex(ContractError, "ROS_EXEC_STEP"):
+                    self.transport.submit_learned_actuator_revision(*goals, revision="one", dispatch_guard=guard)
+                guard.assert_not_called()
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
 
 
 if __name__ == "__main__":

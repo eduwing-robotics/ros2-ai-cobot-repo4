@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from tools.fr5_data_factory import ContractError, canonical_digest
-from .arm_stream import ArmStream
+from .actuator_stream import ActuatorStream
 
 
 JOINT_ORDER = ["j1", "j2", "j3", "j4", "j5", "j6"]
@@ -1001,12 +1001,12 @@ class RosMoveItTransport:
         self._execution_locked = False
         return active
 
-    def open_learned_arm_stream(self, *, deadline):
-        """Reserve this transport's sole motion slot for native rolling JTC goals.
+    def open_learned_actuator_stream(self, *, deadline):
+        """Reserve one logical motion slot with subordinate ARM/gripper handles.
 
-        No goal is sent here. The task owner must admit each exact trajectory
-        through submit_learned_arm_trajectory's mandatory dispatch guard. Legacy
-        MoveIt/gripper phases cannot run concurrently through this transport.
+        No goal is sent here. The task owner admits each exact actuator pair
+        through submit_learned_actuator_revision's mandatory guard. This port is
+        not an independent motion authority or a second lifecycle owner.
         """
         if self._execution_locked or self._active is not None:
             raise ContractError("ROS_EXEC_ACTIVE")
@@ -1015,37 +1015,70 @@ class RosMoveItTransport:
             client = self._ActionClient(self.node, self._FollowJointTrajectory,
                                        "/fairino5_controller/follow_joint_trajectory")
             self._learned_arm_client = client
-        stream = ArmStream(client, deadline=deadline, clock=self._clock)
+        stream = ActuatorStream(client, self.gripper, deadline=deadline, clock=self._clock)
         self._active = stream
 
-    def submit_learned_arm_trajectory(self, goal, *, revision, dispatch_guard):
-        """Send a whole native goal; never create row-level execution phases."""
-        if self._execution_locked or not isinstance(self._active, ArmStream):
-            raise ContractError("ROS_EXEC_ACTIVE")
-        if (not isinstance(goal, self._FollowJointTrajectory.Goal)
-                or list(goal.trajectory.joint_names) != JOINT_ORDER
-                or not goal.trajectory.points):
-            raise ContractError("ROS_EXEC_STEP")
-        self._active.submit(goal, revision=revision, dispatch_guard=dispatch_guard)
-        self._execute_goal_count += 1
+    def submit_learned_actuator_revision(self, arm_goal, gripper_goal, *, revision, dispatch_guard):
+        """Submit exact native timelines without row-level completion barriers.
 
-    def poll_learned_arm_stream(self):
-        if not isinstance(self._active, ArmStream):
+        A common explicit start stamp is necessary, not proof of physical
+        synchronization. The owner's guard checks its current validity and the
+        exact goals' geometry, timing, authority and hardware qualifications.
+        """
+        if self._execution_locked or not isinstance(self._active, ActuatorStream):
+            raise ContractError("ROS_EXEC_ACTIVE")
+        for goal, names in ((arm_goal, JOINT_ORDER), (gripper_goal, ["finger_right_joint"])):
+            if (not isinstance(goal, self._FollowJointTrajectory.Goal)
+                    or list(goal.trajectory.joint_names) != names
+                    or not goal.trajectory.points
+                    or goal.multi_dof_trajectory.joint_names or goal.multi_dof_trajectory.points):
+                raise ContractError("ROS_EXEC_STEP")
+            previous = -1
+            for point in goal.trajectory.points:
+                stamp = point.time_from_start
+                when = stamp.sec * 1_000_000_000 + stamp.nanosec
+                if (stamp.sec < 0 or not 0 <= stamp.nanosec < 1_000_000_000 or when <= previous
+                        or len(point.positions) != len(names)
+                        or any(values and len(values) != len(names)
+                               for values in (point.velocities, point.accelerations, point.effort))
+                        or any(not math.isfinite(value) for values in
+                               (point.positions, point.velocities, point.accelerations, point.effort)
+                               for value in values)):
+                    raise ContractError("ROS_EXEC_STEP")
+                previous = when
+        stamp = arm_goal.trajectory.header.stamp
+        if (arm_goal.trajectory.header != gripper_goal.trajectory.header
+                or stamp.sec < 0 or not 0 <= stamp.nanosec < 1_000_000_000
+                or stamp.sec == 0 and stamp.nanosec == 0):
+            raise ContractError("ROS_EXEC_STEP")
+        stream = self._active
+        before = stream.submission_attempts
+        try:
+            stream.submit(arm_goal, gripper_goal, revision=revision, dispatch_guard=dispatch_guard)
+        finally:
+            # A native send may have been entered before its response fails.
+            # Count attempts, never turn missing acknowledgement into no-send.
+            after = stream.submission_attempts
+            self._execute_goal_count += after["arm"] - before["arm"]
+            self._gripper_goal_count += after["gripper"] - before["gripper"]
+
+    def poll_learned_actuator_stream(self):
+        if not isinstance(self._active, ActuatorStream):
             raise ContractError("ROS_EXEC_NO_ACTIVE")
         self._rclpy.spin_once(self.node, timeout_sec=0.0)
         return self._active.poll()
 
-    def close_learned_arm_stream(self):
+    def close_learned_actuator_stream(self):
         """Release only a fenced stream whose native handles are all terminal."""
-        if not isinstance(self._active, ArmStream):
+        if not isinstance(self._active, ActuatorStream):
             raise ContractError("ROS_EXEC_NO_ACTIVE")
         if self._active.owns_goals or not self._active.fenced:
             raise ContractError("ROS_EXEC_ACTIVE")
         self._active = None
 
-    def fence_learned_arm_stream(self):
+    def fence_learned_actuator_stream(self):
         """Request cancellation without representing it as completed stopping."""
-        if not isinstance(self._active, ArmStream):
+        if not isinstance(self._active, ActuatorStream):
             raise ContractError("ROS_EXEC_NO_ACTIVE")
         self._active.cancel()
 
@@ -1054,7 +1087,7 @@ class RosMoveItTransport:
         active = getattr(self, "_active", None)
         if active is None:
             raise ContractError("ROS_EXEC_NO_ACTIVE")
-        if isinstance(active, ArmStream):
+        if isinstance(active, ActuatorStream):
             raise ContractError("ROS_EXEC_STREAM_OWNER_REQUIRED")
         if active.result_future is None:
             raise ContractError("ROS_EXEC_GOAL_PENDING")
@@ -1109,7 +1142,7 @@ class RosMoveItTransport:
     def terminal_verification(self):
         """Retain the last checked witness separately from any fault snapshot."""
         active = getattr(self, "_active", None)
-        if active is None or isinstance(active, ArmStream) or active.action_terminal_observation is None:
+        if active is None or isinstance(active, ActuatorStream) or active.action_terminal_observation is None:
             return None
         return copy.deepcopy({"phase": active.phase, "type": active.type,
             "deadline_monotonic_s": active.deadline, "status": active.terminal_observation_status,
@@ -1189,7 +1222,7 @@ class RosMoveItTransport:
         ):
             raise ContractError("ROS_EXEC_CANCEL_TIMEOUT")
         self._execution_locked = True
-        if isinstance(active, ArmStream):
+        if isinstance(active, ActuatorStream):
             # The stream's owner polls native cancellation/terminal evidence;
             # never translate a fence or cancel acknowledgement into a stop.
             active.cancel()
@@ -1241,7 +1274,7 @@ class RosMoveItTransport:
         active = getattr(self, "_active", None)
         if active is None:
             raise ContractError("ROS_EXEC_NO_ACTIVE")
-        if isinstance(active, ArmStream):
+        if isinstance(active, ActuatorStream):
             raise ContractError("ROS_EXEC_STREAM_OWNER_REQUIRED")
         if getattr(active, "action_succeeded", False) and not self._execution_locked:
             # A normal hardware handoff is still owned; diagnostic polling must

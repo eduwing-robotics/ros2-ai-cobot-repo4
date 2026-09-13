@@ -483,6 +483,13 @@ physical execution and Pick/release outcomes remain unproven.
 
 ### Native rolling-trajectory migration
 
+The selected rhythm40 checkpoint is trained for bidirectional pick-and-place,
+not Pick alone. Normal rollout must let the policy consume fresh observations
+through pickup, transfer and placement under its SOURCE/DESTINATION instruction.
+A qualified mechanical release/reset is a separately attributed recovery or
+next-attempt preparation, not a substitute for the policy's placement or evidence
+of policy task success.
+
 Use the existing six-joint JTC's `FollowJointTrajectory` endpoint for rolling
 ARM updates, under `RosMoveItTransport`'s same exclusive motion slot. JTC and
 the existing hardware writer retain interpolation/ServoJ ownership; do not add
@@ -497,7 +504,19 @@ handles, exact guarded goals, the original deadline and native cancellation
 responses/results. Accepted replacement is not RT adoption or predecessor
 completion; neither canceled action status nor an empty handle set proves a
 physical stop. Normal OneJob/LeRobot admission and evidence consumers are not
-yet connected to this port, and full ARM/gripper coexistence remains unresolved.
+yet connected to this port, and physical ARM/gripper coexistence remains unresolved.
+
+The transport now exposes one composite `ActuatorStream` rather than the unused
+ARM-only public port. It reserves the same exclusive transport slot and owns two
+subordinate native handles for the existing disjoint ARM and gripper controllers.
+One guard validates the exact pair before either native send. Both trajectories
+share an explicit start stamp; that is not proof of atomic server acceptance or
+physical synchronization. Each native acceptance/result remains separately
+observable, and a partial failure fences both channels while retaining ambiguous
+handles and actual send-call counts. No row completion barrier, second command
+producer, inference scheduler or cursor advancement is introduced. This software
+seam does not itself qualify concurrent hardware commands; normal task admission,
+driver coexistence/retargeting and full 7D consumption still require integration.
 
 The installed JTC `4.40.1-1noble.20260615.171409` predates the native preemption
 result-delivery fix; its binary retains the old `Current goal cancelled due to
