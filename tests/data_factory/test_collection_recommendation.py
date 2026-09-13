@@ -694,6 +694,54 @@ def learned_lifecycle(fixture, order=1, *, completed=False, reviewed=False):
     return result
 
 
+def scoped_terminal_lifecycle(result):
+    """Project the canonical contract shape; this is no physical qualification."""
+    from tools.data_factory.motion.mechanical_terminal import PHASES
+    from tools.data_factory.rollout.task_authority import SCOPE, task_scope
+
+    result = copy.deepcopy(result)
+    plan = result["plan_envelope"]["plan"]
+    grant = {
+        "schema_version": "data_factory.learned_task_grant.v1",
+        "grant_id": "synthetic-task", "issued_by": "synthetic-authority",
+        "run_id": result["run_id"],
+        "scope": task_scope(plan["learned_source_program"], plan["scene_binding"], plan["learned_proposal"]),
+        "deadline_s": 100., "terminal_reserve_s": 30., "max_outputs": 1,
+        "revoked": False,
+    }
+    redigest(grant, "grant_digest")
+    admission = {
+        "approval_id": "task-" + result["plan_digest"].removeprefix("sha256:"),
+        "approved_by": grant["issued_by"], "approval_scope": SCOPE,
+        "approval_expiry": None, "run_id": result["run_id"],
+        "resolved_job_digest": plan["resolved_job_digest"],
+        "plan_digest": result["plan_digest"], "task_grant": copy.deepcopy(grant),
+    }
+    terminal_plan = redigest({
+        "parent_plan_digest": digest(plan),
+        "source_program_digest": digest(plan["learned_source_program"]),
+        "grant_digest": grant["grant_digest"], "deadline_s": grant["deadline_s"],
+        "control_source": "QUALIFIED_MECHANICAL_RELEASE",
+        "recording_scope": "OUT_OF_DATASET", "semantic_success": "NOT_MEASURED",
+        "steps": [{"phase": phase} for phase in PHASES],
+    }, "terminal_digest")
+    result.update(code="MECHANICAL_TERMINAL_COMPLETE", semantic_verdict="PENDING")
+    result["execution_evidence"].pop("semantic_verdict", None)
+    result["execution_evidence"].pop("semantic_decision", None)
+    result["execution_evidence"].update(
+        task_authority={"grant": grant, "admission": admission},
+        mechanical_terminal={"plan": terminal_plan, "status": "COMPLETED", "terminal_phases": list(PHASES)},
+        task_handoff={
+            "status": "PLANNED", "termination_reason": "TASK_OUTPUT_LIMIT_REACHED",
+            "terminal_digest": terminal_plan["terminal_digest"], "deadline_s": grant["deadline_s"],
+            "semantic_success": "NOT_MEASURED",
+        },
+    )
+    from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+    build_run_diagnostic(result)
+    return result
+
+
 class MechanicalDiagnosticConsumerTests(unittest.TestCase):
     def lifecycle(self, kind):
         from tools.data_factory.motion.mechanical_terminal import PHASES
@@ -716,14 +764,18 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                 "plan": terminal, "status": "COMPLETED", "terminal_phases": list(PHASES),
             }
         elif kind == "handoff":
+            result["execution_evidence"]["task_handoff"] = {"status": "BLOCKED_UNAVAILABLE"}
+        elif kind == "legacy_handoff":
             result["task_handoff"] = {"status": "BLOCKED_UNAVAILABLE"}
+        elif kind == "legacy_null_handoff":
+            result["task_handoff"] = None
         return result
 
     def test_retained_mechanical_diagnostic_reaches_operator_and_collection(self):
         from tools.data_factory.collection_recommendation import _analysis_ref
         from tools.data_factory.operator.workflow.learned_run import LearnedRunApplication
         from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
-        for kind in ("baseline", "contact", "terminal", "handoff"):
+        for kind in ("baseline", "contact", "terminal", "handoff", "legacy_handoff", "legacy_null_handoff"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 lifecycle = self.lifecycle(kind)
@@ -755,7 +807,10 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                     k: v for k, v in diagnostic.items() if k != "diagnostic_digest"}))
                 for field in ("mechanical_terminal", "mechanical_contact_diagnostic"):
                     self.assertEqual(diagnostic.get(field), lifecycle["execution_evidence"].get(field))
-                self.assertEqual(diagnostic.get("task_handoff"), lifecycle.get("task_handoff"))
+                self.assertEqual(diagnostic.get("task_handoff"),
+                    lifecycle["execution_evidence"].get("task_handoff", lifecycle.get("task_handoff")))
+                if kind == "legacy_null_handoff":
+                    self.assertIn("task_handoff", diagnostic)
                 ref = {"availability": "AVAILABLE", "schema_version": diagnostic["schema_version"],
                        "analysis_id": diagnostic["run_id"], "analysis_digest": digest(diagnostic),
                        "reason_codes": []}
@@ -797,6 +852,13 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                     run_job.learned_run_diagnostic(lifecycle,
                         payload={"run_id": lifecycle["run_id"], "run_root": directory})
                 self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_conflicting_nested_and_legacy_handoff_is_rejected(self):
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        lifecycle = self.lifecycle("handoff")
+        lifecycle["task_handoff"] = {"status": "DIFFERENT"}
+        with self.assertRaisesRegex(ContractError, "ROLLOUT_RUN_DIAGNOSTIC_HANDOFF"):
+            build_run_diagnostic(lifecycle)
 
 
 class RolloutRecommendationTests(unittest.TestCase):
@@ -1230,6 +1292,7 @@ class AcquisitionRolloutTests(unittest.TestCase):
         self.assertEqual(self.call(run_directories=self.runs[::-1]), result)
         self.assertEqual(advice["input_snapshot"]["rollout_condition"]["source"], advice["conditions"][0]["source"])
         self.assertEqual(advice["input_snapshot"]["rollout_condition"]["data_deficit"], "UNKNOWN")
+        self.assertNotIn("purpose", advice["input_snapshot"]["rollout_condition"])
         self.assertEqual(advice["input_snapshot"]["rollout_condition"]["condition_indices"], [0])
         baseline = self.call(rollout_lifecycle_path=None)["recommendation"]
         self.assertEqual(advice["object_poses"], baseline["object_poses"])
@@ -1253,6 +1316,129 @@ class AcquisitionRolloutTests(unittest.TestCase):
             self.assertEqual(variant["availability"], "AVAILABLE", variant)
             self.assertEqual(len(variant["recommendation"]["conditions"]), count)
         self.assertTrue(all(p.read_bytes() == value for p, value in before.items()))
+
+    def test_scoped_terminal_requires_consumed_complete_and_linked_lineage(self):
+        base = scoped_terminal_lifecycle(self.lifecycle)
+
+        def reject(value):
+            self.lifecycle_path.write_text(json.dumps(value))
+            result = self.call()
+            self.assertEqual(result["availability"], "UNAVAILABLE", result)
+            self.assertIn("REDEMONSTRATION_UNPROVEN", result["reason_codes"][0])
+            self.assertIsNone(result["recommendation"])
+
+        def retrace(value, *, status, failure_code, terminal_state, terminal_phases):
+            trace = value["execution_evidence"]["learned_execution"]
+            trace.update(status=status, failure_code=failure_code,
+                         terminal_state=terminal_state, terminal_phases=terminal_phases)
+            redigest(trace, "trace_digest")
+
+        zero_consumed = copy.deepcopy(base)
+        retrace(zero_consumed, status="FAILED", failure_code="LEARNED_CANCELLED",
+                terminal_state=None, terminal_phases=[])
+        reject(zero_consumed)
+
+        for terminal_status, phases in (
+            ("PLANNED", []), ("EXECUTING", ["RECYCLE_APPROACH_PTP"]),
+            ("FAILED", ["RECYCLE_APPROACH_PTP"]),
+        ):
+            with self.subTest(terminal_status=terminal_status):
+                value = copy.deepcopy(base)
+                value["execution_evidence"]["mechanical_terminal"].update(
+                    status=terminal_status, terminal_phases=phases)
+                reject(value)
+
+        missing_terminal = copy.deepcopy(base)
+        missing_terminal.update(code="MECHANICAL_TERMINAL_UNAVAILABLE")
+        missing_terminal["execution_evidence"].pop("mechanical_terminal")
+        missing_terminal["execution_evidence"]["task_handoff"] = {
+            "schema_version": "data_factory.learned_task_handoff.v1",
+            "termination_reason": "TASK_OUTPUT_LIMIT_REACHED", "status": "BLOCKED_UNAVAILABLE",
+            "code": "MECHANICAL_TERMINAL_UNAVAILABLE", "run_id": missing_terminal["run_id"],
+            "plan_digest": missing_terminal["plan_digest"],
+            "grant_digest": missing_terminal["execution_evidence"]["task_authority"]["grant"]["grant_digest"],
+            "deadline_s": missing_terminal["execution_evidence"]["task_authority"]["grant"]["deadline_s"],
+            "required_dependencies": ["QUALIFIED_MECHANICAL_TERMINAL", "RECORDER_TERMINAL_RETENTION"],
+            "semantic_success": "NOT_MEASURED",
+        }
+        reject(missing_terminal)
+
+        bad_grant = copy.deepcopy(base)
+        grant = bad_grant["execution_evidence"]["task_authority"]["grant"]
+        grant["scope"]["task"] = "other-task"
+        redigest(grant, "grant_digest")
+        bad_grant["execution_evidence"]["task_authority"]["admission"]["task_grant"] = copy.deepcopy(grant)
+        terminal_plan = bad_grant["execution_evidence"]["mechanical_terminal"]["plan"]
+        terminal_plan["grant_digest"] = grant["grant_digest"]
+        redigest(terminal_plan, "terminal_digest")
+        bad_grant["execution_evidence"]["task_handoff"]["terminal_digest"] = terminal_plan["terminal_digest"]
+        reject(bad_grant)
+
+        bad_admission = copy.deepcopy(base)
+        bad_admission["execution_evidence"]["task_authority"]["admission"]["approved_by"] = "other-authority"
+        reject(bad_admission)
+
+        bad_terminal_link = copy.deepcopy(base)
+        terminal_plan = bad_terminal_link["execution_evidence"]["mechanical_terminal"]["plan"]
+        terminal_plan["grant_digest"] = digest("other-grant")
+        redigest(terminal_plan, "terminal_digest")
+        bad_terminal_link["execution_evidence"]["task_handoff"]["terminal_digest"] = terminal_plan["terminal_digest"]
+        reject(bad_terminal_link)
+
+        bad_handoff_link = copy.deepcopy(base)
+        bad_handoff_link["execution_evidence"]["task_handoff"]["terminal_digest"] = digest("other-terminal")
+        reject(bad_handoff_link)
+
+        def continued(scoped_history):
+            from tools.data_factory.rollout.task_authority import admission
+            previous = copy.deepcopy(self.lifecycle)
+            previous["plan_envelope"]["precommit_safety"] = {
+                "approved_plan_digest": previous["plan_digest"]}
+            history = {"plan_envelope": previous["plan_envelope"], "state": "LEARNED_CHUNK_COMPLETE",
+                "approval": {"approval_id": "synthetic-first-chunk", "approval_scope": "HUMAN_GATED",
+                    "plan_digest": previous["plan_digest"], "run_id": previous["run_id"],
+                    "resolved_job_digest": previous["plan_envelope"]["plan"]["resolved_job_digest"]},
+                "execution_evidence": {
+                    "learned_execution": previous["execution_evidence"]["learned_execution"]}}
+            current = copy.deepcopy(self.lifecycle)
+            current["plan_envelope"]["plan"]["learned_continuation"] = {
+                "previous_plan_digest": previous["plan_digest"],
+                "previous_trace_digest": previous["execution_evidence"]["learned_execution"]["trace_digest"],
+                "previous_chunk_digest": digest(history), "chunk_index": 1}
+            current["execution_evidence"]["learned_history"] = [history]
+            self.rebind(current)
+            value = scoped_terminal_lifecycle(current)
+            if scoped_history:
+                grant = value["execution_evidence"]["task_authority"]["grant"]
+                old_plan = value["execution_evidence"]["learned_history"][0]["plan_envelope"]["plan"]
+                value["execution_evidence"]["learned_history"][0]["approval"] = admission(
+                    grant, old_plan, digest(old_plan), grant["deadline_s"] - 1)
+                continuation = value["plan_envelope"]["plan"]["learned_continuation"]
+                continuation["previous_chunk_digest"] = digest(
+                    value["execution_evidence"]["learned_history"][0])
+                self.rebind(value)
+                plan = value["plan_envelope"]["plan"]
+                value["execution_evidence"]["task_authority"]["admission"] = admission(
+                    grant, plan, value["plan_digest"], grant["deadline_s"] - 1)
+                terminal_plan = value["execution_evidence"]["mechanical_terminal"]["plan"]
+                terminal_plan["parent_plan_digest"] = digest(plan)
+                redigest(terminal_plan, "terminal_digest")
+                value["execution_evidence"]["task_handoff"]["terminal_digest"] = terminal_plan["terminal_digest"]
+                from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+                build_run_diagnostic(value)
+            return value
+
+        reject(continued(False))  # A human-gated prior chunk is not scoped lineage.
+        reject(continued(True))   # Two scoped outputs cannot fit max_outputs == 1.
+
+        unsafe_scene = copy.deepcopy(self.scene)
+        unsafe_scene["revision"] += 1
+        unsafe_scene["objects"]["cube"].update(state="UNKNOWN", pose=None, source="ROBOT_ACTION")
+        self.lifecycle_path.write_text(json.dumps(base))
+        self.scene_path.write_text(json.dumps(unsafe_scene))
+        result = self.call(acquisition={**self.acquisition, "expected_scene_digest": digest(unsafe_scene)})
+        self.assertEqual(result["availability"], "UNAVAILABLE", result)
+        self.assertIsNone(result["recommendation"])
 
     def test_recovered_different_pose_uses_exact_native_direct_condition_within_budget(self):
         from tools.data_factory.operator.catalog import project_direct_poses

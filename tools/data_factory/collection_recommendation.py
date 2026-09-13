@@ -753,6 +753,71 @@ def _human_failed_chunk(lifecycle_result):
     )
 
 
+def _completed_scoped_terminal(lifecycle_result, diagnostic):
+    """Recognize archived scoped execution and recorded terminal bindings.
+
+    This establishes a canonical lineage contract only. It does not independently
+    qualify terminal safety, task effectiveness, physical landing, or a data deficit.
+    """
+    try:
+        from tools.data_factory.rollout.task_authority import SCOPE, task_scope, validate_grant
+
+        plan = lifecycle_result["plan_envelope"]["plan"]
+        trace = diagnostic["execution_trace"]
+        terminal = diagnostic["mechanical_terminal"]
+        terminal_plan = terminal["plan"]
+        retained = lifecycle_result["execution_evidence"]
+        handoff = diagnostic["task_handoff"]
+        authority = retained["task_authority"]
+        grant = validate_grant(authority["grant"])
+        admission = authority["admission"]
+        reference_consumption = trace.get("reference_consumption")
+        history = diagnostic.get("execution_history", [])
+        completed_outputs = len(history) + 1
+        expected_admission = {
+            "approval_id": "task-" + lifecycle_result["plan_digest"].removeprefix("sha256:"),
+            "approved_by": grant["issued_by"], "approval_scope": SCOPE,
+            "approval_expiry": None, "run_id": lifecycle_result["run_id"],
+            "resolved_job_digest": plan["resolved_job_digest"],
+            "plan_digest": lifecycle_result["plan_digest"], "task_grant": grant,
+        }
+        return (
+            lifecycle_result["code"] == "MECHANICAL_TERMINAL_COMPLETE"
+            and lifecycle_result.get("semantic_verdict") in {None, "PENDING"}
+            and lifecycle_result["execution_evidence"].get("semantic_decision") is None
+            and trace["status"] == "COMPLETED" and trace["failure_code"] is None
+            and trace["terminal_phases"] == ["LEARNED_CHUNK"]
+            and bool(plan["learned_proposal"]["actions"])
+            and (reference_consumption is None
+                 or bool(reference_consumption["completed_row_indices"]))
+            and grant["revoked"] is False and grant["run_id"] == lifecycle_result["run_id"]
+            and grant["scope"] == task_scope(
+                plan["learned_source_program"], plan["scene_binding"], plan["learned_proposal"])
+            and admission == expected_admission
+            and all(item["approval"].get("approval_scope") == SCOPE
+                    and item["approval"].get("task_grant") == grant for item in history)
+            and terminal["status"] == "COMPLETED"
+            and terminal_plan["grant_digest"] == grant["grant_digest"]
+            and terminal_plan["deadline_s"] == grant["deadline_s"]
+            and terminal_plan["semantic_success"] == "NOT_MEASURED"
+            and handoff == {
+                "status": "PLANNED", "termination_reason": handoff["termination_reason"],
+                "terminal_digest": terminal_plan["terminal_digest"],
+                "deadline_s": grant["deadline_s"], "semantic_success": "NOT_MEASURED",
+            }
+            and handoff["termination_reason"] in {
+                "TASK_OUTPUT_LIMIT_REACHED", "TASK_POLICY_BUDGET_EXHAUSTED",
+            }
+            and completed_outputs <= grant["max_outputs"]
+            and (handoff["termination_reason"] != "TASK_OUTPUT_LIMIT_REACHED"
+                 or completed_outputs == grant["max_outputs"])
+            and diagnostic["task_effectiveness"] == "UNKNOWN"
+            and diagnostic["physical_qualification"] == "UNKNOWN"
+        )
+    except (ContractError, KeyError, TypeError, ValueError):
+        return False
+
+
 def derive_collection_recommendation(
     *, compiled_authoring: Mapping[str, Any] | None = None,
     episode_evidence: Sequence[Mapping[str, Any]], source_commit: str,
@@ -1307,7 +1372,7 @@ def _rollout_transition(context, selected, plans, preapproval, source_job, progr
 
 
 def _current_rollout_condition(context, selected, lifecycle_result, preapproval, motion_preset=None):
-    """Bind a reviewed finite chunk to its original native source condition.
+    """Bind a reviewed failure or completed scoped attempt to its original condition.
 
     Original resolver fields own source XY/yaw; the current scene owns present
     placement. A later native recovery does not rewrite the historical result.
@@ -1379,18 +1444,32 @@ def _current_rollout_condition(context, selected, lifecycle_result, preapproval,
                 "collection_profile_id": "camera_profile_id",
             }.items())):
         raise ContractError("COLLECTION_ACQUISITION_ROLLOUT_TASK_MISMATCH")
-    if not _human_failed_chunk(lifecycle_result):
+    reviewed_failure = _human_failed_chunk(lifecycle_result)
+    lineage_validation = (
+        not reviewed_failure and _completed_scoped_terminal(lifecycle_result, diagnostic)
+    )
+    if not reviewed_failure and not lineage_validation:
         raise ContractError("COLLECTION_ACQUISITION_ROLLOUT_REDEMONSTRATION_UNPROVEN")
-    return diagnostic, {
+    condition = {
         **transition,
         "resolved_job_digest": program["resolved_job_digest"], "task_id": selected["task_id"],
         "source": {key: job[key] for key in ("place_id", "yaw_deg", "x_mm", "y_mm")},
         "preapproval_evidence_digest": canonical_digest(preapproval),
         "original_scene_binding": original_binding, "source_plan_digest": preapproval["plan_digest"],
-        "review_scope": "FINITE_LEARNED_CHUNK",
-        "suggestion": "REDEMONSTRATE_CONDITION", "reason_code": "HUMAN_REVIEWED_CHUNK_FAILURE",
+        "review_scope": "FINITE_LEARNED_CHUNK" if reviewed_failure else None,
+        "suggestion": (
+            "REDEMONSTRATE_CONDITION" if reviewed_failure
+            else "VALIDATE_ORIGINAL_CONDITION"
+        ),
+        "reason_code": (
+            "HUMAN_REVIEWED_CHUNK_FAILURE" if reviewed_failure
+            else "COMPLETED_SCOPED_ATTEMPT_LINEAGE"
+        ),
         "task_effectiveness": "UNKNOWN", "data_deficit": "UNKNOWN",
     }
+    if lineage_validation:
+        condition["purpose"] = "ORIGINAL_CONDITION_VALIDATION"
+    return diagnostic, condition
 
 
 def _derive_acquisition_recommendation(*, acquisition, episode_evidence, source_commit,
@@ -1618,15 +1697,28 @@ def _derive_acquisition_recommendation(*, acquisition, episode_evidence, source_
         "authority": copy.deepcopy(AUTHORITY),
     }
     if rollout is not None:
-        recommendation["reason_codes"].extend(["HUMAN_REVIEWED_CHUNK_FAILURE",
-            "REDEMONSTRATE_ORIGINAL_TRANSITION" if task == "pick_place" else "REDEMONSTRATE_ORIGINAL_SOURCE"])
+        target = rollout[1]
+        failure_targeted = target.get("purpose") != "ORIGINAL_CONDITION_VALIDATION"
+        recommendation["reason_codes"].extend(
+            ["HUMAN_REVIEWED_CHUNK_FAILURE",
+             "REDEMONSTRATE_ORIGINAL_TRANSITION" if task == "pick_place" else "REDEMONSTRATE_ORIGINAL_SOURCE"]
+            if failure_targeted else
+            ["COMPLETED_SCOPED_ATTEMPT_LINEAGE",
+             "VALIDATE_ORIGINAL_TRANSITION" if task == "pick_place" else "VALIDATE_ORIGINAL_SOURCE"]
+        )
         recommendation["limitations"].append(
             "The original condition is a human-reviewed chunk re-demonstration hypothesis; "
             "task effectiveness and causal data deficit remain unknown."
+            if failure_targeted else
+            "The original condition is proposed only to validate a completed scoped attempt's lineage; "
+            "task effectiveness, physical landing and causal data deficit remain unknown."
         )
         if authoring_mode == "DIRECT_EDIT":
             recommendation["reason_codes"].remove("NATIVE_BALANCED_STATE_SPACE")
-            recommendation["reason_codes"].append("NATIVE_DIRECT_REDEMONSTRATION")
+            recommendation["reason_codes"].append(
+                "NATIVE_DIRECT_REDEMONSTRATION" if failure_targeted
+                else "NATIVE_DIRECT_ORIGINAL_CONDITION_VALIDATION"
+            )
             recommendation["limitations"][1] = (
                 "Remaining sampled coverage is not an optimized missing-condition selector or fitted utility ranking."
             )

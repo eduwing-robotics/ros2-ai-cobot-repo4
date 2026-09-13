@@ -83,7 +83,7 @@ class AcquisitionAdviceTests(unittest.TestCase):
         self.assertEqual(advice["status"], "READY", advice)
         return advice
 
-    def transition_rollout(self, original_index=0):
+    def transition_rollout(self, original_index=0, *, scoped_terminal=False):
         """Actual native resolver/program/language producers, synthetic learned review."""
         from tools.data_factory import run_job
         from tools.data_factory.rollout.finite_plan import compile_program
@@ -129,6 +129,8 @@ class AcquisitionAdviceTests(unittest.TestCase):
         lifecycle["scene_binding"] = copy.deepcopy(plan["scene_binding"])
         lifecycle["execution_evidence"]["learned_execution"]["proposal_digest"] = proposal["proposal_digest"]
         evidence_fixture.AcquisitionRolloutTests.rebind(lifecycle)
+        if scoped_terminal:
+            lifecycle = evidence_fixture.scoped_terminal_lifecycle(lifecycle)
         receipt = {k: copy.deepcopy(resolved[k]) for k in ("normalized_job", "input_digests", "resolved_job_digest")}
         preapproval = {"schema_version": "data_factory.preapproval_evidence.v4", "run_id": lifecycle["run_id"],
             "plan_digest": lifecycle["plan_digest"], "resolved_job_digest": resolved["resolved_job_digest"],
@@ -146,6 +148,29 @@ class AcquisitionAdviceTests(unittest.TestCase):
         self.app = self.application("transition-consumer", source=lambda: context, rollout=path)
         self.send(self.app, "update_draft", {"draft_id": self.app.draft["draft_id"], "selection": {"variant": "DIRECT"}})
         return lifecycle, preapproval, context
+
+    def test_scoped_terminal_proposes_original_transition_validation(self):
+        _lifecycle, preapproval, _context = self.transition_rollout(original_index=2, scoped_terminal=True)
+        self.send(self.app, "update_draft", {"draft_id": self.app.draft["draft_id"], "requested_count": 4})
+        advice = self.refresh()
+        recommendation = advice["recommendation"]
+        target = recommendation["input_snapshot"]["rollout_condition"]
+        self.assertEqual(target["purpose"], "ORIGINAL_CONDITION_VALIDATION")
+        self.assertEqual(target["reason_code"], "COMPLETED_SCOPED_ATTEMPT_LINEAGE")
+        self.assertEqual(target["task_effectiveness"], "UNKNOWN")
+        self.assertEqual(target["data_deficit"], "UNKNOWN")
+        self.assertNotEqual(recommendation["object_poses"][0], target["source"])
+        self.assertEqual(recommendation["object_poses"][2:4], [target["source"], target["destination"]])
+        self.assertEqual(target["episode_instruction_binding"], preapproval["episode_instruction_binding"])
+        self.assertIn("VALIDATE_ORIGINAL_TRANSITION", recommendation["reason_codes"])
+        self.assertNotIn("HUMAN_REVIEWED_CHUNK_FAILURE", recommendation["reason_codes"])
+        self.send(self.app, "choose_collection_advice", {
+            "choice": "APPLY", "expected_recommendation_digest": advice["recommendation_digest"]})
+        self.send(self.app, "compile_draft", {
+            "draft_id": self.app.draft["draft_id"], "data_disposition": "PRODUCTION"})
+        self.assertEqual(self.app._campaign._episode_instruction_bindings[2], preapproval["episode_instruction_binding"])
+        self.assertIsNone(self.app.projection()["campaign_authorization"])
+        self.native.forbidden.assert_not_called()
 
     def test_original_transition_roundtrips_native_paired_draft_and_compile(self):
         lifecycle, preapproval, context = self.transition_rollout()

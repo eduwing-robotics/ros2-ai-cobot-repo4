@@ -10,6 +10,10 @@ explicit native human FAIL for a completed finite learned chunk MAY support a
 bounded re-demonstration hypothesis at the original source condition;
 controller completion or fault alone SHALL NOT establish task effectiveness or
 a causal data deficit. Historical compiled authoring SHALL NOT be reconstructed.
+An exactly bound completed scoped attempt and mechanical terminal MAY instead
+support original-condition validation without a human failure label. This advice
+SHALL remain distinct from a failure-targeted data hypothesis and from execution
+or training authority.
 
 #### Scenario: Original learned preparation retains source identity
 - **WHEN** native preparation writes preapproval evidence for a plan containing a learned proposal
@@ -23,6 +27,14 @@ a causal data deficit. Historical compiled authoring SHALL NOT be reconstructed.
 - **THEN** the existing v2 recommendation SHALL bind that provenance to the exact matching condition indices as a re-demonstration hypothesis
 - **AND** the existing sampler, caller budget, repeat, seed and condition sequence SHALL remain authoritative
 - **AND** task effectiveness, causal data deficit, training authorization and physical qualification SHALL NOT be promoted.
+
+#### Scenario: Completed scoped attempt informs original-condition validation
+- **WHEN** the canonical diagnostic retains completed learned consumption, matching scoped grant/admission, a completed qualified-mechanical terminal and its exact task handoff, and current acquisition inputs and Scene remain valid
+- **THEN** the existing recommendation producer SHALL emit `ORIGINAL_CONDITION_VALIDATION` with `COMPLETED_SCOPED_ATTEMPT_LINEAGE`, preserving the original source/destination separately from present placement
+- **AND** native advice choose, draft update and compilation SHALL consume that condition through existing owners without campaign authorization or execution
+- **AND** task effectiveness, physical qualification and causal data deficit SHALL remain UNKNOWN; neither a human failure nor task success SHALL be fabricated
+- **AND** missing consumption, incomplete/cancelled terminal evidence, mismatched authority/handoff or unavailable current Scene SHALL NOT support this branch
+- **AND** existing human-reviewed failure advice SHALL retain its previous payload shape and interpretation.
 
 #### Scenario: Source readiness changes after a learned attempt
 - **WHEN** the executor has recorded an UNKNOWN scene after the attempt and existing native recovery later provides a current source pose

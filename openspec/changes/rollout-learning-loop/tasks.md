@@ -20,6 +20,14 @@ bounded continuity question only; learned task success remains unproven.
 - [ ] Use a fresh qualified runtime and fresh run/grant/Scene binding for the
   next bounded learned Pick, mechanical release/reset and canonical diagnosis;
   consume its original-condition recommendation through existing Collection.
+- [x] Connect completed scoped-attempt/mechanical-terminal lineage to explicit
+  original-condition validation advice without human FAIL fabrication. Focused
+  software tests cover recommendation rejection/legacy compatibility and the
+  native advice choose → draft update → compile consumer; real Pick, landing,
+  data utility and actual next Collection remain unqualified. Final focused six
+  tests PASS in 134.184s; independent re-review accepts exact single-grant
+  history/budget and canonical nested-handoff/legacy-null coverage. No full-suite
+  repetition or physical qualification is claimed.
 
 Independent preparation uses existing owners: native capture-cost review and
 diagnostic/recollection readiness do not require the temporal implementation,

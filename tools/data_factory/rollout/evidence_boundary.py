@@ -486,7 +486,12 @@ def build_run_diagnostic(lifecycle_result: Mapping[str, Any]) -> dict[str, Any]:
         diagnostic["mechanical_terminal"] = validate_terminal_evidence(evidence["mechanical_terminal"], plan)
     elif "mechanical_contact_diagnostic" in evidence:
         diagnostic["mechanical_contact_diagnostic"] = copy.deepcopy(evidence["mechanical_contact_diagnostic"])
-    if "task_handoff" in result:
-        diagnostic["task_handoff"] = copy.deepcopy(result["task_handoff"])
+    nested_handoff = "task_handoff" in evidence
+    legacy_handoff = "task_handoff" in result
+    if nested_handoff and legacy_handoff and evidence["task_handoff"] != result["task_handoff"]:
+        raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_HANDOFF")
+    if nested_handoff or legacy_handoff:
+        diagnostic["task_handoff"] = copy.deepcopy(
+            evidence["task_handoff"] if nested_handoff else result["task_handoff"])
     diagnostic["diagnostic_digest"] = canonical_digest(diagnostic)
     return diagnostic
