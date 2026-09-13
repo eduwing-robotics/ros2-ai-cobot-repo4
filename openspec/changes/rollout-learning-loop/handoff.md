@@ -1,5 +1,224 @@
 # Coordinator handoff — 2026-09-09
 
+## September 13 bounded close of Thin natural use
+
+The user ended this experiment. Do not continue it by opening architecture
+implementation, Router/Kernel maintenance, frameworks or benchmarks. This is a
+handoff, **not completion of the FR5 product Goal**. The later independent
+counterproposal review was not dispatched and has no final owner decision or
+implementation. Earlier sections below are historical checkpoints, superseded
+only prospectively by this section and current user instructions.
+
+Owner session: `01a09897-e7c2-7992-aba1-a6c307827c01`; native Goal:
+`d1e2a154-9656-436c-a495-e165f5f00b1b`; Run: `run_45e15721f588`, generation 3,
+coordinator `term_8ded6fe8-9cf6-4088-ab89-78ea6170aa32`. The Goal's stored wording
+still mentions the old physical pause and Kernel77; later explicit user return
+and prospective392 promotion superseded those clauses without rewriting history.
+Its product acceptance remains open: bounded learned Pick → qualified mechanical
+release/reset → diagnosis → original-condition targeted Collection.
+
+### Published product changes and verification limits
+
+The source cutoff is main `972411995c110f64497957bb051266b119bbc687`, following
+`3bf3258cee8f03b17c8ae0bbcc95636b760c7905`; both and the earlier consumer fix
+were pushed. This closing handoff adds documentation only.
+
+| Commit | Actual result | Evidence and limit |
+| --- | --- | --- |
+| `0259002fc7cc40598a77f8e8aa64255d7c0c5a55` | Canonical mechanical/contact/handoff diagnostics now reach their strict consumer through existing builders/validators. | Focused two tests: six failing subcases before, PASS after. Full repository run: 1,368 tests, two failures, three skips, 1,859.426s, exit 1. The same object-position return/unknown-return failures reproduce with the two changed production modules from base3811f9d in the same environment. This is not a pristine whole-baseline PASS. |
+| `3bf3258cee8f03b17c8ae0bbcc95636b760c7905` | Preserves returned-user natural rejection and primary-source temporal review in this OpenSpec handoff. | Evidence/documentation, not a runtime improvement. |
+| `972411995c110f64497957bb051266b119bbc687` | Preserves exact initial admission-check time, original timestamps, limit and proposal digest through PickupExecutor → OneJob → public plan-only response. | Missing-response regression before; 13 focused tests PASS in 0.301s after. Original reject survives diagnostic failure; replay retains original time. OpenSpec strict and diff hygiene passed. No full-suite rerun, latency improvement or physical success claim. |
+
+Raw evidence root, excluded from Git:
+`.agent-local/work/lerobot-fr5/owner-20260913/` (relative to main checkout).
+Consumer logs/receipts: `fr5-diagnostic-final-regression.json`,
+`fr5-diagnostic-full-regression.log`, `diagnostic-{before,after}.log`,
+`admission-freshness-{before,final}.log`. Source tests and commands remain in
+the corresponding commits; local logs are not publicly downloadable Git assets.
+Preserve the user's unstaged `observation.py`, strategy `__init__.py` and dirty
+`src/frcobot_ros2`; none belongs to these root commits.
+
+### Physical return, exact timing and outcome
+
+Both returned-user attempts used the original rhythm40 12k checkpoint and saved
+processors, full 50×7 output, native Euler10 and existing gates. Checkpoint tree:
+`sha256:e4bd332c86c38749741ebf64f63780e4e041ee8b66e47a3f588103fe9f384d0c`.
+Selected runtime process identities are in the two `*-runtime-identity.json`
+receipts; the alternative opening-coordinate URDF was not activated/qualified.
+
+| Boundary | Readiness | Inference / oldest source age | Actual consumer result |
+| --- | --- | --- | --- |
+| First return | Native v5 same-runtime readiness PASS, 10.000102s, 3,905 samples, 976 progressions | 478.176ms inference; 110.025ms before, 588.307ms after | `LEARNED_STALE_OBSERVATION` at post-inference check, before planning |
+| After manual camera restoration | PASS, 10.006539s, 4,004 samples, 1,000 progressions | 169.110ms inference; 125.846ms before, 295.097ms after; limit 300ms | Eight parent checks pass; OneJob initial plan returns `LEARNED_STALE_OBSERVATION`, no plan digest |
+
+The latter oldest camera source is `1789274966.133883`; capture returned at
+`1789274966.2366204`; pre-inference check at `1789274966.2597294`; completion
+check at `1789274966.42898` (seconds). Remaining age margin: **4.903ms**.
+Seven parent checks reuse that completion timestamp, so are not seven later
+freshness measurements. Capture request duration 498.734ms is not source age.
+**The actual child admission-check timestamp was not recorded in that attempt**;
+9724119 cannot retroactively supply it. Its precise delay/cause remains UNKNOWN.
+
+One subsequent saved-proposal CPU observation on9724119 passed the unchanged
+actual payload through OneJob and native JSONL parsing/PickupExecutor with
+StringIO and unavailable hardware transport. It measured parent validation
+5.959ms + serialization0.572ms + parse-to-admission5.911ms = **12.442ms** before
+admission (14.029ms including failure response). This exceeds the earlier
+4.903ms margin, but is one current CPU observation, not the historical live
+delay, a latency distribution or a guaranteed lower bound. IPC, ROS scheduling
+and pre-OneJob compilation are excluded; wrapper overhead is unquantified.
+Original timestamps stayed unchanged, so its current stale rejection is
+intentional. No further measurement or retry follows from closing this experiment.
+
+Both real boundaries produced **zero learned/gripper goal sends**, no recorder,
+dataset or Scene writes, and `NOT_EVALUATED` task outcomes. Bring-up separately
+activated hardware/current-position hold. Policy output ≠ controller-consumed
+execution ≠ observed manipulation ≠ task success. **Physical outcome: UNKNOWN.**
+First teardown retained a MoveIt destructor SIGSEGV/escalation; final teardown
+has no complete graceful-exit proof. Owned processes were subsequently absent;
+do not turn that into clean-teardown certification or a new debugging branch.
+
+### Live/offline discrepancy and UP camera
+
+The bounded offline diagnosis loaded the same original12k once and used one
+saved TRAIN0 observation three times: **164.124 / 154.426 / 152.246ms** (middle
+call instrumented). Middle host-stage times: policy150.358ms, preprocessing
+1.442ms, postprocessing0.114ms. No extra CUDA synchronization was added; these
+are host measurements, not isolated GPU kernel times. Historical live478ms was
+**not reproduced**. The failed live RGB was not saved as the same replay input;
+cause and latency tail remain UNKNOWN. Later live169ms is compatible with the
+offline scale, but does not explain the first live478ms or qualify a deadline.
+
+Native camera audit compared raw640×480 initial TRAIN0/31 and EVAL38 frames.
+Static A4/table/panel landmarks showed approximately15–22px rightward drift.
+Original policy observation view was raw/raw_once/none, not a Curator mask;
+model resizing is a later step. User adjusted the camera with side-by-side live
+and overlay views. Final `camera-restore-check-1789273984198962034.png` was
+visually near the references with a few pixels of residual difference; this is
+not a calibrated tolerance or distribution-equivalence PASS. No calibration
+stack or manual measurement campaign was introduced. Drift is a separate risk,
+**not an established cause of stale observation**. Temporary viewer/camera
+processes and tabs were closed after use; no live stream remains promised.
+
+### Remaining product and authority boundary
+
+Readiness does not qualify learned Pick, contact, object arrival or release.
+The next product owner still needs an evidence-backed temporal-contract decision
+and fresh qualified scene/cell/hardware/physical bindings before an admitted
+bounded rollout. Qualified mechanical contact/release/reset and original-condition
+Collection consumption remain open. A rejected plan is not a completed learned
+chunk with reviewed semantic FAIL and cannot be used as such for recollection.
+Historical Scene revision310/slot run `learned-4032-plan-20260911-r1` supplied
+preview context, not fresh execution authority. Current physical scene is UNKNOWN.
+
+The external counterproposal separates observation freshness, generation validity
+and current execution admission. Preserve it as a proposal, not an adopted design.
+Earlier native review `task_94de9a3c7b88` / `msg_8ae27ef04576` concluded scoped
+REOPEN and produced `runtime-architecture/decision.json`. The later deeper review
+requested by the user was stopped before dispatch; no new final KEEP/LOCAL
+CORRECTION/REOPEN judgment or implementation is claimed. Sole physical authority
+and fail-closed admission remain unchanged; no second executor, RTC or scheduler
+was added.
+
+**Human-OK correction:** current OpenSpec already says normal bounded Pick/release
+does not require repeated personal approval (`6a2f697`, September8). It separates
+valid task grants from assisted exact-plan human approval; native
+`rollout/task_authority.py` creates a plan-bound admission receipt, explicitly
+not a fabricated human decision. The external review's assumption of mandatory
+per-chunk human waiting therefore does not describe every current path. The
+historical origin and full caller-path audit were not completed before closure.
+Do not invent a new personal gate, remove existing safety checks, or declare
+the bounded path physically qualified from this correction in interpretation.
+
+### S/D, resources and native lifecycle
+
+S/D empirical utility remains **UNKNOWN**, neither positive nor negative. Earlier
+defer decisions reflected full-regression host RAM/swap pressure and then actual
+runtime GPU ownership; they were not proof that all research depended on rollout.
+Independent D software preparation subsequently completed in native
+`task_1954b98dc957` / `ctx_86114945ff5f`, result `msg_59eb75a4e580`:
+`research-software-prep/d_probe.py`, README, pins, binding and checks. It reuses
+installed SmolVLA/LeRobot for a minimal future coarse/refined/reference probe.
+Only stdlib/AST/syntax/help checks ran: **0 model loads, 0 NFE, no heavy tests**.
+Runtime compatibility, D/reference ordering, S separation and runtime benefit
+are unmeasured. No scheduler, new network, ROS update or policy metadata input.
+
+The prepared D result was rejected by accepted392 at consume because a successful
+command carried empty stdout; it was not silently used to launch inference.
+Original report and reject remain. Router owner received preservation-only
+`msg_d2bef84827ee`; no repair was requested. After seven-file hash recovery and
+explicit user permission, terminal `term_19c919cb-653b-457a-857c-4b1497713158`
+was closed with native `ptyKilled:true`. Its historical user_owned/retained
+resource record remains unchanged.
+
+At closure: Orca inbox empty, no reclaimable owned worker, no active dispatched
+Task; one old blocked publication `task_60f0020445ff` was never dispatched
+because the user changed its scope. Preserve it, not an active experiment.
+GPU compute list empty, about7.3GiB RAM available and6MiB swap free; no owned
+model/robot/camera/test process observed. These are a checkpoint, not a future
+resource grant. Existing independent lane Goals/worktrees/sessions remain.
+
+### What Thin natural use established, and what still needed the owner
+
+Accepted source was prospectively promoted after explicit user approval from
+`77e57644645028456bce9c479d7dd78203437af7` to
+`392500aabf8434c5a881b1a297725945b05de264`, repository
+`hasemu1211/agent-capability-router`, branch
+`hasemu1211/thin-kernel-exit-code-candidate`, source
+`experiments/greenfield/boundary_kernel.py`, SHA-256
+`5e74bd5541dfc30933838eb4d13b8880d2a7aaa461592fce10ccc6bbd678a9a0`.
+Candidate full regression:274 tests/3 skips PASS;32 Greenfield tests PASS.
+Old source/Task/attempt/result/rejection history stayed unchanged. New Tasks
+bound exact source/scope/attempt/result/consumer; the first old natural payload
+was checked unchanged through a new consumer Task. Successful consume receipts
+preserved UNKNOWN for independent evidence verification and downstream outcome;
+they did not confer physical or semantic success.
+
+Natural rejects also exposed limits: old integer-exit-code evidence was corrected
+only in the separate candidate; the second teardown evidence rejection stayed
+outside that correction;392 later rejected valid empty command output. Original
+payloads and rejects were retained rather than rewritten to pass. This supports
+continuity/provenance preservation, **not general payload compatibility or
+autonomous semantic coordination**. No natural evidence established that the
+old semantic Router was required for a missing consequential responsibility.
+No synthetic Router task or quantitative efficiency claim follows.
+
+Repeated external steering was operationally significant: the user had to
+reassert product rollout/recollection priority over consumer/Kernel investigation;
+distinguish full-regression admission evidence from a global work lock; separate
+GPU deferral from independent software preparation and prohibit heavy checks;
+request delegated judgment rather than duplicated root analysis; redirect work
+toward existing lanes with their own Goals; clarify recovered-worker cleanup and
+regular commit/push; correct confusing camera live/overlay interaction; challenge
+temporal semantics and the assumed personal-OK requirement. The former coordinator
+also supplied one bounded historical handoff. These are observed interventions,
+not proof that any particular Router would have prevented them. Kernel continuity
+does not supply product prioritization, resource judgment, UI usability or
+architecture authority; those remained with the owner/user.
+
+Skills used during this bounded session included Orca CLI/orchestration,
+engineering explanation and computer-use for applicable interaction; Ponytail
+was limited to earlier implementation reuse, not architecture authority, and
+was excluded from the requested later review. Parallel work included camera
+audit, source research and software preparation where inputs/resources permitted;
+model work was serialized for real RAM/GPU contention. One pre-load environment
+correction and a later changed-condition post-restoration plan attempt are
+retained; no unchanged automatic physical retry followed a stale rejection.
+
+Selected immutable local evidence SHA-256 anchors (paths relative to the evidence
+root above; originals remain outside Git):
+
+| File | SHA-256 |
+| --- | --- |
+| `return-boundary-result.json` | `dafe2a1af7632ab76002b043eecfe34208d957abe57ea540e9c706bcc3f86655` |
+| `post-restore-boundary-result.json` | `e3480f5be24378bc2c0d56655ebc9233ce410c5feaa092b2eb7de1d3753c324e` |
+| `post-restore-native-plan.log` | `c813121a2a4843938ddc7fac9d1846cf7c02f232ca536243b456504a30647d54` |
+| `saved-proposal-cpu-admission.json` | `9e87682256d59eb69937189c7aa44010fde39f6503f34f36e60fa6e5dda6a166` |
+| `latency-diagnosis-result.json` | `20bfe750e9890e61014d464f0a585ac18bb0a180cf6970549ca0ab8af1c2ffc6` |
+| `camera-audit-message.json` | `576a8b88c40ae12e57ca064f369daa0c7ed760a4e6b0a7a9b702289e509a87fd` |
+| `research-software-prep-message.json` | `eb17f1ddb54929bada12b9f120b871af9eb622e470ce390699cf825dd83bb759` |
+| `research-software-prep-consume.json` | `7cabcd040a5012fe6d397ec2d4b5a1da63bde464caf7e9d07829321b3ae5e56e` |
+
 ## September 13 returned-user boundary on main0259002
 
 The user's **복귀** and subsequent camera-check/continue instructions supersede
