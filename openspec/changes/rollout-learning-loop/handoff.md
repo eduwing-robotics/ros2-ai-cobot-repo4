@@ -1,5 +1,62 @@
 # Coordinator handoff — 2026-09-09
 
+## September 13 returned-user boundary on main0259002
+
+The user's **복귀** and subsequent camera-check/continue instructions supersede
+the physical pause below prospectively. Existing hardware, scene, human,
+exact-plan and physical-binding gates remain. Manual UP framing restoration
+ended with a raw frame visually close to TRAIN0/31 and EVAL38; this is neither
+calibrated tolerance qualification nor evidence that framing caused stale input.
+
+The first returned-user native call took478ms and failed the unchanged300ms
+input-age gate before planning. One bounded offline diagnosis then observed
+164/154/152ms on one saved observation, whose input differs from the failed live
+input. The next fresh plan-only attempt used the unchanged rhythm40 12k
+checkpoint, original URDF and exact selected v5 plugin/SDK. Readiness passed
+10.0065s/4004samples. All50 native outputs took169.110ms; oldest input age was
+125.846ms before inference and295.097ms afterward. Eight parent checks passed,
+but normal `OneJob.plan_only` returned `LEARNED_STALE_OBSERVATION`. The final
+child gate timestamp and intervening stage costs were not retained; passing
+parent checks does not qualify complete observation-to-plan latency.
+
+There were zero learned/gripper goals and no recorder, dataset or Scene writes;
+task outcome remains `NOT_EVALUATED`, physical outcome UNKNOWN. Separate
+bring-up activated hardware/current-position holds. Owned model, robot and
+camera processes exited; their three visible Orca tabs were closed afterward.
+Exact logs, source identities, final native output and limits are retained under
+`.agent-local/work/lerobot-fr5/owner-20260913/` in
+`post-restore-{native-plan.log,runtime-identity.json,boundary-result.json}` and
+`latency-diagnosis-result.json`. The historical slot run ID was preview scope,
+not authority for a fresh physical attempt.
+
+No automatic retry, threshold relaxation or runtime architecture change follows
+from this result. User-requested primary-source architecture assessment now
+consumed this natural failure through Task `task_94de9a3c7b88`, result
+`msg_8ae27ef04576`, accepted by the pinned Kernel. Its scoped conclusion is
+**REOPEN temporal responsibility**, provisionally retaining LeRobot inference,
+OneJob and the sole executor. The same completion timestamp underlies seven
+parent checks; they are not seven fresh admission-time observations. Only4.903ms
+remained after inference. Final rejection timing is missing, so transfer/copy/
+validation cost is a candidate explanation rather than a measured bottleneck.
+Fresh controller feedback also does not establish current visual validity of
+a frozen plan. First-plan versus continuation validity requires an explicit
+owner decision, not a silent change to the300ms predicate.
+
+The comparison used official [LeRobot inference](https://huggingface.co/docs/lerobot/en/inference),
+[async](https://huggingface.co/docs/lerobot/en/async),
+[RTC](https://huggingface.co/docs/lerobot/en/rtc) and
+[ROS Jazzy JTC](https://control.ros.org/jazzy/doc/ros2_controllers/joint_trajectory_controller/doc/userdoc.html)
+sources against installed interfaces. Native async/RTC does not remove the
+first-chunk delay; FR5 retiming and gripper waits make queue indices insufficient
+evidence of actual completion. No runner replacement is authorized by this
+review. The next consumer is the existing Rollout owner: retain exact final
+rejection timing through the current failure response and decide temporal
+validity scope before selecting a local repair. Full report and applicability
+limits: `owner-20260913/runtime-architecture/decision.json` under the evidence
+directory above. No tests, inference or hardware ran in this review. Independent
+S/D software preparation carries no model-load/inference or physical
+qualification claim.
+
 ## September 12 continuation: LeRobot pick-place integration
 
 ### Current boundary: Scene-slot correction CPU-reviewed; physical replay paused
