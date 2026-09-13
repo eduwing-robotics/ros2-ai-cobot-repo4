@@ -250,6 +250,10 @@ def prepare_request_geometry(transport, plan, scene_object):
         "source_datum": context["datum"], "released_datum": datum,
         "source_dimensions_m": context["dimensions_m"],
         "fingertip_boxes": context["fingertip_boxes"], "open_m": context["open_m"],
+        "release_m": next(step["release_position_m"] for step in source["steps"]
+                          if step["phase"] == "GRIPPER_OPEN"),
+        "jaw_midplane_m": context["jaw_midplane_m"],
+        "closed_gap_bound_m": context["closed_gap_bound_m"],
         "orientation_tolerance_rad": source["planning"]["goal_tolerances"]["orientation_rad"]}
     result["geometry_digest"] = canonical_digest(result)
     return result

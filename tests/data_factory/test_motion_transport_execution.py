@@ -425,7 +425,7 @@ class TestExecutionTransport(unittest.TestCase):
                 "gripper_tolerance_m": .001, "start_joint_state": [0.] * 6,
                 "learned_proposal": {"robot_description": model, "initial_state": [0.] * 6 + [.01]}}
         for mode in ("queued_then_current", "paused_joint", "paused_arm", "paused_gripper",
-                     "future_source", "expires_during_snapshot", "legacy"):
+                     "future_source", "expires_during_snapshot", "legacy", "poll_stale", "poll_fresh"):
             with self.subTest(mode=mode):
                 clock, spins = [10.], []
                 transport = object.__new__(RosMoveItTransport)
@@ -471,9 +471,23 @@ class TestExecutionTransport(unittest.TestCase):
                             else 11. if mode == "future_source" else 9.)
 
                 transport._rclpy = SimpleNamespace(spin_once=spin)
-                publish(11. if mode == "future_source" else 9.99 if mode == "expires_during_snapshot" else 9.)
+                publish(11. if mode == "future_source" else 9.99 if mode in {"expires_during_snapshot", "poll_fresh"} else 9.)
                 with mock.patch("tools.data_factory.motion.moveit_transport.time.monotonic", side_effect=lambda: clock[0]), \
                      mock.patch("tools.data_factory.motion.moveit_transport.time.time", side_effect=lambda: clock[0]):
+                    if mode.startswith("poll_"):
+                        transport._prepare_native_clock = mock.Mock(side_effect=AssertionError("no parameter RPC"))
+                        transport._load_robot_description_parameter = mock.Mock(side_effect=AssertionError("no discovery wait"))
+                        if mode == "poll_stale":
+                            with self.assertRaisesRegex(ContractError, "LEARNED_STALE_STATE"):
+                                transport.poll_snapshot(.1)
+                        else:
+                            self.assertEqual(transport.poll_snapshot(.1)["joint_state_stamp_ns"], 9_990_000_000)
+                        self.assertEqual(spins, [])
+                        self.assertEqual(clock[0], 10.)
+                        transport._native_clock_configured_age = None
+                        with self.assertRaisesRegex(ContractError, "ROS_SNAPSHOT_NOT_INITIALIZED"):
+                            transport.poll_snapshot(.1)
+                        continue
                     if mode.startswith("paused_") or mode in ("future_source", "expires_during_snapshot"):
                         with self.assertRaisesRegex(ContractError, "LEARNED_STALE_STATE"):
                             transport.snapshot(.1)

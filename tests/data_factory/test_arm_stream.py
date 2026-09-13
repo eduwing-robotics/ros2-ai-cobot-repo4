@@ -590,6 +590,43 @@ class TransportActuatorStreamTest(unittest.TestCase):
             self.transport.submit_checked_learned_revision(binding=binding, start_time_ns=42_000_000_000,
                 scene_binding=scene, dispatch_guard=guard)
 
+    def test_normal_revision_uses_worker_intent_without_nominal_or_caller_override(self):
+        helper, scene, pair, old_binding, result = self.prepared_revision()
+        self.transport._native_geometry_candidate = None
+        prior = {"intent_digest": canonical_digest("prior-committed-intent")}
+        binding = self.transport.prepare_learned_revision_geometry(*pair,
+            revision="revision-2", scene_binding=scene, deadline=19., prior_intent=prior)
+        call = helper.submit.call_args
+        self.assertTrue(call.kwargs["derive_intent"])
+        self.assertEqual(call.kwargs["prior_intent"], prior)
+        self.assertEqual(len(call.args[0][0][1]), 13)
+        assignments = (("source", (0,)), ("carried", tuple(range(1, 13))))
+        intent = {"assignments": assignments, "intent": {"intent_digest": canonical_digest("next-intent")}}
+        result.update(binding=binding, assignments=assignments, reference_intent=intent,
+                      source_query_digest=canonical_digest("native-fk-query"), variants=[
+                          {"hypothesis": name, "samples": [{"allowed": True, "saturated": False}
+                                                           for _ in indices]} for name, indices in assignments])
+        checked = self.transport.poll_learned_revision_geometry(binding=binding)
+        self.assertEqual(checked["assignments"], assignments)
+        self.assertEqual(checked["reference_intent"], intent)
+        self.assertNotEqual(old_binding, binding)
+        checked["reference_intent"]["intent"]["intent_digest"] = "mutated"
+        self.assertEqual(self.transport.poll_learned_revision_geometry(binding=binding)["reference_intent"], intent)
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+
+    def test_derived_assignment_gaps_cannot_certify_a_revision(self):
+        helper, scene, pair, _, result = self.prepared_revision()
+        self.transport._native_geometry_candidate = None
+        binding = self.transport.prepare_learned_revision_geometry(*pair,
+            revision="derived", scene_binding=scene, deadline=19.)
+        result.update(binding=binding, assignments=(("source", (0,)),))
+        with self.assertRaisesRegex(ContractError, "NATIVE_GEOMETRY_ASSIGNMENT"):
+            self.transport.poll_learned_revision_geometry(binding=binding)
+        self.assertIsNone(self.transport._native_geometry_candidate)
+        self.assertFalse(self.transport._active.fenced)
+        self.client.send_goal_async.assert_not_called()
+
     def test_pending_check_keeps_existing_actuator_poll_and_cancel_live(self):
         helper, scene, pair, binding, _ = self.prepared_revision(ready=False)
         current = copy.deepcopy(pair)

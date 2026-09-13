@@ -82,6 +82,11 @@ class RequestContactGeometryTest(unittest.TestCase):
         self.assertEqual((self.plan, self.obj, self.context), original)
         self.assertFalse(self.context["physical_success"])
         self.assertEqual(self.context["status"], "PROSPECTIVE")
+        released = next(step for step in self.plan["source_program"]["steps"] if step["phase"] == "GRIPPER_OPEN")
+        self.assertEqual(self.context["release_m"], released["release_position_m"])
+        self.assertGreater(self.context["closed_gap_bound_m"], 0.)
+        self.assertEqual(self.context["geometry_digest"], canonical_digest(
+            {k: v for k, v in self.context.items() if k != "geometry_digest"}))
         self.assertNotEqual(self.context["proxies"]["released"]["translation_m"], self.context["source_datum"]["translation_m"])
         # No transport API is available: preparing/building cannot query or apply a Scene.
         self.assertEqual(set(vars(self.transport)), {"_robot_description", "contact_config_root"})

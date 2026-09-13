@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 
-from tools.fr5_data_factory import ContractError, DIGEST, validate_rigid_transform
+from tools.fr5_data_factory import ContractError, DIGEST, canonical_digest, validate_rigid_transform
 from .contact_transition import bind_native_request_geometry, bind_request_contacts
 
 
@@ -71,6 +71,7 @@ class NativeGeometry:
             raise ContractError("NATIVE_GEOMETRY_FULL_SCENE_REQUIRED")
         self._build = bind_native_request_geometry(context, plan)
         self._classify = bind_request_contacts(context, plan, released_world=True)
+        self._context, self._plan = context, plan
         if command is None:
             from ament_index_python.packages import get_package_prefix
             command = [str(Path(get_package_prefix("fr5_motion_geometry")) /
@@ -116,7 +117,7 @@ class NativeGeometry:
             raise ContractError("NATIVE_GEOMETRY_REJECTED", response["error"])
         return response, "sha256:" + hashlib.sha256(raw).hexdigest()
 
-    def submit(self, samples, *, binding, deadline):
+    def submit(self, samples, *, binding, deadline, derive_intent=False, prior_intent=None):
         """Submit ((hypothesis, ((j1,..,j6,g), ...)), ...), not a motion goal.
 
         The binding belongs to the caller's exact revision/Scene/contact/timing
@@ -137,19 +138,59 @@ class NativeGeometry:
                               for row in v[1]) for v in samples)
                 or len({v[0] for v in samples}) != len(samples)):
             raise ContractError("NATIVE_GEOMETRY_SAMPLES")
+        if (type(derive_intent) is not bool
+                or derive_intent and (len(samples) != 1 or samples[0][0] != "source")
+                or not derive_intent and prior_intent is not None):
+            raise ContractError("NATIVE_GEOMETRY_SAMPLES")
         self._deadline = self._check_deadline(deadline)
-        self._serial += 1
+        # A derived check may issue FK/source then expanded-occupancy queries.
+        # Each exchange gets a distinct identity even within one revision.
+        self._serial += 2 if derive_intent else 1
         self._binding = binding
-        self._future = self._worker.submit(self._query, samples, binding, self._serial)
+        self._future = (self._worker.submit(self._reference_query, samples[0][1], binding,
+                                            self._serial - 1, copy.deepcopy(prior_intent)) if derive_intent else
+                        self._worker.submit(self._query, samples, binding, self._serial))
 
-    def _query(self, samples, binding, serial):
+    def _reference_query(self, rows, binding, serial, prior):
+        """Derive possible occupancy from native FK on this same CPU worker.
+
+        The source query is not motion admission. Its poses select prospective
+        masks and an enclosing carried box for the final full-scene check.
+        Neither a pending query nor its inferred occupancy updates Scene truth.
+        """
+        from .reference_intent import compute_reference_intent
+        source = self._query((("source", rows),), binding, serial)
+        samples = tuple((sample["gripper_pose"], row[6])
+                        for sample, row in zip(source["variants"][0]["samples"], rows))
+        intent = compute_reference_intent(self._context, samples, prior=prior)
+        assignments = intent["assignments"]
+        if assignments == (("source", tuple(range(len(rows)))),):
+            result = source
+        else:
+            context = copy.deepcopy(self._context)
+            envelope = intent["carried_envelope"]
+            if envelope is not None:
+                context["proxies"]["carried"].update(
+                    translation_m=envelope["translation_m"], dimensions_m=envelope["dimensions_m"],
+                    rotation_xyzw=[0., 0., 0., 1.])
+            context["geometry_digest"] = canonical_digest({k: v for k, v in context.items() if k != "geometry_digest"})
+            result = self._query(tuple((h, tuple(rows[i] for i in indices)) for h, indices in assignments),
+                                 binding, serial + 1, build=bind_native_request_geometry(context, self._plan),
+                                 classify=bind_request_contacts(context, self._plan, released_world=True))
+        result.update(assignments=assignments, reference_intent=intent,
+                      source_query_digest=source["query_digest"])
+        return result
+
+    def _query(self, samples, binding, serial, *, build=None, classify=None):
         from rclpy.serialization import serialize_message, deserialize_message
         from moveit_msgs.srv import GetStateValidity
+        build = self._build if build is None else build
+        classify = self._classify if classify is None else classify
         variants = []
         for hypothesis, rows in samples:
             states, objects = [], []
             for row in rows:
-                state, world = self._build(hypothesis, row[:6], row[6])
+                state, world = build(hypothesis, row[:6], row[6])
                 if not states:
                     objects = [serialize_message(obj).hex() for obj in world]
                 states.append(serialize_message(state).hex())
@@ -184,7 +225,7 @@ class NativeGeometry:
                     raise ContractError("NATIVE_GEOMETRY_PROTOCOL")
                 allowed = not sample["saturated"] and not validity.constraint_result and (
                     validity.valid or bool(validity.contacts) and all(
-                        self._classify(hypothesis, contact, gripper_pose=pose, gripper_m=row[6])
+                        classify(hypothesis, contact, gripper_pose=pose, gripper_m=row[6])
                         for contact in validity.contacts))
                 checked.append(dict(allowed=allowed, saturated=sample["saturated"],
                                     response=validity, gripper_pose=pose))

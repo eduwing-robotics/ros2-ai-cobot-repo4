@@ -536,12 +536,34 @@ current-state/start validity and real native acceptance timing remain to be qual
 by the normal consumer. Native send failures preserve the executable revision
 identity without acceptance, reference-consumption or physical-outcome claims.
 
-The contact component must explicitly assign prospective hypotheses to selected
-reference samples; the query binding covers that assignment and every sample.
-The transport neither selects a convenient passing hypothesis nor demands all
-three everywhere. A normal applicability rule is still engineering work: aperture,
-queue progress and controller completion are not observed object disposition.
-Do not import the historical stationary-close barriers to supply this rule.
+The contact component assigns prospective occupancy to native reference samples,
+not observed phases. In the same CPU worker, a source-scene query supplies FK;
+`reference_intent` then retains possible carrying from sampled closing/overlapping
+jaw geometry, including interval-entry jaw sweeps. Off-center source-to-gripper
+relations expand a monotone enclosing carried box; using only the nominal box
+would lose that occupancy. Existing qualified release coordinates and destination
+geometry add a possible released-world obligation without removing uncertain
+carrying. The final query consumes these actual boxes and sample assignments,
+preserves the source world and full native obstacles, and applies unchanged
+narrow contact predicates. Carrying and released variants are alternative
+occupancy obligations, not two colliding copies attached to one robot.
+The original qualified context binds the previous committed intent; pending or
+rejected candidates cannot update it. Both source/FK and final query digests are
+retained. These sampled models establish neither continuous collision coverage
+nor capture, arbitrary slip, landing or Scene truth; no stationary-close or
+row-terminal barrier supplies their applicability.
+
+Native queue selection retains originating raw/processed rows, observation and
+row identity, plus the existing bounded gripper projection. Only cumulative
+full-7D controller-reference progress may conditionally advance the unchanged
+native prefix. Queue mutation identity is not observation freshness. The transport
+exposes initialized cached state without discovery/RPC/spin waits for commit;
+initial task setup and historical Collection acquisition keep their own behavior.
+Normal caller/owner integration and once-per-output generation eligibility remain
+open. In particular, do not introduce a300ms dispatch TTL for every queued row:
+an eligible horizon intentionally outlives acquisition, and rejecting its tail
+can prevent queue draining. No production controller lead time is inferred from
+that TTL or the policy period; physical timing still needs its own evidence.
 OneJob/PickupExecutor retain task/start/commit/fault/close decisions; inference,
 queue, geometry, actuator and reference-progress computation remain with their
 existing components. No new lifecycle framework or caller-side motion authority.

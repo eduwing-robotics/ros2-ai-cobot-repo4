@@ -385,6 +385,109 @@ class NativeGeometryBinaryTest(unittest.TestCase):
                     self.fail("CPU geometry child failed to close")
                 time.sleep(.001)
 
+    def test_native_default_revision_derives_intent_and_queries_expanded_geometry_without_sends(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from control_msgs.action import FollowJointTrajectory
+        from trajectory_msgs.msg import JointTrajectoryPoint
+        from tools.data_factory.motion.contact_transition import TIPS
+        from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+        from tools.data_factory.motion.native_geometry import NativeGeometry
+        from tools.fr5_data_factory import canonical_digest
+
+        # Same small native model, now with both explicitly modeled moving jaws.
+        xml = XML.replace('<axis xyz="1 0 0"/>', '<origin xyz=".005 0 0"/><axis xyz="1 0 0"/>')
+        xml = xml.replace('</robot>', '<link name="finger_tip_left_link"><collision><geometry>'
+            '<box size="0.02 0.02 0.02"/></geometry></collision></link>'
+            '<joint name="finger_left_joint" type="prismatic"><parent link="gripper_link"/>'
+            '<child link="finger_tip_left_link"/><origin xyz="-.005 0 0"/><axis xyz="-1 0 0"/>'
+            '<limit lower="0" upper="0.021" effort="20" velocity="0.1"/>'
+            '<mimic joint="finger_right_joint" multiplier="1" offset="0"/></joint></robot>')
+        initial = scene()
+        initial.world.collision_objects[-1] = box("source", (0., .004, .2))
+        original_scene = copy.deepcopy(initial)
+        plan = {"fixture": "native-derived-intent-only"}
+        datum = {"translation_m": [0., .004, .2], "rotation_columns": [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]}
+        context = {"schema_version": "data_factory.request_contact_geometry.v1", "status": "PROSPECTIVE",
+            "physical_success": False, "plan_digest": canonical_digest(plan), "source_object_id": "source",
+            "planning_frame": "base_link", "source_datum": datum, "released_datum": copy.deepcopy(datum),
+            "source_dimensions_m": [.024] * 3, "open_m": .021, "release_m": .0126,
+            "jaw_midplane_m": 0., "closed_gap_bound_m": .01436, "orientation_tolerance_rad": .1,
+            "fingertip_boxes": [{"center": [.005, 0., 0.], "dimensions": [.02] * 3},
+                                 {"center": [-.005, 0., 0.], "dimensions": [.02] * 3}], "proxies": {}}
+        for hypothesis, link, touch, position in (("carried", "gripper_link", TIPS, [0., 0., 0.]),
+                                                  ("released", "base_link", [], datum["translation_m"])):
+            context["proxies"][hypothesis] = {"object_id": "source::prospective:" + hypothesis,
+                "link_name": link, "touch_links": touch[:], "translation_m": position[:],
+                "rotation_xyzw": [0., 0., 0., 1.], "dimensions_m": [.024] * 3}
+        context["geometry_digest"] = canonical_digest(context)
+        original_context = copy.deepcopy(context)
+        deadline = time.monotonic() + 5.
+        adapter = NativeGeometry(urdf=xml, srdf=SRDF, scene=initial, context=context, plan=plan,
+                                 deadline=deadline, command=[str(self.binary)])
+        transport = object.__new__(RosMoveItTransport)
+        transport._active, transport._execution_locked = None, False
+        transport._clock = time.monotonic
+        transport._execute_goal_count = transport._gripper_goal_count = 0
+        transport._FollowJointTrajectory, transport._JointTrajectoryPoint = FollowJointTrajectory, JointTrajectoryPoint
+        arm, gripper = Mock(), Mock()
+        transport._ActionClient, transport.gripper = Mock(return_value=arm), gripper
+        transport.node = object()
+        transport._rclpy = SimpleNamespace(spin_once=Mock())
+        transport.open_learned_actuator_stream(deadline=deadline)
+        try:
+            def wait_for(poll):
+                while time.monotonic() < deadline:
+                    result = poll()
+                    if result is not None:
+                        return result
+                    time.sleep(.001)  # Bounded test harness, not owner code.
+                self.fail("native derived geometry did not finish")
+
+            transport._native_geometry_ready = wait_for(adapter.poll)
+            transport._native_geometry = adapter
+            transport._native_geometry_context, transport._native_geometry_plan = context, plan
+            transport._native_geometry_deadline = deadline
+            calls, exchange = [], adapter._exchange
+
+            def record(request):
+                calls.append(copy.deepcopy(request))
+                return exchange(request)
+
+            adapter._exchange = record
+            pair = transport.build_learned_actuator_goals([0.] * 6 + [.021],
+                [[.001] * 6 + [.01176], [.002] * 6 + [.021]], period_s=.1)
+            scene_binding = {"scene_state_digest": canonical_digest("fixture-scene"), "revision": 1}
+            binding = transport.prepare_learned_revision_geometry(*pair, revision="derived-cpu-revision",
+                scene_binding=scene_binding, deadline=deadline)  # Actual omitted-assignment path.
+            checked = wait_for(lambda: transport.poll_learned_revision_geometry(binding=binding))
+            self.assertTrue(checked["allowed"], checked)
+            self.assertEqual(checked["sample_count"], 13)
+            self.assertEqual(checked["reference_intent"]["intent"]["geometry_digest"], context["geometry_digest"])
+            self.assertAlmostEqual(checked["reference_intent"]["evidence"]["candidate_relations"][0]["source_to_gripper"]["translation_m"][2], 0.)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["variants"][0]["hypothesis"], "source")
+            carried = next(v for v in calls[1]["variants"] if v["hypothesis"] == "carried")
+            body = deserialize_message(bytes.fromhex(carried["states_cdr_hex"][0]), RobotState).attached_collision_objects[0]
+            self.assertGreater(body.object.primitive_poses[0].position.y, .003)
+            self.assertGreaterEqual(body.object.primitives[0].dimensions[1], .024)
+            self.assertTrue(any(v["hypothesis"] == "released" and v["world_objects_cdr_hex"] for v in calls[1]["variants"]))
+            self.assertEqual(initial, original_scene)  # CDR padding itself is not canonical.
+            self.assertEqual(adapter._context, original_context)
+            retained = copy.deepcopy(checked)
+            checked["reference_intent"]["intent"]["carried_envelope"]["translation_m"][1] = 99.
+            self.assertEqual(transport.poll_learned_revision_geometry(binding=binding), retained)
+            self.assertEqual(len(calls), 2)
+            arm.send_goal_async.assert_not_called()
+            gripper.send_goal_async.assert_not_called()
+            self.assertEqual((transport._execute_goal_count, transport._gripper_goal_count), (0, 0))
+        finally:
+            limit = time.monotonic() + 5.
+            while not adapter.close():
+                if time.monotonic() >= limit:
+                    self.fail("native derived geometry child failed to close")
+                time.sleep(.001)
+
 
 if __name__ == "__main__":
     unittest.main()

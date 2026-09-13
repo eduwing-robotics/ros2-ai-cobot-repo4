@@ -1109,7 +1109,7 @@ class RosMoveItTransport:
         return closed
 
     def prepare_learned_revision_geometry(self, arm_goal, gripper_goal, *, revision,
-                                         scene_binding, assignments, deadline):
+                                         scene_binding, deadline, assignments=None, prior_intent=None):
         """Check a detached next pair while the current native pair keeps running.
 
         ``assignments`` is ((hypothesis, (sample_index, ...)), ...), an
@@ -1117,7 +1117,9 @@ class RosMoveItTransport:
         inferred task phase or a blanket source/carried/released safety gate.
         Scene identity is the task owner's captured SceneStateStore revision;
         the helper initialization separately binds the full native model/Scene.
-        This method sends only a CPU query and creates no motion authority.
+        With assignments omitted, the same CPU worker derives them from native
+        FK and prospective contact intent. prior_intent is only the previous
+        committed revision's intent. This method creates no motion authority.
         """
         ready = getattr(self, "_native_geometry_ready", None)
         if (not isinstance(self._active, ActuatorStream) or self._active.fenced
@@ -1125,40 +1127,40 @@ class RosMoveItTransport:
             raise ContractError("NATIVE_GEOMETRY_NOT_READY")
         if getattr(self, "_native_geometry_candidate", None) is not None:
             raise ContractError("NATIVE_GEOMETRY_BUSY")
+        arm, gripper, scene_binding, prior_intent = copy.deepcopy(
+            (arm_goal, gripper_goal, scene_binding, prior_intent))
         if (not isinstance(revision, str) or not revision
                 or not isinstance(scene_binding, dict)
                 or set(scene_binding) != {"scene_state_digest", "revision"}
                 or not isinstance(scene_binding["scene_state_digest"], str)
                 or not DIGEST.fullmatch(scene_binding["scene_state_digest"])
                 or type(scene_binding["revision"]) is not int or scene_binding["revision"] < 0
-                or type(assignments) is not tuple or not assignments):
+                or assignments is not None and prior_intent is not None):
             raise ContractError("NATIVE_GEOMETRY_BINDING")
         if (type(deadline) not in (int, float) or not math.isfinite(deadline)
                 or not self._clock() < deadline <= self._native_geometry_deadline):
             raise ContractError("NATIVE_GEOMETRY_DEADLINE")
-        arm, gripper = copy.deepcopy((arm_goal, gripper_goal))
         samples = self._learned_actuator_reference_samples(arm, gripper, relative=True)
         if arm.trajectory.header.stamp.sec != 0 or arm.trajectory.header.stamp.nanosec != 0:
             raise ContractError("NATIVE_GEOMETRY_RELATIVE_TEMPLATE")
-        if (any(type(a) is not tuple or len(a) != 2 or type(a[0]) is not str
-                or a[0] not in {"source", "carried", "released"}
-                or type(a[1]) is not tuple or not a[1]
-                or any(type(i) is not int or not 0 <= i < len(samples) for i in a[1])
-                or tuple(sorted(set(a[1]))) != a[1] for a in assignments)
-                or len({h for h, _ in assignments}) != len(assignments)
-                or {i for _, indices in assignments for i in indices} != set(range(len(samples)))):
-            raise ContractError("NATIVE_GEOMETRY_ASSIGNMENT")
+        if assignments is not None:
+            self._validate_learned_geometry_assignments(assignments, len(samples))
         pair_digest = self._learned_actuator_pair_digest(arm, gripper)
         binding = canonical_digest({
             "selection_revision": revision, "native_template_digest": pair_digest,
             "scene_binding": scene_binding, "assignments": assignments,
+            "prior_intent": prior_intent,
             "initialization_digest": ready["initialization_digest"],
             "contact_context_digest": canonical_digest(self._native_geometry_context),
             "task_plan_digest": canonical_digest(self._native_geometry_plan),
             "deadline_monotonic_s": deadline})
-        self._native_geometry.submit(
-            tuple((h, tuple(samples[i][1] for i in indices)) for h, indices in assignments),
-            binding=binding, deadline=deadline)
+        if assignments is None:
+            self._native_geometry.submit((("source", tuple(row for _, row in samples)),),
+                binding=binding, deadline=deadline, derive_intent=True, prior_intent=prior_intent)
+        else:
+            self._native_geometry.submit(
+                tuple((h, tuple(samples[i][1] for i in indices)) for h, indices in assignments),
+                binding=binding, deadline=deadline)
         self._native_geometry_candidate = {
             "arm": arm, "gripper": gripper, "revision": revision, "binding": binding,
             "scene_binding": copy.deepcopy(scene_binding), "assignments": assignments,
@@ -1166,6 +1168,18 @@ class RosMoveItTransport:
             "initialization_digest": ready["initialization_digest"],
             "deadline": deadline, "report": None}
         return binding
+
+    @staticmethod
+    def _validate_learned_geometry_assignments(assignments, sample_count):
+        if (type(assignments) is not tuple or not assignments
+                or any(type(a) is not tuple or len(a) != 2 or type(a[0]) is not str
+                       or a[0] not in {"source", "carried", "released"}
+                       or type(a[1]) is not tuple or not a[1]
+                       or any(type(i) is not int or not 0 <= i < sample_count for i in a[1])
+                       or tuple(sorted(set(a[1]))) != a[1] for a in assignments)
+                or len({h for h, _ in assignments}) != len(assignments)
+                or {i for _, indices in assignments for i in indices} != set(range(sample_count))):
+            raise ContractError("NATIVE_GEOMETRY_ASSIGNMENT")
 
     def poll_learned_revision_geometry(self, *, binding):
         """Retain query facts only. Mismatch/failure never cancels current motion."""
@@ -1185,20 +1199,32 @@ class RosMoveItTransport:
                         or not DIGEST.fullmatch(result["scene_cdr_digest"])):
                     raise ContractError("NATIVE_GEOMETRY_BINDING")
                 variants = result.get("variants")
-                if (not isinstance(variants, list) or len(variants) != len(candidate["assignments"])
+                assignments = candidate["assignments"]
+                if assignments is None:
+                    assignments = result.get("assignments")
+                    self._validate_learned_geometry_assignments(assignments, candidate["sample_count"])
+                    intent = result.get("reference_intent")
+                    if (not isinstance(intent, dict) or intent.get("assignments") != assignments
+                            or not isinstance(result.get("source_query_digest"), str)
+                            or not DIGEST.fullmatch(result["source_query_digest"])):
+                        raise ContractError("NATIVE_GEOMETRY_BINDING")
+                if (not isinstance(variants, list) or len(variants) != len(assignments)
                         or any(v.get("hypothesis") != h or not isinstance(v.get("samples"), list)
                                or len(v["samples"]) != len(indices)
                                or any(type(s.get("allowed")) is not bool or type(s.get("saturated")) is not bool
                                       for s in v["samples"])
-                               for v, (h, indices) in zip(variants, candidate["assignments"]))):
+                               for v, (h, indices) in zip(variants, assignments))):
                     raise ContractError("NATIVE_GEOMETRY_BINDING")
                 candidate["report"] = {
                     "status": "CHECKED", "binding": candidate["binding"],
                     "selection_revision": candidate["revision"], "native_template_digest": candidate["native_template_digest"],
                     "initialization_digest": result["initialization_digest"],
                     "scene_cdr_digest": result["scene_cdr_digest"], "query_digest": result["query_digest"],
-                    "sample_count": candidate["sample_count"], "assignments": candidate["assignments"],
+                    "sample_count": candidate["sample_count"], "assignments": assignments,
                     "allowed": all(s["allowed"] and not s["saturated"] for v in variants for s in v["samples"])}
+                if candidate["assignments"] is None:
+                    candidate["report"].update(reference_intent=copy.deepcopy(intent),
+                                               source_query_digest=result["source_query_digest"])
             if binding != candidate["binding"]:
                 raise ContractError("NATIVE_GEOMETRY_SUPERSEDED")
             return copy.deepcopy(candidate["report"])
@@ -1752,8 +1778,20 @@ class RosMoveItTransport:
                 return False
         return True
 
-    def snapshot(self, max_age_s):
-        """Return a fresh, complete observation for execution safety checks."""
+    def poll_snapshot(self, max_age_s):
+        """Read initialized native caches without discovery, RPC, or spin waits.
+
+        The task start owns initialization. Absence/staleness is still an
+        error, not a newly timestamped sample. The normal revision owner can
+        therefore keep pumping progress/cancel while waiting for new evidence.
+        """
+        if (not self._initial_snapshot_complete or self._robot_description is None
+                or getattr(self, "_native_clock_configured_age", None) != max_age_s):
+            raise ContractError("ROS_SNAPSHOT_NOT_INITIALIZED")
+        return self.snapshot(max_age_s, wait=False)
+
+    def snapshot(self, max_age_s, *, wait=True):
+        """Return a fresh, complete observation; old callers retain acquisition."""
         if (
             isinstance(max_age_s, bool)
             or not isinstance(max_age_s, (int, float))
@@ -1762,7 +1800,8 @@ class RosMoveItTransport:
         ):
             raise ContractError("ROS_SNAPSHOT_AGE")
         max_age_s = float(max_age_s)
-        self._prepare_native_clock(max_age_s)
+        if wait:
+            self._prepare_native_clock(max_age_s)
         # The configured native LIVE path already requires SYSTEM_TIME stamps
         # at learned admission. Drain queued old-source samples within the same
         # acquisition deadline; legacy unconfigured readers retain their contract.
@@ -1774,8 +1813,9 @@ class RosMoveItTransport:
             else self.preflight_timeout_s
         )
         deadline = time.monotonic() + timeout
-        self._load_robot_description_parameter(deadline)
-        while (
+        if wait:
+            self._load_robot_description_parameter(deadline)
+        while wait and (
             self._joint_state_received_at is None
             or self._arm_controller_received_at is None
             or self._gripper_controller_received_at is None
