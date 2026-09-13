@@ -507,3 +507,16 @@ the existing recorder remains the state/action time-series owner. Neither this
 feedback nor ARM-only progress proves full seven-dimensional command adoption,
 gripper completion or task success. Diagnostic projection failure is reported as
 unavailable feedback without becoming an actuator cancellation condition.
+
+For the first native async integration, RTC guidance is not required: installed
+SmolVLA `supports_rtc()` returns true independently of `RTCConfig.enabled`, and
+the native `RTCInferenceEngine` appends chunks when guidance is disabled. The
+earlier capability-based incompatibility assumption is disproved by actual
+native factory/thread tests with synthetic sampling; no admission patch follows.
+`start_with_acknowledged_queue` only replaces a fresh paused engine's empty queue
+before observations/resume, because pinned 0.6.1 exposes no queue factory. It
+does not copy the producer loop, change merge policy or install a robot consumer.
+Native pause does not cancel an in-flight inference, and stop's timeout is not
+proof of thread exit; the task owner must retain resource ownership until actual
+termination. Normal task-lifetime loading, observation binding and full 7D
+reference adoption remain integration work, not completed by this seam.

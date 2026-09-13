@@ -18,6 +18,31 @@ from lerobot.policies.rtc import ActionQueue, RTCConfig
 LEROBOT_VERSION = "0.6.1"
 
 
+def start_with_acknowledged_queue(engine):
+    """Start a fresh native producer with the controller-facing queue adapter.
+
+    The task owner must call this before publishing observations or resuming
+    inference. LeRobot 0.6.1 starts paused with no observation, so replacing its
+    initial empty queue here cannot race a merge. No producer loop is copied or
+    patched globally. The same owner retains native pause/resume/stop ownership.
+    This installs no robot consumer and grants no execution authority.
+    """
+    from lerobot.rollout.inference.rtc import RTCInferenceEngine
+
+    if not isinstance(engine, RTCInferenceEngine):
+        raise TypeError("FR5_ACK_QUEUE_REQUIRES_NATIVE_ASYNC_ENGINE")
+    if (engine.action_queue is not None or engine._rtc_thread is not None
+            or engine._policy_active.is_set()):
+        raise RuntimeError("FR5_ACK_QUEUE_REQUIRES_FRESH_ENGINE")
+    queue = AcknowledgedActionQueue(engine._rtc_config)
+    engine.start()
+    # start() has no queue-factory parameter in the pinned upstream version.
+    # This one private assignment is the compatibility seam; scheduling,
+    # processing, inference and merge remain native responsibilities.
+    engine._action_queue = queue
+    return queue
+
+
 @dataclass(frozen=True, order=True)
 class RawActionIndex:
     """Stable identity of one row in one native queue merge."""
