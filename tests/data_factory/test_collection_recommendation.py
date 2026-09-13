@@ -745,6 +745,13 @@ def scoped_terminal_lifecycle(result):
 class MechanicalDiagnosticConsumerTests(unittest.TestCase):
     def lifecycle(self, kind):
         from tools.data_factory.motion.mechanical_terminal import PHASES
+        if kind == "failed_start":
+            result = learned_lifecycle(RecommendationFixture(), order=0)
+            result["code"] = "LEARNED_STALE_STATE"
+            trace = result["execution_evidence"]["learned_execution"]
+            trace["failure_code"] = result["code"]
+            redigest(trace, "trace_digest")
+            return result
         result = learned_lifecycle(RecommendationFixture(), order=0, reviewed=True)
         if kind == "contact":
             result["execution_evidence"]["mechanical_contact_diagnostic"] = {
@@ -777,7 +784,7 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
         from tools.data_factory.collection_recommendation import _analysis_ref
         from tools.data_factory.operator.workflow.learned_run import LearnedRunApplication
         from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
-        for kind in ("baseline", "contact", "terminal", "handoff", "legacy_handoff", "legacy_null_handoff", "generation_cleanup"):
+        for kind in ("baseline", "contact", "terminal", "handoff", "legacy_handoff", "legacy_null_handoff", "generation_cleanup", "failed_start"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 lifecycle = self.lifecycle(kind)
@@ -794,7 +801,8 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                         code="LEARNED_POLICY_FAILED" if kind == "generation_cleanup" else lifecycle["code"],
                         state=lifecycle["state"], run_id=lifecycle["run_id"],
                         plan_digest=lifecycle["plan_digest"],
-                        data=run_job.learned_run_diagnostic(lifecycle, payload=value))
+                        data=(run_job._failed_start_data(lifecycle, value) if kind == "failed_start"
+                              else run_job.learned_run_diagnostic(lifecycle, payload=value)))
                 app = LearnedRunApplication(payload=request, operator_label="fixture-operator",
                                             run_live_call=producer)
                 app._run()
@@ -806,6 +814,11 @@ class MechanicalDiagnosticConsumerTests(unittest.TestCase):
                 self.assertEqual(json.loads(saved_bytes), lifecycle)
                 diagnostic = app.result["data"]
                 self.assertEqual(diagnostic, build_run_diagnostic(lifecycle))
+                if kind == "failed_start":
+                    self.assertEqual(app.result["code"], "LEARNED_STALE_STATE")
+                    self.assertEqual(diagnostic["execution_trace"]["status"], "FAILED")
+                    self.assertNotIn("execute_goal_count", diagnostic)
+                    self.assertEqual(diagnostic["human_semantic_verdict"], "PENDING")
                 self.assertEqual(diagnostic["diagnostic_digest"], digest({
                     k: v for k, v in diagnostic.items() if k != "diagnostic_digest"}))
                 for field in ("mechanical_terminal", "mechanical_contact_diagnostic"):
@@ -1587,15 +1600,18 @@ class AcquisitionRolloutTests(unittest.TestCase):
             expected_recommendation_digest=baseline)["reason_codes"], ["COLLECTION_ACQUISITION_INPUT_CHANGED"])
 
     def test_controller_fault_task_and_current_profile_changes_remain_insufficient(self):
-        value = copy.deepcopy(self.lifecycle)
-        value.update(code="CONTROLLER_FAULT", semantic_verdict=None)
-        value["execution_evidence"].pop("semantic_decision")
-        value["execution_evidence"].pop("semantic_verdict")
-        value["execution_evidence"]["learned_execution"].update(status="FAILED", failure_code="CONTROLLER_FAULT",
-                                                               terminal_state=None, terminal_phases=[])
-        self.rebind(value)
-        self.lifecycle_path.write_text(json.dumps(value))
-        self.assertEqual(self.call()["reason_codes"], ["COLLECTION_ACQUISITION_ROLLOUT_REDEMONSTRATION_UNPROVEN"])
+        for code in ("CONTROLLER_FAULT", "LEARNED_STALE_STATE"):
+            with self.subTest(failure=code):
+                value = copy.deepcopy(self.lifecycle)
+                value.update(code=code, semantic_verdict=None)
+                value["execution_evidence"].pop("semantic_decision")
+                value["execution_evidence"].pop("semantic_verdict")
+                value["execution_evidence"]["learned_execution"].update(
+                    status="FAILED", failure_code=code, terminal_state=None, terminal_phases=[])
+                self.rebind(value)
+                self.lifecycle_path.write_text(json.dumps(value))
+                self.assertEqual(self.call()["reason_codes"],
+                                 ["COLLECTION_ACQUISITION_ROLLOUT_REDEMONSTRATION_UNPROVEN"])
         for key in ("cell_calibration", "object_profile", "grasp_profile", "collection_profile", "motion_qualification"):
             value = copy.deepcopy(self.lifecycle)
             plan = value["plan_envelope"]["plan"]
