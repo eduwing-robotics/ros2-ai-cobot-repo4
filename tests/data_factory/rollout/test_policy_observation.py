@@ -84,6 +84,27 @@ class PolicyObservationTest(unittest.TestCase):
                 {"camera1": "/up", "camera2": "/wrist"}, .3, clock=lambda: 20.)
         node.destroy_subscription.assert_called_once_with("first")
 
+    @mock.patch("tools.data_factory.motion.policy_observation.time.time", return_value=100.)
+    def test_legacy_capture_subscription_setup_consumes_original_deadline(self, _wall):
+        now, destroyed = [20.], []
+        transport = object.__new__(RosMoveItTransport)
+        transport._active, transport._execution_locked = None, False
+        transport._joint_state = transport._joint_state_received_at = None
+        transport._clock = lambda: now[0]
+        transport.graph_timeout_s = .1
+        def subscribe(_type, topic, _callback, _qos):
+            now[0] += .06
+            return topic
+        transport.node = SimpleNamespace(create_subscription=subscribe,
+            destroy_subscription=destroyed.append,
+            get_parameter=lambda _: SimpleNamespace(value=False))
+        transport._rclpy = SimpleNamespace(spin_once=mock.Mock())
+        with mock.patch("tools.data_factory.motion.moveit_transport.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(ContractError, "LEARNED_OBSERVATION_UNAVAILABLE"):
+                transport.capture_policy_observation({"camera1": "/up", "camera2": "/wrist"}, .3)
+        transport._rclpy.spin_once.assert_not_called()
+        self.assertCountEqual(destroyed, ["/up", "/wrist"])
+
     def capture(self, *, stamp=100., received=20., state=True, malformed=False,
                 active=False, simulated=False, after_conversion=100., executor=False,
                 paused_system=False, cached=False):

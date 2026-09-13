@@ -1323,8 +1323,8 @@ class RosMoveItTransport:
         """
         if self._execution_locked or self._active is not None:
             raise ContractError("ROS_EXEC_ACTIVE")
-        stream = self.policy_observation_stream(camera_topics, max_age_s)
         deadline = time.monotonic() + self.graph_timeout_s
+        stream = self.policy_observation_stream(camera_topics, max_age_s)
         try:
             while time.monotonic() < deadline:
                 self._rclpy.spin_once(self.node, timeout_sec=max(0., min(.05, deadline - time.monotonic())))
