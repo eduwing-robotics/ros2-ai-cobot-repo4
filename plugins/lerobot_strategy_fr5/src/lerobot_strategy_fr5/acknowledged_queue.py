@@ -296,3 +296,43 @@ class AcknowledgedActionQueue(ActionQueue):
             start = self.last_index
             self.last_index += count
             return self._rows[start : self.last_index]
+
+    def advance_unchanged_prefix(
+        self, snapshot: ActionQueueSnapshot, *, count: int, offset: int = 0,
+    ) -> tuple[RawActionIndex, ...]:
+        """Consume a checked prefix even if native inference appended meanwhile.
+
+        Unlike generation-wide compare-and-advance, this permits a new tail or
+        native compaction only when the requested front rows, input provenance,
+        and both raw/processed tensors are still identical. Comparison and
+        advancement share the native lock; there is no blind retry or second
+        cursor. The caller supplies reference progress, not goal acceptance or
+        physical target-arrival claims. An already consumed prefix cannot replay.
+        ``offset`` identifies the next unacknowledged row in that same detached
+        revision snapshot; it is checked against the native queue front.
+        """
+        if not isinstance(snapshot, ActionQueueSnapshot):
+            raise TypeError("FR5_ACK_QUEUE_EXPECTED_SNAPSHOT")
+        if type(count) is not int or type(offset) is not int:
+            raise TypeError("FR5_ACK_QUEUE_EXPECTED_INTEGER: count/offset")
+        if count < 0 or offset < 0 or offset + count > len(snapshot.rows):
+            raise ValueError(f"FR5_ACK_QUEUE_INVALID_COUNT: {count}")
+        with self.lock:
+            if count == 0:
+                return ()
+            end = self.last_index + count
+            if (self._rows[self.last_index:end] != snapshot.rows[offset:offset + count]
+                    or self._observation_provenance[self.last_index:end]
+                    != snapshot.observation_provenance[offset:offset + count]):
+                raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+            for saved, current in ((snapshot.original_actions, self.original_queue),
+                                   (snapshot.processed_actions, self.queue)):
+                if not isinstance(saved, Tensor) or not isinstance(current, Tensor):
+                    raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+                expected, actual = saved[offset:offset + count], current[self.last_index:end]
+                if (expected.shape != actual.shape or expected.dtype != actual.dtype
+                        or expected.device != actual.device or not expected.equal(actual)):
+                    raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+            return self.advance_if_current(
+                generation=self._generation, expected_index=self.last_index, count=count,
+            )

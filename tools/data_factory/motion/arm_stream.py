@@ -164,7 +164,7 @@ class ArmStream:
                     if list(message.goal_id.uuid) == list(item.handle.goal_id.uuid):
                         from rosidl_runtime_py.convert import message_to_ordereddict
                         events.append({"revision": item.revision, "event": "FEEDBACK",
-                                       "goal_id": list(message.goal_id.uuid),
+                                       "goal_id": [int(value) for value in message.goal_id.uuid],
                                        "received_monotonic_s": received,
                                        "samples_since_poll": count,
                                        "feedback": message_to_ordereddict(message.feedback)})
@@ -178,7 +178,7 @@ class ArmStream:
                         and item.cancel_response.done()):
                     item.cancel_observed = True
                     response = item.cancel_response.result()
-                    identifier = list(item.handle.goal_id.uuid)
+                    identifier = [int(value) for value in item.handle.goal_id.uuid]
                     accepted = response.return_code == 0 and any(
                         list(info.goal_id.uuid) == identifier for info in response.goals_canceling)
                     events.append({"revision": item.revision, "event": "CANCEL_RESPONSE",

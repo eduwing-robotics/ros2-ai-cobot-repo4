@@ -544,6 +544,20 @@ feedback nor ARM-only progress proves full seven-dimensional command adoption,
 gripper completion or task success. Diagnostic projection failure is reported as
 unavailable feedback without becoming an actuator cancellation condition.
 
+`rollout.stream_progress.ReferenceProgress` reduces the two native actuator
+references to the prefix whose policy endpoints both timelines have crossed.
+The time-zero initial anchor is not a policy row: acceptance and elapsed zero
+acknowledge zero rows; crossing the first policy endpoint acknowledges one.
+The slower ARM/gripper reference determines the cumulative count, not wall
+time, feedback frequency, queue merge, or physical target arrival. Delayed or
+coalesced feedback may advance several rows together without terminal waits.
+Missing feedback cannot advance the prefix and does not itself cancel motion.
+A positive native terminal may reconcile only its own actuator's final prefix.
+The existing native queue lock atomically compares row identity, observation
+provenance and raw/processed values before advancing an unchanged prefix, even
+after native append/compaction. This adds no producer scheduler or second cursor.
+These tested seams still require the normal execution-owner caller below.
+
 For the first native async integration, RTC guidance is not required: installed
 SmolVLA `supports_rtc()` returns true independently of `RTCConfig.enabled`, and
 the native `RTCInferenceEngine` appends chunks when guidance is disabled. The

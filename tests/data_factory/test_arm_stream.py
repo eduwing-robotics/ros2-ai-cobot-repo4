@@ -607,6 +607,58 @@ class TransportActuatorStreamTest(unittest.TestCase):
         self.assertFalse(self.transport.owns_active_goal)
         self.assertTrue(self.transport._execution_locked)
 
+    def test_native_pair_feedback_advances_reference_prefix_without_terminal_wait(self):
+        from tools.data_factory.rollout.stream_progress import ReferenceProgress
+
+        arm, gripper = self.transport.build_learned_actuator_goals(
+            [0.] * 6 + [.021], [[i * .001] * 6 + [.012] for i in range(1, 5)],
+            period_s=.1, start_time_ns=42_000_000_000)
+        times = [p.time_from_start.sec * 10**9 + p.time_from_start.nanosec
+                 for p in arm.trajectory.points]
+        progress = ReferenceProgress("one", times)
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        self.transport.submit_learned_actuator_revision(arm, gripper, revision="one", dispatch_guard=Mock())
+        first, second = handle(), handle()
+        self.response.set_result(first)
+        self.gripper_response.set_result(second)
+        def push(actuator, elapsed_ns):
+            item = first if actuator == "arm" else second
+            message = feedback(item, elapsed_ns)
+            client = self.client if actuator == "arm" else self.transport.gripper
+            if actuator == "gripper":
+                message.feedback.joint_names = ["finger_right_joint"]
+                message.feedback.desired.positions = [.012]
+                message.feedback.actual.positions = [.011]
+            client.send_goal_async.call_args.kwargs["feedback_callback"](message)
+        def consume():
+            import json
+
+            events = self.transport.poll_learned_actuator_stream()
+            self.assertEqual(json.loads(json.dumps(events)), events)
+            for event in events:
+                progress.observe(event)
+            return events
+        push("arm", 100_000_000)
+        push("gripper", 50_000_000)
+        self.assertIn("PAIR_ACCEPTED", [event["event"] for event in consume()])
+        self.assertEqual(progress.selected_count, 0)
+        push("arm", 300_000_000)
+        push("gripper", 200_000_000)
+        self.assertEqual([e["event"] for e in consume()], ["FEEDBACK", "FEEDBACK"])
+        self.assertEqual(progress.selected_count, 2)
+        self.assertFalse(first.get_result_async.return_value.done())
+        self.assertFalse(second.get_result_async.return_value.done())
+        self.client.send_goal_async.assert_called_once()
+        self.transport.gripper.send_goal_async.assert_called_once()
+        first.cancel_goal_async.assert_not_called()
+        second.cancel_goal_async.assert_not_called()
+        finish(first)
+        consume()
+        self.assertEqual(progress.selected_count, 2)
+        finish(second)
+        consume()
+        self.assertEqual(progress.selected_count, 4)
+
     def test_native_send_failure_preserves_actual_attempt_counts(self):
         for failed_actuator, expected in (("arm", (1, 0)), ("gripper", (1, 1))):
             with self.subTest(actuator=failed_actuator):

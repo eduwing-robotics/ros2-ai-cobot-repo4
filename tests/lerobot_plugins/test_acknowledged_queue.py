@@ -1,6 +1,7 @@
 """CPU-only checks for the LeRobot ActionQueue acknowledgment seam."""
 
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch
@@ -150,6 +151,124 @@ class AcknowledgedActionQueueTest(unittest.TestCase):
                 torch.cat([first_processed[2:], second_processed]),
             )
         )
+
+    def test_unchanged_prefix_survives_native_append_and_compaction_not_replay(self):
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        queue.merge(actions(0), actions(100), real_delay=0)
+        queue.get()
+        queue.get()
+        snapshot = queue.snapshot()
+        queue.merge(actions(1000, 2), actions(2000, 2), real_delay=0)
+        self.assertNotEqual(snapshot.generation, queue.generation)
+        self.assertNotEqual(snapshot.queue_index, queue.get_action_index())
+        advanced = queue.advance_unchanged_prefix(snapshot, count=1)
+        self.assertEqual(advanced, (RawActionIndex(1, 2),))
+        self.assertEqual(queue.qsize(), 3)
+        with self.assertRaisesRegex(RuntimeError, "FR5_ACK_QUEUE_PREFIX_CHANGED"):
+            queue.advance_unchanged_prefix(snapshot, count=1)
+        self.assertTrue(torch.equal(queue.get(), actions(100)[3]))
+        self.assertTrue(torch.equal(queue.get_processed_left_over(), actions(2000, 2)))
+
+    def test_unchanged_prefix_checks_identity_provenance_and_both_tensor_representations(self):
+        provenance = ObservationProvenance("sha256:" + "a" * 64, "SYSTEM_TIME",
+            (("camera1", 1.), ("camera2", 1.), ("state", 1.)))
+        for change in ("raw", "processed", "dtype", "identity", "provenance", "clear", "cursor", "rtc"):
+            with self.subTest(change=change):
+                queue = AcknowledgedActionQueue(RTCConfig(enabled=change == "rtc"))
+                queue.merge(actions(0), actions(100), real_delay=0)
+                snapshot = queue.snapshot()
+                if change == "raw":
+                    snapshot.original_actions[0, 0] += 1
+                elif change == "processed":
+                    snapshot.processed_actions[0, 0] += 1
+                elif change == "dtype":
+                    snapshot = replace(snapshot, processed_actions=snapshot.processed_actions.double())
+                elif change == "identity":
+                    snapshot = replace(snapshot, rows=(RawActionIndex(99, 0), *snapshot.rows[1:]))
+                elif change == "provenance":
+                    snapshot = replace(snapshot, observation_provenance=(provenance, *snapshot.observation_provenance[1:]))
+                elif change == "clear":
+                    queue.clear()
+                    queue.merge(actions(0), actions(100), real_delay=0)
+                elif change == "cursor":
+                    queue.get()
+                else:
+                    queue.merge(actions(0), actions(100), real_delay=0)
+                before = queue.get_action_index()
+                with self.assertRaisesRegex(RuntimeError, "FR5_ACK_QUEUE_PREFIX_CHANGED"):
+                    queue.advance_unchanged_prefix(snapshot, count=1)
+                self.assertEqual(queue.get_action_index(), before)
+
+    def test_unchanged_prefix_does_not_claim_or_consume_a_changed_tail(self):
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        queue.merge(actions(0), actions(100), real_delay=0)
+        snapshot = queue.snapshot()
+        snapshot.original_actions[2:] = -1
+        snapshot.processed_actions[2:] = -2
+        self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=2), snapshot.rows[:2])
+        self.assertTrue(torch.equal(queue.get_processed_left_over(), actions(100)[2:]))
+
+    def test_cumulative_progress_reuses_bound_snapshot_with_explicit_offset(self):
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        queue.merge(actions(0), actions(100), real_delay=0)
+        snapshot = queue.snapshot()
+        self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=2), snapshot.rows[:2])
+        queue.merge(actions(1000, 2), actions(2000, 2), real_delay=0)
+        self.assertEqual(queue.advance_unchanged_prefix(snapshot, offset=2, count=1), snapshot.rows[2:3])
+        with self.assertRaisesRegex(RuntimeError, "FR5_ACK_QUEUE_PREFIX_CHANGED"):
+            queue.advance_unchanged_prefix(snapshot, offset=2, count=1)
+        self.assertEqual(queue.advance_unchanged_prefix(snapshot, offset=3, count=1), snapshot.rows[3:])
+        self.assertEqual(queue.snapshot().rows, (RawActionIndex(2, 0), RawActionIndex(2, 1)))
+
+    def test_unchanged_prefix_comparison_and_advance_share_native_lock(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        queue.merge(actions(0), actions(100), real_delay=0)
+        snapshot = queue.snapshot()
+        compared, attempted, release = Event(), Event(), Event()
+        advance = queue.advance_if_current
+        def after_comparison(**kwargs):
+            compared.set()
+            if not release.wait(3):
+                raise TimeoutError("test did not release prefix advancement")
+            return advance(**kwargs)
+        def append():
+            if not compared.wait(3):
+                raise TimeoutError("prefix was never compared")
+            acquired = queue.lock.acquire(blocking=False)
+            if acquired:
+                queue.lock.release()
+            attempted.set()
+            queue.merge(actions(1000, 2), actions(2000, 2), real_delay=0)
+            return acquired
+        with ThreadPoolExecutor(max_workers=2) as pool, patch.object(
+                queue, "advance_if_current", side_effect=after_comparison):
+            consumer = pool.submit(queue.advance_unchanged_prefix, snapshot, count=2)
+            producer = pool.submit(append)
+            try:
+                self.assertTrue(attempted.wait(3))
+            finally:
+                release.set()
+            self.assertEqual(consumer.result(timeout=3), snapshot.rows[:2])
+            self.assertFalse(producer.result(timeout=3))
+        self.assertEqual(queue.snapshot().rows,
+                         (RawActionIndex(1, 2), RawActionIndex(1, 3), RawActionIndex(2, 0), RawActionIndex(2, 1)))
+
+    def test_unchanged_prefix_invalid_counts_do_not_move_native_cursor(self):
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        queue.merge(actions(0), actions(100), real_delay=0)
+        snapshot = queue.snapshot()
+        for count in (True, 1., "1", None, -1, 5):
+            with self.subTest(count=count), self.assertRaises((TypeError, ValueError)):
+                queue.advance_unchanged_prefix(snapshot, count=count)
+            self.assertEqual(queue.get_action_index(), 0)
+        self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=0), ())
+        self.assertEqual(queue.get_action_index(), 0)
+        for offset in (True, 1., "1", None, -1, 4):
+            with self.subTest(offset=offset), self.assertRaises((TypeError, ValueError)):
+                queue.advance_unchanged_prefix(snapshot, offset=offset, count=1)
+            self.assertEqual(queue.get_action_index(), 0)
 
     def test_native_rtc_replace_delay_and_staleness_are_unchanged(self):
         queue = AcknowledgedActionQueue(RTCConfig(enabled=True))

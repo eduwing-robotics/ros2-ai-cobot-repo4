@@ -269,6 +269,63 @@ class NativeAsyncTest(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(engine.failed)
 
+    def test_checked_prefix_consumption_survives_actual_inflight_native_append(self):
+        from tools.data_factory.rollout.stream_progress import ReferenceProgress
+
+        progress = ReferenceProgress("native-one", [0, 100_000_000, 200_000_000, 300_000_000, 400_000_000])
+        def feedback(actuator, elapsed_ns):
+            names = [f"j{i}" for i in range(1, 7)] if actuator == "arm" else ["finger_right_joint"]
+            sec, nanosec = divmod(elapsed_ns, 1_000_000_000)
+            return {"revision": "native-one", "event": "FEEDBACK", "actuator": actuator,
+                    "goal_id": [0] * 15 + [1 if actuator == "arm" else 2],
+                    "received_monotonic_s": 10., "samples_since_poll": 1,
+                    "feedback": {"joint_names": names, "desired": {
+                        "positions": [0.] * len(names), "velocities": [], "accelerations": [], "effort": [],
+                        "time_from_start": {"sec": sec, "nanosec": nanosec}}}}
+
+        policy = SyntheticSampler()
+        engine = self._engine(policy)
+        queue = start_with_acknowledged_queue(engine)
+        thread = engine._rtc_thread
+        try:
+            engine.notify_observation(dict.fromkeys([f"j{i}" for i in range(7)], 0.))
+            engine.resume()
+            deadline = time.monotonic() + 3.
+            while queue.qsize() < 4 and time.monotonic() < deadline:
+                time.sleep(.005)
+            snapshot = queue.snapshot()
+            self.assertEqual(len(snapshot.rows), 4)
+            self.assertEqual(progress.observe({"revision": "native-one", "event": "PAIR_ACCEPTED", "predecessor": None}), 0)
+            self.assertEqual(queue.qsize(), 4)  # Acceptance is not row consumption.
+            progress.observe(feedback("arm", 200_000_000))
+            progress.observe(feedback("gripper", 100_000_000))
+            self.assertEqual(progress.selected_count, 1)
+            self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=progress.selected_count), snapshot.rows[:1])
+            self.assertFalse(policy.second_started.is_set())
+            progress.observe(feedback("gripper", 200_000_000))
+            self.assertEqual(queue.advance_unchanged_prefix(snapshot, offset=1, count=progress.selected_count - 1), snapshot.rows[1:2])
+            self.assertTrue(policy.second_started.wait(2.))
+            engine.pause()
+            policy.release_second.set()
+            deadline = time.monotonic() + 3.
+            while queue.generation < 2 and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(queue.generation, 2)
+            self.assertEqual(queue.qsize(), 6)
+            # A late cumulative update catches up both rows without per-row
+            # terminal waits, even after real native append/compaction occurred.
+            progress.observe(feedback("arm", 400_000_000))
+            progress.observe(feedback("gripper", 400_000_000))
+            self.assertEqual(queue.advance_unchanged_prefix(snapshot, offset=2, count=progress.selected_count - 2), snapshot.rows[2:])
+            self.assertEqual(queue.snapshot().rows, tuple(RawActionIndex(2, i) for i in range(4)))
+            torch.testing.assert_close(queue.get_processed_left_over(), torch.full((4, 7), 2.))
+            self.assertEqual(policy.calls, 2)
+        finally:
+            policy.release_second.set()
+            engine.stop()
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(engine.failed)
+
     def test_already_resumed_engine_is_not_started_or_replaced(self):
         engine = self._engine(SyntheticSampler())
         engine.resume()
