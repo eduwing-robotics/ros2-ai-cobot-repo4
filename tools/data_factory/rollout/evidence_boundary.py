@@ -443,13 +443,14 @@ if __name__ == "__main__":
 
 
 def build_run_diagnostic(lifecycle_result: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a finite learned run without inventing a committed episode/ledger.
+    """Project a retained learned run without inventing a committed episode/ledger.
 
     The existing OneJob result owns recorder disposition and executor evidence.
     This read-only diagnostic can target later collection/re-evaluation; neither
     controller completion nor human semantic PASS grants terminal/reset safety.
     """
     from tools.data_factory.rollout.finite_plan import validate_execution_trace, validate_execution_history
+    from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA, validate_stream_plan
     try:
         result = copy.deepcopy(dict(lifecycle_result))
         plan = result["plan_envelope"]["plan"]
@@ -457,31 +458,70 @@ def build_run_diagnostic(lifecycle_result: Mapping[str, Any]) -> dict[str, Any]:
                 or result["recorder_state"] not in {"ABORTED", "FROZEN", "QUARANTINED_COMMIT"}
                 or result["state"] not in {"ABORTED", "BLOCKED", "QUARANTINED_COMMIT"}):
             raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
-        trace = validate_execution_trace(plan, result["execution_evidence"]["learned_execution"])
-        history = validate_execution_history(plan, result["execution_evidence"].get("learned_history", []))
-        if trace["status"] not in {"COMPLETED", "FAILED"}:
-            raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_TERMINAL")
         recorder = result["recorder_evidence"]
         if not isinstance(recorder, dict) or recorder.get("state") != result["recorder_state"]:
             raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_RECORDER")
+        evidence = result["execution_evidence"]
+        native = plan.get("schema_version") == PLAN_SCHEMA
+        if native:
+            plan = validate_stream_plan(plan)
+            if (result.get("scene_binding", plan["scene_binding"]) != plan["scene_binding"]
+                    or recorder.get("run_id", result["run_id"]) != result["run_id"]):
+                raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
+            if evidence is not None and not isinstance(evidence, dict):
+                raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
+            if evidence is not None:
+                if any(key in evidence for key in ("learned_execution", "learned_history")):
+                    raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
+                if "native_stream" in evidence:
+                    stream = evidence["native_stream"]
+                    if (not isinstance(stream, dict)
+                            or set(stream) != {"status", "reference_consumed_count", "task_outcome"}
+                            or stream["status"] not in {"OPENING", "WAITING_FOR_POLICY", "NATIVE_HANDLES_TERMINAL"}
+                            or type(stream["reference_consumed_count"]) is not int
+                            or stream["reference_consumed_count"] < 0
+                            or stream["task_outcome"] != UNKNOWN):
+                        raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
+            history = []
+        else:
+            if "native_stream" in evidence:
+                raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")
+            trace = validate_execution_trace(plan, evidence["learned_execution"])
+            history = validate_execution_history(plan, evidence.get("learned_history", []))
+            if trace["status"] not in {"COMPLETED", "FAILED"}:
+                raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_TERMINAL")
     except (KeyError, TypeError, ValueError) as exc:
         raise ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING") from exc
     diagnostic = {
-        "schema_version": "data_factory.rollout_run_diagnostic.v1",
+        "schema_version": "data_factory.rollout_run_diagnostic.v2" if native else "data_factory.rollout_run_diagnostic.v1",
         "run_id": result["run_id"], "plan_digest": result["plan_digest"],
-        "proposal_digest": trace["proposal_digest"], "checkpoint": trace["checkpoint"],
-        "execution_trace": trace, "lifecycle_result_digest": canonical_digest(result),
+        "lifecycle_result_digest": canonical_digest(result),
         "recorder_disposition": result["recorder_state"], "recorder_evidence_digest": canonical_digest(recorder),
         "disposition_reason": result["code"], "episode_ledger": None,
         "human_semantic_verdict": result.get("semantic_verdict"),
-        "human_semantic_decision": copy.deepcopy(result["execution_evidence"].get("semantic_decision")),
+        "human_semantic_decision": copy.deepcopy((evidence or {}).get("semantic_decision")),
         "task_effectiveness": UNKNOWN, "physical_qualification": UNKNOWN,
         "training_authorized": False, "online_policy_authorized": False,
     }
+    if native:
+        source = plan["source_program"]
+        # Preserve native owner observations verbatim. Missing events, queue
+        # acceptance and terminal native handles establish no physical verdict.
+        diagnostic.update(
+            source_program_digest=canonical_digest(source),
+            resolved_job_digest=plan["resolved_job_digest"],
+            destination_resolved_job_digest=source["destination_resolved_job_digest"],
+            endpoint_bindings_digest=source["endpoint_bindings_digest"],
+            scene_binding=plan["scene_binding"], checkpoint=plan["policy"]["checkpoint"],
+            execution_evidence=evidence, physical_stop=UNKNOWN, data_deficit=UNKNOWN,
+        )
+    else:
+        diagnostic.update(proposal_digest=trace["proposal_digest"], checkpoint=trace["checkpoint"],
+                          execution_trace=trace)
     if history:
         diagnostic["execution_history"] = history
-    evidence = result["execution_evidence"]
-    if "mechanical_terminal" in evidence:
+    evidence = evidence or {}
+    if "mechanical_terminal" in evidence and not native:
         from tools.data_factory.motion.mechanical_terminal import validate_terminal_evidence
         diagnostic["mechanical_terminal"] = validate_terminal_evidence(evidence["mechanical_terminal"], plan)
     elif "mechanical_contact_diagnostic" in evidence:

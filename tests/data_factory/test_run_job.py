@@ -216,6 +216,35 @@ class RunJobTest(unittest.TestCase):
             self.assertIsNone(run_job.learned_run_diagnostic({}, payload=request))
             self.assertEqual(list(root.iterdir()), [])
 
+    def test_native_stream_diagnostic_uses_existing_canonical_persistence_boundary(self):
+        result = {"run_id": "run-1", "plan_envelope": {"plan": {
+            "schema_version": "data_factory.native_learned_task_plan.v1"}}, "execution_evidence": {
+            "native_stream": {"status": "NATIVE_HANDLES_TERMINAL", "task_outcome": "UNKNOWN"}}}
+        diagnostic = {"lifecycle_result_digest": run_job.canonical_digest(result)}
+        with tempfile.TemporaryDirectory() as directory:
+            request = {"run_root": directory, "run_id": "run-1"}
+            root = run_job._prepare_run_dir(request)
+            target = root / "learned_lifecycle_result.json"
+            with mock.patch("tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
+                            side_effect=run_job.ContractError("ROLLOUT_RUN_DIAGNOSTIC_BINDING")) as derive:
+                with self.assertRaisesRegex(run_job.ContractError, "ROLLOUT_RUN_DIAGNOSTIC_BINDING"):
+                    run_job.learned_run_diagnostic(result, payload=request)
+                derive.assert_called_once_with(result)
+            self.assertFalse(target.exists())
+            with mock.patch("tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
+                            return_value=diagnostic) as derive:
+                self.assertEqual(run_job.learned_run_diagnostic(result, payload=request), diagnostic)
+                derive.assert_called_once_with(result)
+            self.assertEqual(run_job.load_json_strict(target), result)
+            self.assertNotIn("learned_execution", result["execution_evidence"])
+            with mock.patch("tools.data_factory.rollout.evidence_boundary.build_run_diagnostic",
+                            return_value=diagnostic) as derive:
+                # A pre-execute rejection has no stream. The canonical builder
+                # decides whether its retained lifecycle is diagnosable.
+                rejected = {**result, "execution_evidence": None}
+                self.assertEqual(run_job.learned_run_diagnostic(rejected), diagnostic)
+                derive.assert_called_once_with(rejected)
+
     def test_failed_start_retains_canonical_lifecycle_without_inventing_dispatch(self):
         started = {
             "run_id": "run-1", "code": "LEARNED_STALE_STATE",

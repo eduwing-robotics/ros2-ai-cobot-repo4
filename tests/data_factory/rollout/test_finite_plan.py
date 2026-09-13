@@ -528,6 +528,26 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
                 self.assertFalse(executor.runs["run"]["execution"]["actuator_stream_opened"])
                 self.assertEqual(scene.updates, [])
 
+    def test_normal_cancellation_diagnostic_consumes_settled_lifecycle_not_finite_trace(self):
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"])
+        pending = job.cancel()
+        with self.assertRaisesRegex(ContractError, "ROLLOUT_RUN_DIAGNOSTIC_BINDING"):
+            build_run_diagnostic(pending)
+        settled = job.cancel()
+        diagnostic = build_run_diagnostic(settled)
+        self.assertEqual(diagnostic["schema_version"], "data_factory.rollout_run_diagnostic.v2")
+        self.assertEqual(diagnostic["lifecycle_result_digest"], canonical_digest(settled))
+        self.assertEqual(diagnostic["execution_evidence"], settled["execution_evidence"])
+        self.assertEqual(diagnostic["recorder_disposition"], "QUARANTINED_COMMIT")
+        self.assertEqual(diagnostic["execution_evidence"]["scene_preservation"]["reason_code"], "NO_DISPATCH")
+        for field in ("task_effectiveness", "physical_qualification", "physical_stop", "data_deficit"):
+            self.assertEqual(diagnostic[field], "UNKNOWN")
+        for field in ("proposal_digest", "execution_trace"):
+            self.assertNotIn(field, diagnostic)
+        self.assertEqual(transport.sent, [])
+
 
 class CurrentStateTest(unittest.TestCase):
     def fixture(self, *, v5=False):

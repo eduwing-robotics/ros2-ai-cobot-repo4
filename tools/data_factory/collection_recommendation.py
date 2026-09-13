@@ -658,7 +658,9 @@ def _rollout_condition(hypothesis, lifecycle_result):
         return None
     from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
     from tools.fr5_data_factory import validate_motion_program
-    build_run_diagnostic(lifecycle_result)
+    diagnostic = build_run_diagnostic(lifecycle_result)
+    if diagnostic["schema_version"] != "data_factory.rollout_run_diagnostic.v1":
+        raise ContractError("COLLECTION_RECOMMENDATION_ROLLOUT_OWNER")
     plan = lifecycle_result["plan_envelope"]["plan"]
     resolved = plan.get("resolved_job_digest")
     matches = [base for base in hypothesis["base_conditions"]
@@ -1384,6 +1386,9 @@ def _current_rollout_condition(context, selected, lifecycle_result, preapproval,
     from tools.fr5_data_factory import normalize_job_spec, validate_motion_program
 
     diagnostic = build_run_diagnostic(lifecycle_result)
+    if diagnostic["schema_version"] != "data_factory.rollout_run_diagnostic.v1":
+        # Native retained lifecycle evidence is not yet a collection analysis.
+        raise ContractError("COLLECTION_RECOMMENDATION_ROLLOUT_OWNER")
     plan = lifecycle_result["plan_envelope"]["plan"]
     program = validate_motion_program(plan.get("learned_source_program"))
     binding = validate_scene_binding(plan.get("scene_binding"))

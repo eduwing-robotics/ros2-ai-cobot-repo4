@@ -117,6 +117,103 @@ def scene_binding():
 
 
 class StreamPlanTest(unittest.TestCase):
+    def retained_lifecycle(self):
+        plan = build_stream_plan("normal-run-1", source_program(), scene_binding(), policy())
+        return {
+            "ok": False, "code": "CANCELLED", "state": "ABORTED",
+            "run_id": plan["run_id"], "plan_digest": canonical_digest(plan),
+            "plan_envelope": {"plan": plan}, "scene_binding": plan["scene_binding"],
+            "recorder_state": "ABORTED",
+            "recorder_evidence": {"state": "ABORTED", "run_id": plan["run_id"],
+                                  "transaction_id": "native-transaction-1"},
+            "execution_evidence": {
+                "native_stream": {"status": "NATIVE_HANDLES_TERMINAL",
+                                  "reference_consumed_count": 0, "task_outcome": "UNKNOWN"},
+                "actuator_stream_events": [],
+                "actuator_stream_drain": {"status": "NATIVE_HANDLES_TERMINAL",
+                                          "fenced": True, "owns_goals": False},
+            },
+        }
+
+    def test_native_diagnostic_retains_identity_without_finite_or_physical_claims(self):
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        lifecycle = self.retained_lifecycle()
+        before = copy.deepcopy(lifecycle)
+        diagnostic = build_run_diagnostic(lifecycle)
+        plan = lifecycle["plan_envelope"]["plan"]
+        self.assertEqual(diagnostic["schema_version"], "data_factory.rollout_run_diagnostic.v2")
+        self.assertEqual(diagnostic["source_program_digest"], canonical_digest(plan["source_program"]))
+        self.assertEqual(diagnostic["destination_resolved_job_digest"], plan["source_program"]["destination_resolved_job_digest"])
+        self.assertEqual(diagnostic["checkpoint"], plan["policy"]["checkpoint"])
+        self.assertEqual(diagnostic["scene_binding"], plan["scene_binding"])
+        self.assertEqual(diagnostic["execution_evidence"], lifecycle["execution_evidence"])
+        self.assertEqual(diagnostic["recorder_evidence_digest"], canonical_digest(lifecycle["recorder_evidence"]))
+        for key in ("task_effectiveness", "physical_stop", "data_deficit"):
+            self.assertEqual(diagnostic[key], "UNKNOWN")
+        for key in ("proposal_digest", "execution_trace", "execution_history"):
+            self.assertNotIn(key, diagnostic)
+        self.assertEqual(lifecycle, before)
+        diagnostic["execution_evidence"]["native_stream"]["status"] = "CHANGED"
+        self.assertEqual(lifecycle, before)
+
+    def test_native_diagnostic_preserves_failed_preparation_and_pending_drain(self):
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        for status in ("OPENING", "WAITING_FOR_POLICY", "NATIVE_HANDLES_TERMINAL"):
+            with self.subTest(status=status):
+                lifecycle = self.retained_lifecycle()
+                lifecycle.update(code="ROS_EXEC_STREAM_OPEN", state="BLOCKED", recorder_state="FROZEN")
+                lifecycle["recorder_evidence"]["state"] = "FROZEN"
+                evidence = lifecycle["execution_evidence"]
+                evidence["native_stream"]["status"] = status
+                evidence["actuator_stream_drain"] = {"status": "OWNERSHIP_UNAVAILABLE", "fenced": None, "owns_goals": None}
+                diagnostic = build_run_diagnostic(lifecycle)
+                self.assertEqual(diagnostic["execution_evidence"], evidence)
+                self.assertEqual(diagnostic["physical_stop"], "UNKNOWN")
+
+        for unavailable in (None, {}):
+            lifecycle = self.retained_lifecycle()
+            lifecycle.update(code="LEARNED_PREPARATION_FAILED", execution_evidence=unavailable)
+            diagnostic = build_run_diagnostic(lifecycle)
+            self.assertEqual(diagnostic["execution_evidence"], unavailable)
+            self.assertEqual(diagnostic["data_deficit"], "UNKNOWN")
+            self.assertNotIn("dispatch", diagnostic)
+
+    def test_native_diagnostic_rejects_rebinding_mixed_finite_and_success_claims(self):
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        mutations = (
+            lambda v: v.update(run_id="other"),
+            lambda v: v.update(state="EXECUTING"),
+            lambda v: (v.update(recorder_state="RECORDING"), v["recorder_evidence"].update(state="RECORDING")),
+            lambda v: v.update(scene_binding={**v["scene_binding"], "revision": 8}),
+            lambda v: v["recorder_evidence"].update(run_id="other"),
+            lambda v: v["recorder_evidence"].update(state="COMMITTED"),
+            lambda v: v["execution_evidence"].update(learned_execution={}),
+            lambda v: v["execution_evidence"].update(learned_history=[]),
+            lambda v: v["execution_evidence"]["native_stream"].update(task_outcome="PASS"),
+            lambda v: v["execution_evidence"]["native_stream"].update(reference_consumed_count=True),
+            lambda v: v["plan_envelope"]["plan"]["policy"]["checkpoint"].update(tree_digest=canonical_digest("different")),
+        )
+        for mutate in mutations:
+            lifecycle = self.retained_lifecycle()
+            mutate(lifecycle)
+            with self.subTest(lifecycle=lifecycle), self.assertRaises(ContractError):
+                build_run_diagnostic(lifecycle)
+
+    def test_native_diagnostic_is_not_a_collection_failure_analysis(self):
+        from tools.data_factory.collection_recommendation import _analysis_ref, _current_rollout_condition, _rollout_condition
+        from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
+        lifecycle = self.retained_lifecycle()
+        diagnostic = build_run_diagnostic(lifecycle)
+        reference = {"availability": "AVAILABLE", "schema_version": diagnostic["schema_version"],
+                     "analysis_id": diagnostic["run_id"], "analysis_digest": canonical_digest(diagnostic),
+                     "reason_codes": []}
+        with self.assertRaisesRegex(ContractError, "COLLECTION_RECOMMENDATION_ROLLOUT_OWNER"):
+            _analysis_ref(reference, owner="rollout", artifact=lifecycle, normalize=False)
+        with self.assertRaisesRegex(ContractError, "COLLECTION_RECOMMENDATION_ROLLOUT_OWNER"):
+            _current_rollout_condition({}, {}, lifecycle, None)
+        with self.assertRaisesRegex(ContractError, "COLLECTION_RECOMMENDATION_ROLLOUT_OWNER"):
+            _rollout_condition({}, lifecycle)
+
     def test_builds_detached_static_native_task_identity(self):
         source, settings, scene = source_program(), policy(), scene_binding()
         plan = build_stream_plan("normal-run-1", source, scene, settings)

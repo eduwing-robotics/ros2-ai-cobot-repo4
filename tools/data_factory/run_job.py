@@ -2757,8 +2757,12 @@ def run_learned_plan_only(payload, cancel, publish, *, checkpoint, observation=N
 
 def learned_run_diagnostic(result, *, payload=None):
     """Derive the diagnostic; a live caller retains its source in the owned run."""
+    from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA
     evidence = result.get("execution_evidence")
-    if not isinstance(evidence, dict) or "learned_execution" not in evidence:
+    envelope = result.get("plan_envelope")
+    plan = envelope.get("plan") if isinstance(envelope, dict) else None
+    native = isinstance(plan, dict) and plan.get("schema_version") == PLAN_SCHEMA
+    if not native and (not isinstance(evidence, dict) or "learned_execution" not in evidence):
         return None
     from tools.data_factory.rollout.evidence_boundary import build_run_diagnostic
     diagnostic = build_run_diagnostic(result)
