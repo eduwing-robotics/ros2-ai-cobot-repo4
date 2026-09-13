@@ -1503,6 +1503,24 @@ class FinitePlanTest(unittest.TestCase):
         self.assertNotIn(("recorder", "commit"), calls)
         handles[1].cancel_goal_async.assert_not_called()
 
+    def test_arm_streaming_during_active_gripper_is_observation_not_completion(self):
+        # Actual existing action consumer, synthetic controller telemetry only.
+        job, executor, transport, state, now, sent, handles, _ = self.make_pending_held_job()
+        active, deadline = transport._active, transport._active.deadline
+        state["hardware_override"]["arm_resumed"] = 1.
+        with mock.patch('tools.data_factory.motion.moveit_transport.time.time', side_effect=lambda: now[0]):
+            for _ in range(3):
+                self.assertEqual(job.poll()["state"], "EXECUTING")
+                self.assertIs(transport._active, active)
+                self.assertEqual(transport._active.deadline, deadline)
+                self.assertTrue(transport.owns_active_goal)
+                self.assertEqual(len(sent), 2)
+            state["hardware_override"] = {}
+            self.assertEqual(job.poll()["state"], "EXECUTING")
+            self.assertEqual(len(sent), 3)  # Only completed-generation evidence advances.
+        self.assertEqual(transport._gripper_goal_count, 1)
+        handles[1].cancel_goal_async.assert_not_called()
+
     def test_pending_hardware_faults_are_not_retryable_waits(self):
         cases = [({"stopped": 1.}, "LEARNED_HARDWARE_UNRESOLVED"),
                  ({"error": -1.}, "LEARNED_HARDWARE_UNRESOLVED"),
@@ -2595,6 +2613,78 @@ class FinitePlanTest(unittest.TestCase):
                 self.assertEqual(executor._execution_data(executor.runs["run"])["scene_transition"], historical)
                 self.assertEqual(learned_run_diagnostic(result)["task_effectiveness"], "UNKNOWN")
 
+    def test_zero_dispatch_cancel_preserves_real_scene_bytes_and_foreign_revision(self):
+        from tools.data_factory.scene_state import SceneStateStore
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign), tempfile.TemporaryDirectory() as directory:
+                store = SceneStateStore(directory, "fr5-lab-a")
+                store.update_object(instance_id="cube-1", object_profile_id="cube", state="ON_SURFACE",
+                    source="HUMAN", updated_by="synthetic-operator",
+                    pose={"place_id": "PLACE_A", "yaw_deg": 0., "x_mm": 10., "y_mm": 20.})
+                job, executor, transport, cell, _, _, calls = self.make_job(scene_store=store)
+                self.assertTrue(job.approve(APPROVAL)["ok"])
+                self.assertTrue(job.start()["ok"])
+                self.assertEqual(job.poll()["state"], "PRECONTACT_HUMAN")
+                self.assertIs(executor.runs["run"]["execution"]["motion_dispatch_attempted"], False)
+                if foreign:
+                    store.update_object(instance_id="cube-1", object_profile_id="cube", state="ON_SURFACE",
+                        source="HUMAN", updated_by="another-operator", expected_revision=store.read()["revision"],
+                        pose={"place_id": "PLACE_A", "yaw_deg": 30., "x_mm": 40., "y_mm": 50.})
+                before = store._path().read_bytes()
+                job.cancel()
+                self.assertEqual(store._path().read_bytes(), before)
+                self.assertEqual(transport.sent, [])
+                self.assertEqual(transport.cancel_count, 0)
+                self.assertFalse(cell.ready)
+                # The zero-dispatch fault must not be followed by a late send.
+                with self.assertRaisesRegex(ContractError, "ROS_EXEC_CANCELLED"):
+                    executor._start_phase(executor.runs["run"], {})
+                self.assertEqual(transport.sent, [])
+                self.assertIs(executor.runs["run"]["execution"]["motion_dispatch_attempted"], False)
+                data = executor._execution_data(executor.runs["run"])
+                self.assertEqual(data["scene_preservation"]["reason_code"], "NO_DISPATCH")
+                self.assertEqual(data["scene_preservation"]["status"], "NOT_UPDATED")
+                self.assertNotIn("scene_transition", data)
+                self.assertNotIn(("recorder", "commit"), calls)
+
+    def test_transport_exception_without_ack_is_not_zero_dispatch_evidence(self):
+        for record_send in (False, True):
+            with self.subTest(record_send=record_send):
+                job, executor, transport, _, scene, _, _ = self.start_job()
+                def failed_start(step, **options):
+                    if record_send:
+                        transport.sent.append(copy.deepcopy(step))
+                    raise RuntimeError("send/response ambiguity")
+                transport.start_phase = failed_start
+                self.assertFalse(job.confirm("operator")["ok"])
+                self.assertIs(executor.runs["run"]["execution"]["motion_dispatch_attempted"], True)
+                self.assertEqual(len(transport.sent), int(record_send))
+                self.assertEqual([item["state"] for item in scene.updates], ["UNKNOWN"])
+                self.assertNotIn("scene_preservation", executor._execution_data(executor.runs["run"]))
+
+    def test_missing_dispatch_history_does_not_preserve_scene(self):
+        job, executor, transport, _, scene, _, _ = self.start_job()
+        executor.runs["run"]["execution"].pop("motion_dispatch_attempted")
+        job.cancel()
+        self.assertEqual(transport.sent, [])
+        self.assertEqual([item["state"] for item in scene.updates], ["UNKNOWN"])
+
+    def test_next_output_preserves_prior_dispatch_on_presend_failure(self):
+        job, executor, transport, _, scene, _, _ = self.start_job()
+        self.assertTrue(job.confirm("operator")["ok"])
+        self.assertEqual(job.poll()["state"], "LEARNED_CHUNK_COMPLETE")
+        self.assertTrue(job.prepare_next_learned(self.next_raw_program(job))["ok"])
+        self.assertTrue(job.approve_next_learned({**APPROVAL, "approval_id": "next"})["ok"])
+        def fail_before_next_send(run):
+            self.assertIs(run["execution"]["motion_dispatch_attempted"], True)
+            executor._fault(run, "SYNTHETIC_PRESEND_FAILURE")
+            return run["state"]
+        with mock.patch.object(executor, "_start_current_step", side_effect=fail_before_next_send):
+            self.assertFalse(job.start_next_learned()["ok"])
+        self.assertEqual(len(transport.sent), 1)
+        self.assertEqual([item["state"] for item in scene.updates], ["UNKNOWN"])
+        self.assertNotIn("scene_preservation", executor._execution_data(executor.runs["run"]))
+
     def test_scene_transition_conflict_or_write_failure_cannot_publish_a_snapshot(self):
         from tools.data_factory.scene_state import SceneStateStore
         for conflict in (True, False):
@@ -3351,8 +3441,13 @@ class FinitePlanTest(unittest.TestCase):
         native.prepare_contact_transition = RosMoveItTransport.prepare_contact_transition.__get__(native)
         self.assertTrue(job.admit_task(task_grant(job._program["source_program"],SCENE,job._program["learned_proposal"]))["ok"])
         with mock.patch('tools.data_factory.motion.moveit_transport.time.time',side_effect=lambda:now[0]):
-            self.assertEqual(job.start()["code"], "CONTACT_PROFILE_UNAVAILABLE")
+            result = job.start()
+            self.assertEqual(result["code"], "CONTACT_PROFILE_UNAVAILABLE")
         self.assertEqual(sent, [])
+        self.assertIs(executor.runs["run"]["execution"]["motion_dispatch_attempted"], False)
+        self.assertEqual(executor.scene_state_store.updates, [])
+        self.assertEqual(result["execution_evidence"]["scene_preservation"]["reason_code"], "NO_DISPATCH")
+        self.assertNotIn("scene_transition", result["execution_evidence"])
 
     def test_closure_centering_envelope_contains_source_geometry_counterexample(self):
         from tools.data_factory.motion.contact_transition import prepare, lateral_envelope

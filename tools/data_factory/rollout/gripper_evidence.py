@@ -324,10 +324,16 @@ def check_hardware(evidence, now, steady_now, max_age_s, *, completion=False, al
             raise ContractError("LEARNED_HARDWARE_UNRESOLVED")
         unresolved = (wire["pending"] or wire["rpc_active"] or not wire["arm_resumed"]
                       or wire["active_generation"])
-        pending = (allow_pending and not completion and unresolved and not wire["arm_resumed"]
+        # Pending progress is not completion and need not suppress the ARM
+        # producer. Its native availability flag can be true between gripper
+        # RPCs while the same gripper generation remains active.
+        pending = (allow_pending and not completion and unresolved
                    and wire["generation"] > 0 and wire["completed_generation"] < wire["generation"]
                    and wire["active_generation"] in (0, wire["generation"])
-                   and (wire["pending"] or wire["rpc_active"] or wire["active_generation"]))
+                   and (wire["pending"] or wire["rpc_active"] or wire["active_generation"])
+                   and (not wire["arm_resumed"] or (
+                       not wire["pending"] and not wire["rpc_active"]
+                       and wire["active_generation"] == wire["generation"])))
         if unresolved and not pending:
             raise ContractError("LEARNED_HARDWARE_UNRESOLVED")
         now, steady_now = number(now), number(steady_now)

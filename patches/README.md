@@ -24,11 +24,12 @@ qualified exact-plan test consumption remain open. No previously qualified
 Source review limits this candidate to one gripper command in an isolated
 exercise. Removing the pause exposes a worker handoff interval between taking
 the pending target and publishing RPC/active-generation state; repeated target
-updates are not qualified. The current `check_hardware(allow_pending=True)` also
-rejects an active gripper generation with `arm_resumed=1`. Under the candidate,
-that flag describes an unpaused ARM producer, not a successful post-gripper
-`ServoMoveStart` acknowledgement. Do not falsify either field to satisfy the old
-consumer. Normal integration must separate these responsibilities first.
+updates are not qualified. Under the candidate, `arm_resumed=1` describes an
+unpaused ARM producer, not a successful post-gripper `ServoMoveStart`
+acknowledgement. `check_hardware(allow_pending=True)` can observe that state
+between RPCs while the same incomplete gripper generation remains active;
+ordinary readiness and completion checks still reject it. This observation-only
+distinction does not authorize concurrent commands or qualify the candidate.
 
 `fairino-cpp-sdk-2.3.7.patch` is an **unqualified, opt-in SDK candidate** against
 [FAIRINO's v2.3.7-3.9.7 source](https://github.com/FAIR-INNOVATION/fairino-cpp-sdk/tree/0553c35d760a4e76c9b8d2fc0208ca83e6d731cd).

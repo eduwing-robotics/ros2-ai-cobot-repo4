@@ -130,6 +130,30 @@ class CurrentBracketTest(unittest.TestCase):
         old["wire"]["version"] = 3
         check_hardware(archived, evidence["captured_at_s"], evidence["captured_monotonic_s"], .08)
 
+    def test_pending_gripper_observation_does_not_require_arm_suppression(self):
+        packet, policy = self.packet()
+        evidence = self.evidence(packet, policy)
+        wire = evidence["snapshot"]["gripper_controller"]["hardware_execution"]["wire"]
+        wire.update(pending=0, rpc_active=0, active_generation=1,
+                    completed_generation=0, completion_reason=0, arm_resumed=1)
+        at, mono = evidence["captured_at_s"], evidence["captured_monotonic_s"]
+        original = copy.deepcopy(evidence)
+        self.assertEqual(check_hardware(evidence, at, mono, .08, allow_pending=True), wire)
+        self.assertEqual(evidence, original)
+        # Progress observation is neither admission readiness nor completion.
+        for options in ({}, {"allow_pending": True, "completion": True}):
+            with self.subTest(options=options), self.assertRaises(ContractError):
+                check_hardware(evidence, at, mono, .08, **options)
+        for changed in ({"active_generation": 2}, {"completed_generation": 1},
+                        {"completion_reason": 1}, {"error": -5}, {"stopped": 1},
+                        {"pending": 1}, {"rpc_active": 1}):
+            candidate = copy.deepcopy(evidence)
+            candidate["snapshot"]["gripper_controller"]["hardware_execution"]["wire"].update(changed)
+            with self.subTest(changed=changed), self.assertRaises(ContractError):
+                check_hardware(candidate, at, mono, .08, allow_pending=True)
+        with self.assertRaisesRegex(ContractError, "LEARNED_HARDWARE_STALE"):
+            check_hardware(evidence, at+.1, mono+.1, .08, allow_pending=True)
+
     def test_actual_worker_same_integer_endpoint_keeps_distinct_direction_tuple(self):
         from tools.data_factory.rollout.gripper_evidence import native_close_equivalence
         required = {"command_position_m":.01176,"velocity_percent":20,"force_percent":20}

@@ -316,6 +316,18 @@ class CoherentSnapshotTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(self.packet(mode)["arm_sends"], 0)
 
+    def test_coherent_pending_observation_is_not_completion_or_readiness(self):
+        evidence, now, steady = self.evidence(self.packet("normal"))
+        wire = evidence["snapshot"]["gripper_controller"]["hardware_execution"]["wire"]
+        # Replay the overlap candidate's between-RPC progress state over the
+        # actual SDK/native/ROS v5 sample. No physical overlap is claimed.
+        wire.update(generation=1, active_generation=1, completed_generation=0,
+                    completion_reason=0, pending=0, rpc_active=0, arm_resumed=1)
+        self.assertEqual(check_hardware(evidence, now, steady, .08, allow_pending=True), wire)
+        for options in ({}, {"completion": True, "allow_pending": True}):
+            with self.subTest(options=options), self.assertRaises(ContractError):
+                check_hardware(evidence, now, steady, .08, **options)
+
     def test_python_rejects_mixed_frame_epoch_and_fake_source_progress(self):
         import copy
         from tools.data_factory.rollout.gripper_evidence import check_transition

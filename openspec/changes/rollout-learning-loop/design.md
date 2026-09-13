@@ -448,6 +448,23 @@ future bounded overlap check must distinguish continued hold packets from actual
 ARM motion, RPC acknowledgement from gripper completion, and native rejection
 from application-inserted pause/restart.
 
+The shared hardware observation consumer must not require ARM suppression to
+recognize a still-active gripper generation. In its explicit pending-observation
+mode, an unpaused producer between RPCs is progress, not completion. Generation,
+source freshness, incarnation and faults remain checked; normal readiness and
+completion modes still reject incomplete gripper work. This does not introduce
+a concurrent-command authority or qualify the isolated overlap candidate.
+
+Scene uncertainty is not an automatic consequence of task failure. The sole
+executor preserves Scene bytes when its complete attempt history positively
+establishes that no transport dispatch was entered. It records
+`NOT_UPDATED/NO_DISPATCH`, leaves Cell blocked, and never restores an old bound
+snapshot over a newer Scene revision. Entering transport remains ambiguous even
+without an acceptance response; continuation preserves earlier dispatch history,
+and missing history cannot claim zero dispatch. Once motion may have occurred,
+this narrow correction does not assert that the object stayed put. Existing
+object-effect/outcome evidence or a new human observation must resolve that case.
+
 Terminal handling must retain the exact action result and the coherent native
 observation actually used to confirm completion. A fresh buffered sample is not
 necessarily ordered after that result. Existing v5 delivery/source-progress

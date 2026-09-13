@@ -1486,6 +1486,8 @@ class PickupExecutor:
                         next_execution[key] = execution[key]
                 next_execution.update(step_index=0, grasp_verdict=None, semantic_verdict=None, release_verdict=None,
                                       snapshot=None, active=False, terminal_phases=[])
+                # A new output does not erase earlier dispatch uncertainty.
+                next_execution["motion_dispatch_attempted"] = execution.get("motion_dispatch_attempted", True)
                 if contact is not None:
                     next_execution["prospective_contact"] = contact
                 task_authority = {key: run[key] for key in ("task_grant", "task_deadline", "task_revoked") if key in run}
@@ -1645,6 +1647,7 @@ class PickupExecutor:
                             raise
                         raise ContractError("CELL_STATE_ARMING_FAILED") from exc
                 run["execution"] = {"lease_id": payload["lease_id"], "lease_deadline": self.monotonic_clock() + run["plan"]["execution_timeouts_s"]["heartbeat_lease"], "step_index": 0, "grasp_verdict": None, "semantic_verdict": None, "release_verdict": None, "snapshot": None, "active": False, "scene_object": copy.deepcopy(item), "scene_state_digest": execution_scene_digest, "scene_revision": execution_scene_revision, "terminal_phases": [], "phase_event_sequence": 0}
+                run["execution"]["motion_dispatch_attempted"] = False
                 if parent_cell_binding is not None:
                     run["execution"]["parent_cell_binding"] = parent_cell_binding
                 if self.phase_events_root is not None:
@@ -1694,6 +1697,8 @@ class PickupExecutor:
             data["prospective_contact"] = copy.deepcopy(execution["prospective_contact"])
         if "terminal_verification" in execution:
             data["terminal_verification"] = copy.deepcopy(execution["terminal_verification"])
+        if "scene_preservation" in execution:
+            data["scene_preservation"] = copy.deepcopy(execution["scene_preservation"])
         if run.get("recycle_plan_digest") is not None:
             data["recycle_plan_digest"] = run["recycle_plan_digest"]
         if "learned_proposal" in run["plan"]:
@@ -1955,17 +1960,17 @@ class PickupExecutor:
                 self._emit_phase_event(run, "DISPATCH_REQUESTED", step, "REQUESTED", {"step": step})
                 if step["phase"] == "LEARNED_CHUNK":
                     self._check_learned_dispatch(run, deadlines, require_contact=True)
-                    self.transport.start_phase(resolved_step, cancel_event=run["cancel_event"], cancel_timeout_s=run["plan"]["execution_timeouts_s"]["cancel"],
+                    self._start_phase(run, resolved_step, cancel_event=run["cancel_event"], cancel_timeout_s=run["plan"]["execution_timeouts_s"]["cancel"],
                                                dispatch_guard=lambda: self._check_learned_dispatch(run, deadlines, require_contact=True), **options)
                     if run["state"] != "EXECUTING" or run["cancel_event"].is_set():
                         return run["state"]
                 else:
                     if "mechanical_terminal" in run:
-                        self.transport.start_phase(step, cancel_event=run["cancel_event"],
+                        self._start_phase(run, step, cancel_event=run["cancel_event"],
                             cancel_timeout_s=run["plan"]["execution_timeouts_s"]["cancel"],
                             dispatch_guard=lambda: self._check_mechanical_dispatch(run, step))
                     else:
-                        self.transport.start_phase(step)
+                        self._start_phase(run, step)
                 self._emit_phase_event(run, "GOAL_ACCEPTED", step, "ACCEPTED", {"accepted": True, "step": step})
         except Exception as exc:
             self._fault(run, exc.code if isinstance(exc, ContractError) else "SNAPSHOT_SCHEMA")
@@ -1973,6 +1978,17 @@ class PickupExecutor:
             if "_scene_dispatch_fault" in execution:
                 self._fault(run, execution["_scene_dispatch_fault"])
         return run["state"]
+
+    def _start_phase(self, run, step, **options):
+        # A fault before this boundary may already have retained the Scene on
+        # zero-dispatch evidence. Never let that faulted owner dispatch later.
+        cancel = run.get("cancel_event")
+        if run["state"] != "EXECUTING" or cancel is not None and cancel.is_set():
+            raise ContractError("ROS_EXEC_CANCELLED")
+        # Mark before entering transport: validation/send/ACK can raise, and a
+        # missing accepted handle never proves that no command reached hardware.
+        run["execution"]["motion_dispatch_attempted"] = True
+        return self.transport.start_phase(step, **options)
 
     def _fault(self, run, code):
         self._retire_observation_cache()
@@ -2039,7 +2055,19 @@ class PickupExecutor:
             if self.scene_state_store is not None and isinstance(item, dict):
                 scene_options = {"blocking": False} if "learned_proposal" in run["plan"] else {}
                 slot = binding.get("release_slot")
-                if slot is None or "learned_proposal" in run["plan"]:
+                if execution.get("motion_dispatch_attempted") is False:
+                    # No transport dispatch was entered in this execution or
+                    # its predecessors. Do not rewrite the observed object on
+                    # a configuration/admission failure. In particular, do not
+                    # restore our old snapshot over a foreign Scene revision.
+                    # This records no Scene write, not current pose validation.
+                    execution["scene_preservation"] = {
+                        "status": "NOT_UPDATED", "reason_code": "NO_DISPATCH",
+                        "object_instance_id": binding["object_instance_id"],
+                        "bound_scene_state_digest": execution.get("scene_state_digest", binding["scene_state_digest"]),
+                        "bound_scene_revision": execution.get("scene_revision", binding["revision"]),
+                    }
+                elif slot is None or "learned_proposal" in run["plan"]:
                     execution["scene_transition"] = self.scene_state_store.update_object(
                         instance_id=binding["object_instance_id"],
                         object_profile_id=item["object_profile_id"],
@@ -2176,11 +2204,11 @@ class PickupExecutor:
                             if "mechanical_terminal" in run:
                                 with self._learned_dispatch_scene(run):
                                     self._capture_mechanical_illumination(run)
-                                    self.transport.start_phase(continued_step, cancel_event=run["cancel_event"],
+                                    self._start_phase(run, continued_step, cancel_event=run["cancel_event"],
                                         cancel_timeout_s=run["plan"]["execution_timeouts_s"]["cancel"],
                                         dispatch_guard=lambda: self._check_mechanical_dispatch(run, continued_step))
                             else:
-                                self.transport.start_phase(continued_step)
+                                self._start_phase(run, continued_step)
                         except Exception as exc:
                             self._fault(
                                 run,
