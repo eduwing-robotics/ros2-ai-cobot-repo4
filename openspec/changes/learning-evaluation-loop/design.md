@@ -335,3 +335,54 @@ The completed 12k diagnosis was followed by a bounded read-only source audit, re
 All 24 heldout observations were matched to the nearest same-task row among all 22,299 TRAIN rows by six-joint absolute-position Euclidean distance. The ten q=.5/.9 observations in episodes 35–39 remain 14.726–20.244° away, versus 0.754–1.948° for their five q=.1 observations. These are configuration distances, not per-joint errors or semantic phases. Across 7,301 provenance rows (episodes 30–39), no state/reference bracket excludes its target; episode 34/35 J6 reference-minus-state maxima are under 1°. Physical calibration, historical executable identity and visual/XY/yaw confounding remain unresolved.
 
 Next discriminating proposal: separately admitted missing-condition coverage with varied XY and both instructions, compared with matched-update existing-data continuation, while retaining the original heldout and processors. Do not promote heldout episodes into TRAIN or launch collection/training under this analysis authority. No GPU, evaluator edit, dataset mutation or physical effect was used. Local helper assertions checked row/match counts and source hashes before/after; no full regression was repeated.
+
+## Candidate research: convergence is not coverage (September 13)
+
+This is independent, bounded research preparation, not a new Rollout gate or
+replacement for the open learned Pick → release/reset → diagnosis → targeted
+Collection acceptance. The Thin handoff preserved D software preparation under
+`.agent-local/work/lerobot-fr5/owner-20260913/research-software-prep/`; it performed
+zero model loads/NFE. Its raw26/10k inputs are historical, not automatically the
+right cohort for the current rhythm40/12k question. S and D utility are UNKNOWN.
+
+Keep two hypotheses separate, never a weighted uncertainty score:
+
+- **S:** a cheap TRAIN-only representation-distance support proxy can order
+  existing physical coverage strata. Reuse frozen native representations and
+  begin with a prototype or kNN distance, not a learned uncertainty estimator.
+  Physical metadata is evaluation-only, never a new policy input. Use only strata
+  that existing artifacts actually support; leave unavailable groups UNKNOWN.
+- **D:** a same-endpoint coarse/refined solver defect can predict the effect of
+  additional numerical refinement on identical observation/noise. Count all
+  actual neural evaluations, including measurement overhead. Keep native fixed10
+  as a behavioral reference and check that a higher-NFE numerical reference is
+  itself sufficiently resolved; neither reference establishes task correctness.
+
+Use existing TRAIN/EVAL splits, saved processors and analysis paths. Exclude
+self-neighbors when checking TRAIN support; preserve episode/session dependence,
+task/time-fraction and visual confounding rather than claiming every frame is
+an independent trial. Do not equate S with true data sufficiency or D with policy
+confidence. Freeze selection and comparison before inspecting results.
+
+First work may inspect sources, prepare small scripts and run pure CPU checks in
+parallel with product implementation. Model experiments use one explicitly
+allocated process with bounded observations/output, no concurrent model owners,
+new weights, dataset copies or manual measurement campaign. Actual runtime
+readiness and available RAM/disk must be checked at allocation. Do not defer
+independent software work merely because GPU use is unavailable.
+
+Stop S if useful separation is absent and rescuing it requires learned estimators
+or new labeling. Stop D if defect does not predict reference discrepancy or its
+measurement cost defeats the intended saving. Keep either useful branch alone;
+negative results do not authorize infrastructure expansion. Only if both survive
+independently, examine their joint distribution without forcing four quadrants.
+Scheduler, runtime support veto and recollection integration remain deferred
+until those results justify them; poor support alone does not prove that extra
+compute is useless. No new Router, telemetry or benchmark framework is required.
+
+Portfolio interpretation follows the same evidence path: clearly separate the
+working data engine, the candidate S/D idea and measured positive/partial/negative
+results. A later joint support/defect plot is useful only if it represents real
+matched observations. Preserve source/data/model/split/noise provenance so the
+same evidence can be reinterpreted as the product evolves without rebuilding a
+parallel presentation dataset or claiming unmeasured runtime benefit.
