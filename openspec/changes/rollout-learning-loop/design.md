@@ -350,3 +350,37 @@ The normal advice choice re-reads evidence and the normal compiler consumes the
 same paired draft. No semantic classification, Scene writes, execution, data
 mutation or approval authority is added. A failed finite chunk remains a reviewed
 re-demonstration hypothesis with unknown complete-task effect and data deficit.
+
+## Opening-coordinate model: bounded qualification transfer (2026-09-13)
+
+The `opening-coordinate-r001` A/B motion qualifications reuse their respective
+`demonstration-rhythm-r001` predecessors' unchanged physical scope. Their
+`qualified_at` is this compatibility assessment time, **not a new physical trial**.
+The selected successor is `fairino5_v6_gripper_opening_r001.urdf`
+(`sha256:6a56a1b42bd52e4a341e90ded1511cd2d16c1bc1bdfb89454a6a38e06f946a9e`),
+bound through `fr5-lab-a-tcp-r002-home-r002-opening-coordinate`. Original model,
+home, qualifications, data, saved processors and checkpoints remain unchanged.
+
+Basis: the native CPU replacement checks establish exactly four fingertip
+origin/axis changes, unchanged arm/TCP, limits, jaw midpoint and collision-box
+dimensions, and unchanged raw command/feedback coordinates. The existing
+`collection-production-rhythm-ab-r5-campaign-0001-run-1-e12`, `e13`, `e14`
+episode ledgers were reopened and validated: COMPLETE, LANDED, semantic PASS;
+close command `0.01176 m`, contact and post-lift feedback `0.01197–0.01218 m`.
+Their ledger digests respectively are
+`sha256:cb4fa0cc2eb6fbbb2e77c9b04af77993420a234f7e2217e9f15d04584250fb02`,
+`sha256:30a1cfad579bae70f7c4e3607569289b5896f19a035de82cec87f16fb0165037`,
+`sha256:993cb1b9336eeb627f17a8752f64d3b8c48b85706f6139b5c1bd429b1a5fb29a`.
+The original staged-release `gripper-staged-release-20260903-r002` evidence
+also records separate 60% then 100% opening commands with a 0.579 s hold.
+This supports reusing the unchanged 24 mm grasp, feedback band, force/velocity,
+release timing and arm-home recipe; no repeated Collection or aperture survey
+is required solely to correct the model's reversed coordinate expression.
+
+Historical collision verdicts do **not** transfer. Every new plan still uses
+the exact selected model and current Scene/hardware/collision admission through
+the sole executor. Calculated jaw gaps are not new measured aperture evidence;
+arbitrary learned contact, attachment/slip and complete Pick outcome remain
+UNKNOWN until observed. The inactive candidate and its `TEST_ONLY_PLAN_ONLY`
+trial API stay non-executable: normal model selection and newly bound plans
+consume these successor qualifications, never a live trial bypass.

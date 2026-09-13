@@ -52,6 +52,50 @@ def finger_geometry(root, q):
 
 
 class RobotModelReplacementTest(unittest.TestCase):
+    def test_successor_qualifications_resolve_normal_contact_without_trial_bypass(self):
+        from tools.data_factory.run_job import resolve_inputs
+        from tools.data_factory.motion.contact_transition import prepare
+        config = ROOT / "config/data_factory"
+        model = ORIGINAL.with_name("fairino5_v6_gripper_opening_r001.urdf")
+        self.assertEqual(ET.tostring(ET.parse(model).getroot()),
+                         ET.tostring(ET.parse(CANDIDATE).getroot()))
+        home = config / "home_candidates/fr5-lab-a-tcp-r002-home-r002-opening-coordinate.json"
+        home_value = json.loads(home.read_text())
+        result = validate_home_candidate(home_value, urdf=model,
+            expected_robot_system_id=home_value["robot_system_id"])
+        self.assertFalse(result["motion_allowed"])
+        preset = json.loads((config / "motion_presets/demonstration-rhythm-r001.json").read_text())
+        for side, calibration in (("a", "place-a-yaw0-r003"), ("b", "place-b-yaw0-r001")):
+            with self.subTest(side=side):
+                prefix = f"fr5-place-{side}-wood-cube-24mm-r001-demonstration-rhythm-r001"
+                old_path = config / "motion_qualifications" / (prefix + ".json")
+                new_path = old_path.with_name(prefix + "-opening-coordinate-r001.json")
+                old, new = json.loads(old_path.read_text()), json.loads(new_path.read_text())
+                self.assertEqual({k for k in old if old[k] != new[k]}, {
+                    "motion_qualification_id", "home_candidate_digest", "robot_description_digest", "qualified_at"})
+                self.assertEqual(new["qualification_status"], "QUALIFIED")
+                self.assertEqual(new["home_candidate_digest"], canonical_digest(home_value))
+                cell = json.loads((config / "cells" / (calibration + ".json")).read_text())
+                job = json.loads((config / "jobs/center-live-24mm-20260903-r002.job.json").read_text())
+                job.update(place_id=cell["place_id"], cell_calibration_id=calibration,
+                           sheet_manifest_digest=cell["yaw0_manifest_digest"])
+                sheet = config / "workspace_sheets" / (calibration + "_yaw0_sheet.json")
+                payload = dict(job=job, config_root=str(config), selected_sheet=str(sheet), yaw0_sheet=str(sheet),
+                    motion_qualification=str(new_path), home_candidate=str(home), urdf=str(model),
+                    expected_robot_system_id=job["robot_system_id"], run_id="cpu-coordinate-binding",
+                    motion_preset={"id": preset["motion_preset_id"], "digest": canonical_digest(preset)})
+                # Pure normal resolver; synthetic scene projection, no store or process.
+                _, source, scene = resolve_inputs(payload, scene_binding_call=lambda *_: {})
+                self.assertNotIn("robot_model_trial", source)
+                pose = {k: job[k] for k in ("place_id", "x_mm", "y_mm", "yaw_deg")}
+                contact = prepare(SimpleNamespace(_robot_description=model.read_text(), contact_config_root=config),
+                    {"learned_source_program": source, "scene_binding": scene},
+                    {"state": "ON_SURFACE", "object_profile_id": job["object_profile_id"], "pose": pose})
+                self.assertEqual(contact["status"], "PROSPECTIVE")
+                self.assertEqual(contact["qualification"], new)
+                with self.assertRaisesRegex(ContractError, "HOME_ROBOT_BINDING"):
+                    resolve_inputs({**payload, "urdf": str(ORIGINAL)}, scene_binding_call=lambda *_: {})
+
     def test_place_a_contact_sheet_resolves_existing_calibration_identity(self):
         from tools.data_factory.motion.contact_transition import bound_document
         config = ROOT / "config/data_factory"

@@ -1,0 +1,36 @@
+{
+  "schema_version": "data_factory.home_candidate.v1",
+  "home_candidate_id": "fr5-lab-a-tcp-r002-home-r002-opening-coordinate",
+  "robot_system_id": "fr5-lab-a-tcp-r002",
+  "robot_model_name": "fairino5_v6_robot",
+  "robot_description_digest": "sha256:6a56a1b42bd52e4a341e90ded1511cd2d16c1bc1bdfb89454a6a38e06f946a9e",
+  "joint_order": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6"
+  ],
+  "ui_observation_deg": [
+    -89.913,
+    -90.001,
+    90,
+    -90,
+    -90,
+    0
+  ],
+  "nominal_target_deg": [
+    -90,
+    -90,
+    90,
+    -90,
+    -90,
+    0
+  ],
+  "observation_source": "controller_web_ui",
+  "feedback_capture_status": "NOT_CAPTURED",
+  "qualification_status": "CANDIDATE",
+  "safety_status": "NOT_SAFE_FOR_MOTION",
+  "intended_use_after_qualification": "SAFE_POSE_PTP"
+}

@@ -1,0 +1,198 @@
+{
+  "cell_calibration_id": "place-b-yaw0-r001",
+  "datum_to_tcp_grasp": {
+    "rotation_columns": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ],
+      [
+        0,
+        0,
+        -1
+      ]
+    ],
+    "translation_m": [
+      0,
+      0,
+      0.0085
+    ]
+  },
+  "execution_timeouts_s": {
+    "cancel": 3,
+    "grasp_verdict": 120,
+    "heartbeat_lease": 1,
+    "precontact_confirmation": 120,
+    "semantic_verdict": 120
+  },
+  "frames": {
+    "planning_frame": "base_link",
+    "planning_group": "fairino5_v6_group",
+    "tool_link": "wrist3_link"
+  },
+  "goal_tolerances": {
+    "joint_rad": 0.01,
+    "orientation_rad": 0.01,
+    "position_m": 0.001
+  },
+  "grasp_profile_id": "wood-cube-24mm-top-3p5mm-r001",
+  "gripper_positions_m": {
+    "closed": 0.01176,
+    "open": 0.021
+  },
+  "home_candidate_digest": "sha256:35a918a17d1ea797a54ed0717ae881c164473d7f9e4c52bb5f419c785b8fad18",
+  "max_joint_state_age_s": 0.1,
+  "motion_preset": {
+    "digest": "sha256:5d3554243186318dad386b46cb92bf1c3000da46aa22704b6fecb1e1c6059f73",
+    "id": "demonstration-rhythm-r001"
+  },
+  "motion_qualification_id": "fr5-place-b-wood-cube-24mm-r001-demonstration-rhythm-r001-opening-coordinate-r001",
+  "moveit_config_digest": "sha256:b5ad9867bf309c347fd2c92a8f7016359e2b7ea2f7ccc73d68ece1d9c326fef8",
+  "object_profile_id": "wood-cube-24mm-r001",
+  "offsets_m": {
+    "approach_stop": 0.02,
+    "lift": 0.04,
+    "pregrasp": 0.1,
+    "retreat": 0.1
+  },
+  "phase_limits": {
+    "APPROACH_STOP_LIN": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "FINAL_APPROACH_LIN": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "GRIPPER_CLOSE": {
+      "command_duration_s": 1,
+      "completion_tolerance_m": 0.00042000000000000023,
+      "execution_timeout_s": 15
+    },
+    "GRIPPER_OPEN": {
+      "command_duration_s": 1,
+      "completion_tolerance_m": 0.000211,
+      "execution_timeout_s": 15
+    },
+    "LIFT_LIN": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "LOWER_LIN": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "PREGRASP_PTP": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "RECYCLE_APPROACH_PTP": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "RETREAT_LIN": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    },
+    "SAFE_POSE_PTP": {
+      "acceleration_scaling": 0.1,
+      "execution_timeout_s": 20,
+      "planning_timeout_s": 5,
+      "velocity_scaling": 0.1
+    }
+  },
+  "planning_scene": {
+    "floor": {
+      "dimensions_m": [
+        2,
+        2,
+        0.05
+      ],
+      "id": "table_floor_conservative_r003",
+      "source": "controller_ui_tcp_crosscheck_minus_bound_24mm_top_3p5mm_grasp_plus_1mm_collision_margin",
+      "surface_z_m": -0.015646999999999998
+    },
+    "frame_id": "base_link",
+    "wall": {
+      "dimensions_m": [
+        2,
+        0.05,
+        2
+      ],
+      "home_arm_protrusion_base_xy": [
+        0,
+        1
+      ],
+      "id": "home_back_wall_candidate",
+      "j1_home_deg": -90,
+      "near_face_y_m": -0.3,
+      "wall_side": "opposite_home_arm_protrusion"
+    }
+  },
+  "planning_scene_digest": "sha256:2fe7a1110daf65213567263d655fcf9b8cd98610826a8533b012edd58d859b76",
+  "planning_scene_profile_digest": "sha256:b0b32db8326dc20af246b8627eff7224a2a61f1a043844d9ff4115c4f2965484",
+  "planning_scene_profile_id": "fr5-table-floor-wall-r003",
+  "profile_digests": {
+    "cell_calibration": "sha256:1ac9ae3daa196abf1dfc562a65bd023e19c35f29effc2f5817165fbc412bfd8e",
+    "grasp_profile": "sha256:d260ca29a2f70258f43d53e2127e0a5d307fef0fc7cbbadb093278391a509173",
+    "object_profile": "sha256:fd93d2fb05d9ddd05a040e823b2d2b31428a79a7ae7ce07a1ad8cf519c66489a",
+    "robot_system": "sha256:747d44b5e4fa63a9afb4408657964040cab9bfdf9046a8a6df216e0d0ee3b7ec"
+  },
+  "qualification_status": "QUALIFIED",
+  "qualified_at": "2026-09-13T16:54:46+09:00",
+  "qualified_safe_joint_positions_rad": [
+    -1.5707963267948966,
+    -1.5707963267948966,
+    1.5707963267948966,
+    -1.5707963267948966,
+    -1.5707963267948966,
+    0
+  ],
+  "robot_description_digest": "sha256:6a56a1b42bd52e4a341e90ded1511cd2d16c1bc1bdfb89454a6a38e06f946a9e",
+  "robot_system_id": "fr5-lab-a-tcp-r002",
+  "schema_version": "data_factory.motion_qualification.v3",
+  "tool_to_tcp": {
+    "rotation_columns": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ]
+    ],
+    "translation_m": [
+      0,
+      0,
+      0.249852939145247
+    ]
+  }
+}
