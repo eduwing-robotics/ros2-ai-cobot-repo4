@@ -65,6 +65,19 @@ bounded continuity question only; learned task success remains unproven.
   recovery accepts this initial prepare failure only with absent contact context
   and the retained prior correction chain. Combined model/launch/Scene/native
   continuation tests:21 PASS1.842s. Physical Pick remains UNKNOWN.
+  r6 passes model binding but rejects initial contact-scene readback before
+  dispatch. Actual native query matches floor/wall and cube geometry except
+  quaternion w `0.9513600693627325` vs `0.9513600693627324`.
+  Repair representation comparison with the existing1e-9 numerical convention,
+  not a new physical tolerance; retain exact shape/ownership/permission checks.
+  Artifacts: `outputs/data_factory/runs/learned-scoped-return-20260913-r6/` and
+  `.agent-local/work/lerobot-fr5/r6-planning-scene-readback.json`.
+  Integrated transport/Scene/native continuation checks:22 PASS1.121s,
+  including world/attachment perturbations and initial cleanup failures. Actual
+  saved three-object readback now passes CPU comparison; real motion is not
+  established by this check. Stopped r6's added collision object was removed
+  with exact before/after native readback; physical Scene continuity correction
+  retained the original HUMAN observation rather than a new acknowledgement.
 - [x] Correct native snapshot acquisition without extending freshness limits:
   `5f4b7ef` waits for original source stamps within the existing deadline
   (13 focused tests PASS0.672s; independent review found no issues). The opted-in

@@ -1304,14 +1304,15 @@ policy, plan or condition lineage.
 
 ### Requirement: Robot-model replacement preserves historical learning coordinates
 
-A stopped initial `CONTACT_PROFILE_UNAVAILABLE` or `CONTACT_MODEL_BINDING` attempt may correct its exact
+A stopped initial `CONTACT_PROFILE_UNAVAILABLE`, `CONTACT_MODEL_BINDING`, or
+`PLANNING_SCENE_MISMATCH` attempt may correct its exact
 erroneous UNKNOWN Scene write using retained canonical failure, preapproval and
 original observation evidence proving failure before the first dispatch. The
 correction SHALL preserve the original observation provenance, CAS the exact
 failed Scene/Cell, retain a correction receipt and restore readiness last. It
 SHALL NOT fabricate fresh human confirmation, apply to ambiguous or dispatched
 attempts, or replace the next run's current hardware/Scene/plan admission.
-For model binding, the retained prospective-contact context SHALL be absent:
+For model/scene binding, the retained prospective-contact context SHALL be absent:
 the same error after preparation is not eligible. A prior correction may supply
 continuity only through its exact retained, digest-checked receipt; preserve the
 original observation and chain that receipt rather than issuing a new human claim.
@@ -1341,6 +1342,14 @@ canonical equality of the entire model after separating its single native
 independent admission. The prepared contact context SHALL pin the actual expanded
 XML digest for subsequent consumers; a runtime model change SHALL still reject.
 This representation binding does not transfer historical collision verdicts.
+
+Native collision-object readback SHALL allow pose floating-point roundoff using
+the existing numerical comparison convention, including unit-quaternion sign
+equivalence. Object identity, frame, shape, dimensions, attachment ownership,
+touch links and collision permissions SHALL remain checked. This numerical
+comparison is not a physical contact/trajectory tolerance. Failed initial
+contact preparation SHALL retain any cleanup result without masking its primary
+error; cleanup removes only the just-added collision object, not physical state.
 
 #### Scenario: Corrected finger geometry retains a recorded opening command
 

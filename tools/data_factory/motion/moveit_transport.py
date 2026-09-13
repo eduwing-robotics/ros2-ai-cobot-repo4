@@ -177,7 +177,26 @@ class RosMoveItTransport:
         response = self._service(self._ApplyPlanningScene, "/apply_planning_scene", request, "PLANNING_SCENE_APPLY")
         if response.success is not True:
             raise ContractError("PLANNING_SCENE_APPLY")
-        self._read_mechanical_scene(source, released=obj)
+        try:
+            self._read_mechanical_scene(source, released=obj)
+        except ContractError as exc:
+            # Only this initial prepare owns the just-added world object. No
+            # motion was submitted; removing it does not restore physical Scene.
+            cleanup = {"status": "UNCONFIRMED", "scope": "COLLISION_WORLD_ONLY", "object_id": obj.id}
+            try:
+                removed = self._CollisionObject(id=obj.id, operation=self._CollisionObject.REMOVE)
+                removed.header.frame_id = obj.header.frame_id
+                cleanup_request = self._ApplyPlanningScene.Request()
+                cleanup_request.scene = self._PlanningScene(is_diff=True)
+                cleanup_request.scene.world.collision_objects = [removed]
+                cleanup_response = self._service(self._ApplyPlanningScene, "/apply_planning_scene", cleanup_request, "PLANNING_SCENE_APPLY")
+                if cleanup_response.success is not True:
+                    raise ContractError("PLANNING_SCENE_APPLY")
+                digest = self._read_mechanical_scene(source)
+                cleanup.update(status="REMOVAL_CONFIRMED", planning_scene_readback_digest=digest)
+            except Exception as cleanup_error:
+                cleanup["code"] = cleanup_error.code if isinstance(cleanup_error, ContractError) else "CONTACT_CLEANUP_UNCONFIRMED"
+            return {"status": "UNAVAILABLE", "code": exc.code, "collision_world_cleanup": cleanup}
         self._contact_world_object = obj
         return context
 
@@ -309,6 +328,29 @@ class RosMoveItTransport:
         return self._check_plan_collision({**terminal,"initial_joint_state":snapshot["joint_positions"],
             "steps":[step],"mechanical_terminal":True},snapshot["gripper_controller"]["feedback_position_m"])
 
+    @staticmethod
+    def _same_collision_object_readback(actual, expected):
+        """Allow only pose roundoff; all remaining ROS message fields stay exact."""
+        if len(actual.primitive_poses) != len(expected.primitive_poses):
+            return False
+        for a, b in zip([actual.pose, *actual.primitive_poses], [expected.pose, *expected.primitive_poses]):
+            position_a = [a.position.x, a.position.y, a.position.z]
+            position_b = [b.position.x, b.position.y, b.position.z]
+            qa = [a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w]
+            qb = [b.orientation.x, b.orientation.y, b.orientation.z, b.orientation.w]
+            # Same 1e-9 numerical convention as _apply_and_readback_scene,
+            # not a physical collision/position tolerance. Unit q and -q
+            # represent the same rotation; never normalize an invalid input.
+            if (any(not math.isfinite(v) for v in [*position_a, *position_b, *qa, *qb])
+                    or any(abs(x-y) > 1e-9 for x,y in zip(position_a, position_b))
+                    or any(abs(sum(v*v for v in q)-1) > 1e-9 for q in (qa, qb))
+                    or not any(all(abs(x-sign*y) <= 1e-9 for x,y in zip(qa, qb)) for sign in (1, -1))):
+                return False
+        compared = copy.deepcopy(actual)
+        compared.pose = copy.deepcopy(expected.pose)
+        compared.primitive_poses = copy.deepcopy(expected.primitive_poses)
+        return compared == expected
+
     def _read_mechanical_scene(self, source, attached=None, released=None):
         query = self._GetPlanningScene.Request()
         query.components = self._PlanningSceneComponents(components=(
@@ -324,13 +366,21 @@ class RosMoveItTransport:
         expected = self._planning_scene_objects(source["planning_scene"])
         if released is not None:
             expected.append(released)
+        expected_attached = [] if attached is None else [attached]
         if (len(scene.world.collision_objects) != len(expected)
                 or {obj.id for obj in scene.world.collision_objects} != {obj.id for obj in expected}
-                or list(scene.robot_state.attached_collision_objects) != ([] if attached is None else [attached])):
+                or len(scene.robot_state.attached_collision_objects) != len(expected_attached)):
             raise ContractError("PLANNING_SCENE_MISMATCH")
+        for actual, obj in zip(scene.robot_state.attached_collision_objects, expected_attached):
+            if not self._same_collision_object_readback(actual.object, obj.object):
+                raise ContractError("PLANNING_SCENE_MISMATCH")
+            compared = copy.deepcopy(actual)
+            compared.object = copy.deepcopy(obj.object)
+            if compared != obj:
+                raise ContractError("PLANNING_SCENE_MISMATCH")
         for obj in expected:
             actual = next(item for item in scene.world.collision_objects if item.id == obj.id)
-            if actual != obj:
+            if not self._same_collision_object_readback(actual, obj):
                 raise ContractError("PLANNING_SCENE_MISMATCH")
         return canonical_digest({"world":[str(obj) for obj in sorted(scene.world.collision_objects,key=lambda obj:obj.id)],
                                  "attached":[str(obj) for obj in scene.robot_state.attached_collision_objects]})

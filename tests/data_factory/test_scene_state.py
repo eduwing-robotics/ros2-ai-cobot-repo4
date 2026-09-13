@@ -20,11 +20,14 @@ class SceneStateTest(unittest.TestCase):
                       "history", "predecessor", "selected", "incarnation", "phase",
                       "preapproval", "canonical", "receipt_io", "scene_io", "cell_io",
                       "model", "model_null", "model_context", "model_history", "model_phase",
-                      "other_contact", "chain", "chain_tamper", "chain_missing"):
+                      "other_contact", "chain", "chain_tamper", "chain_missing",
+                      "scene_readback", "scene_readback_context", "scene_readback_phase"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
-                success = fault in (None, "model", "chain")
-                model_failure = str(fault).startswith(("model", "chain")) or fault == "other_contact"
+                success = fault in (None, "model", "chain", "scene_readback")
+                scene_failure = str(fault).startswith("scene_readback")
+                model_failure = str(fault).startswith(("model", "chain")) or fault == "other_contact" or scene_failure
                 failure = ("CONTACT_MODEL_GEOMETRY" if fault == "other_contact" else
+                           "PLANNING_SCENE_MISMATCH" if scene_failure else
                            "CONTACT_MODEL_BINDING" if model_failure else "CONTACT_PROFILE_UNAVAILABLE")
                 store = scene_state.SceneStateStore(directory, "fr5-lab-a")
                 initial = store.update_object(instance_id="cube", object_profile_id="cube-24mm",
@@ -71,7 +74,7 @@ class SceneStateTest(unittest.TestCase):
                         "snapshot":{"gripper_controller":{"hardware_execution":{"wire":wire,"clock_binding":clock}}}}}
                 if model_failure: result["execution_evidence"].pop("prospective_contact")
                 if fault == "model_null": result["execution_evidence"]["prospective_contact"] = None
-                if fault == "model_context": result["execution_evidence"]["prospective_contact"] = {"status":"PROSPECTIVE"}
+                if fault in ("model_context", "scene_readback_context"): result["execution_evidence"]["prospective_contact"] = {"status":"PROSPECTIVE"}
                 if fault == "chain_tamper": confirmation["after_cell"]["acknowledged_by"] = "forged"
                 if fault == "chain_missing": retained.rename(retained.with_suffix(".unavailable"))
                 if fault == "cell": store._cell.mark_blocked("OTHER_OWNER", "other", canonical_digest("other"))
@@ -83,7 +86,7 @@ class SceneStateTest(unittest.TestCase):
                 if fault == "predecessor": plan["learned_proposal"]["generation_context"]["predecessor_plan_digest"] = canonical_digest("prior")
                 if fault == "selected": wire["selected_valid"] = 1
                 if fault == "incarnation": wire["incarnation_0"] = 99
-                if fault in ("phase", "model_phase"): phase.write_text('{"event":"DISPATCH_REQUESTED"}\n')
+                if fault in ("phase", "model_phase", "scene_readback_phase"): phase.write_text('{"event":"DISPATCH_REQUESTED"}\n')
                 if fault == "preapproval": preapproval["plan_digest"] = canonical_digest("other")
                 before_scene, before_cell = copy.deepcopy(store.read()), store._cell.read()
                 original_observation = copy.deepcopy(initial["scene_state"]["objects"]["cube"])
@@ -115,7 +118,7 @@ class SceneStateTest(unittest.TestCase):
                         self.assertFalse(receipt["new_human_confirmation"])
                         self.assertFalse(receipt["execution_authorized"])
                         self.assertEqual(receipt["prior_confirmation_digest"], canonical_digest(confirmation))
-                        self.assertEqual(receipt["basis"], "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE" if model_failure
+                        self.assertEqual(receipt["basis"], "INITIAL_CONTACT_SCENE_REJECTION_BEFORE_START_PHASE" if scene_failure else "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE" if model_failure
                                          else "INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE")
                         self.assertEqual(json.loads(store._cell.runtime_path(writes[0]).read_text()), receipt)
                         self.assertEqual(writes[1:], ["scene_state.json", "state.json"])

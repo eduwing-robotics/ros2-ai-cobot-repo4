@@ -1,4 +1,5 @@
 import base64
+import copy
 import math
 import time
 import unittest
@@ -18,6 +19,145 @@ from tools.data_factory.motion.moveit_transport import RosMoveItTransport
 
 
 class TestExecutionTransport(unittest.TestCase):
+    def test_initial_contact_readback_failure_cleans_only_its_world_object(self):
+        from geometry_msgs.msg import Pose
+        from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningScene, PlanningSceneComponents
+        from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
+        from shape_msgs.msg import SolidPrimitive
+        for fault in (None, "initial_read_timeout", "remove_timeout", "remove_false", "partial", "extra_world", "attachment", "floor_changed", "verify_timeout"):
+            with self.subTest(fault=fault):
+                transport = object.__new__(RosMoveItTransport)
+                transport._CollisionObject, transport._SolidPrimitive, transport._Pose = CollisionObject, SolidPrimitive, Pose
+                transport._GetPlanningScene, transport._PlanningSceneComponents = GetPlanningScene, PlanningSceneComponents
+                transport._ApplyPlanningScene, transport._PlanningScene = ApplyPlanningScene, PlanningScene
+                source = {"planning_scene":{"frame_id":"base_link",
+                    "floor":{"id":"floor", "dimensions_m":[2.,2.,.05], "surface_z_m":0.},
+                    "wall":{"id":"wall", "dimensions_m":[2.,.05,2.], "near_face_y_m":-.3}}}
+                plan = {"steps":[{"held_target_segments":[{"type":"ARM"}]}],
+                        "learned_source_program":source, "scene_binding":{"object_instance_id":"cube"}}
+                context = {"dimensions_m":[.024]*3, "datum":{"translation_m":[.2,.5,.01],
+                           "rotation_columns":[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]}}
+                scene, calls = PlanningScene(), []
+                def service(kind, endpoint, request, code):
+                    calls.append((endpoint, copy.deepcopy(request)))
+                    if endpoint == "/apply_planning_scene":
+                        objects = request.scene.world.collision_objects
+                        if len(calls) == 1:
+                            scene.world.collision_objects = copy.deepcopy(objects)
+                            if fault == "extra_world": scene.world.collision_objects.append(transport._collision_object("foreign", [.1]*3, [0.]*3, "base_link"))
+                            if fault == "attachment": scene.robot_state.attached_collision_objects = [AttachedCollisionObject(link_name="foreign", object=CollisionObject(id="foreign"))]
+                            if fault == "floor_changed": scene.world.collision_objects[0].pose.position.z += .1
+                        else:
+                            self.assertEqual([(obj.id, obj.operation) for obj in objects], [("cube", CollisionObject.REMOVE)])
+                            self.assertEqual(list(request.scene.robot_state.attached_collision_objects), [])
+                            if fault == "remove_timeout": raise ContractError("SYNTHETIC_REMOVE_TIMEOUT")
+                            if fault == "remove_false": return SimpleNamespace(success=False)
+                            if fault != "partial": scene.world.collision_objects = [obj for obj in scene.world.collision_objects if obj.id != "cube"]
+                        return SimpleNamespace(success=True)
+                    if len(calls) == 2:
+                        if fault == "initial_read_timeout": raise ContractError("SYNTHETIC_INITIAL_READ_TIMEOUT")
+                        wrong = copy.deepcopy(scene)
+                        next(obj for obj in wrong.world.collision_objects if obj.id == "cube").pose.position.x += .001
+                        return SimpleNamespace(scene=wrong)
+                    if fault == "verify_timeout": raise ContractError("SYNTHETIC_VERIFY_TIMEOUT")
+                    return SimpleNamespace(scene=copy.deepcopy(scene))
+                transport._service = service
+                with mock.patch("tools.data_factory.motion.contact_transition.prepare", return_value=context):
+                    result = transport.prepare_contact_transition(plan, {}, first=True, deadline_s=100.)
+                self.assertEqual(result["status"], "UNAVAILABLE")
+                self.assertEqual(result["code"], "SYNTHETIC_INITIAL_READ_TIMEOUT" if fault == "initial_read_timeout" else "PLANNING_SCENE_MISMATCH")
+                cleanup = result["collision_world_cleanup"]
+                self.assertEqual(cleanup["scope"], "COLLISION_WORLD_ONLY")
+                self.assertEqual(cleanup["object_id"], "cube")
+                self.assertEqual(cleanup["status"], "REMOVAL_CONFIRMED" if fault in (None, "initial_read_timeout") else "UNCONFIRMED")
+                self.assertFalse(hasattr(transport, "_contact_world_object"))
+                self.assertEqual(sum(endpoint == "/apply_planning_scene" for endpoint, _ in calls), 2)
+                self.assertTrue({"floor", "wall"} <= {obj.id for obj in scene.world.collision_objects})
+                if fault == "extra_world": self.assertIn("foreign", [obj.id for obj in scene.world.collision_objects])
+                if fault == "attachment": self.assertEqual(len(scene.robot_state.attached_collision_objects), 1)
+
+    def test_mechanical_scene_readback_allows_only_pose_roundoff(self):
+        from geometry_msgs.msg import Pose
+        from moveit_msgs.msg import (AllowedCollisionEntry, AttachedCollisionObject, CollisionObject,
+                                     PlanningScene, PlanningSceneComponents)
+        from moveit_msgs.srv import GetPlanningScene
+        from shape_msgs.msg import Mesh, SolidPrimitive
+        transport = object.__new__(RosMoveItTransport)
+        transport._CollisionObject, transport._SolidPrimitive, transport._Pose = CollisionObject, SolidPrimitive, Pose
+        transport._GetPlanningScene, transport._PlanningSceneComponents = GetPlanningScene, PlanningSceneComponents
+        source = {"planning_scene":{"frame_id":"base_link",
+            "floor":{"id":"table_floor_conservative_r003", "dimensions_m":[2.,2.,.05], "surface_z_m":-.015647},
+            "wall":{"id":"home_back_wall_candidate", "dimensions_m":[2.,.05,2.], "near_face_y_m":-.3}}}
+        cube = transport._collision_object("production-object-cf77147bbba918083d03", [.024]*3,
+            [.2395916155781882, .5848593226212451, -.004652], "base_link")
+        # Exact r6 request/readback values: one double-precision ulp plus signed zero.
+        cube.primitive_poses[0].orientation.x = -0.
+        cube.primitive_poses[0].orientation.z = .30808118803675266
+        cube.primitive_poses[0].orientation.w = .9513600693627325
+        for held in (False, True):
+            for change in ("roundtrip", "sign", "position_roundoff", "position", "rotation", "nonunit", "nan", "inf",
+                           "shape", "dimensions", "frame", "id", "operation", "pose_count", "mesh", "subframe", "stamp",
+                           "extra_world", "missing_world", "duplicate_world", "extra_attachment", "touch_links", "link", "acm", "default_acm"):
+                if not held and change in {"touch_links", "link"}:
+                    continue
+                with self.subTest(held=held, change=change):
+                    expected = copy.deepcopy(cube)
+                    if held: expected.header.frame_id = "gripper_link"
+                    attached = AttachedCollisionObject(link_name="gripper_link", object=expected,
+                        touch_links=["finger_tip_left_link", "finger_tip_right_link"]) if held else None
+                    scene = PlanningScene()
+                    scene.world.collision_objects = transport._planning_scene_objects(source["planning_scene"])
+                    if held:
+                        scene.robot_state.attached_collision_objects = [copy.deepcopy(attached)]
+                        actual = scene.robot_state.attached_collision_objects[0].object
+                    else:
+                        scene.world.collision_objects.append(copy.deepcopy(expected))
+                        actual = scene.world.collision_objects[-1]
+                    actual.primitive_poses[0].orientation.x = 0.
+                    actual.primitive_poses[0].orientation.w = .9513600693627324
+                    if change == "sign":
+                        for orientation in (actual.pose.orientation, actual.primitive_poses[0].orientation):
+                            for key in ("x", "y", "z", "w"): setattr(orientation, key, -getattr(orientation, key))
+                    if change == "position_roundoff": actual.pose.position.x += 1e-12
+                    if change == "position": actual.pose.position.x += 2e-9
+                    if change == "rotation": actual.primitive_poses[0].orientation.x += 2e-9
+                    if change == "nonunit": actual.primitive_poses[0].orientation.w *= 2
+                    if change == "nan": actual.pose.position.x = math.nan
+                    if change == "inf": actual.primitive_poses[0].orientation.w = math.inf
+                    if change == "shape": actual.primitives[0].type = SolidPrimitive.SPHERE
+                    if change == "dimensions": actual.primitives[0].dimensions[0] += 1e-12
+                    if change == "frame": actual.header.frame_id = "other_frame"
+                    if change == "id": actual.id = "other_object"
+                    if change == "operation": actual.operation = CollisionObject.REMOVE
+                    if change == "pose_count": actual.primitive_poses.append(Pose())
+                    if change == "mesh": actual.meshes.append(Mesh())
+                    if change == "subframe": actual.subframe_names.append("extra")
+                    if change == "stamp": actual.header.stamp.sec = 1
+                    if change == "extra_world": scene.world.collision_objects.append(transport._collision_object("extra", [.1]*3, [0.]*3, "base_link"))
+                    if change == "missing_world": scene.world.collision_objects.pop(0)
+                    if change == "duplicate_world": scene.world.collision_objects.append(copy.deepcopy(scene.world.collision_objects[0]))
+                    if change == "extra_attachment": scene.robot_state.attached_collision_objects.append(AttachedCollisionObject(object=copy.deepcopy(expected)))
+                    if change == "touch_links": scene.robot_state.attached_collision_objects[0].touch_links.append("wrist3_link")
+                    if change == "link": scene.robot_state.attached_collision_objects[0].link_name = "wrist3_link"
+                    if change == "acm":
+                        scene.allowed_collision_matrix.entry_names = [cube.id]
+                        scene.allowed_collision_matrix.entry_values = [AllowedCollisionEntry(enabled=[True])]
+                    if change == "default_acm":
+                        scene.allowed_collision_matrix.default_entry_names = [cube.id]
+                        scene.allowed_collision_matrix.default_entry_values = [True]
+                    scene.world.collision_objects.reverse()
+                    untouched = copy.deepcopy(scene)
+                    transport._service = mock.Mock(return_value=SimpleNamespace(scene=scene))
+                    if change in {"roundtrip", "sign", "position_roundoff"}:
+                        self.assertTrue(transport._read_mechanical_scene(source, attached=attached,
+                            released=None if held else expected).startswith("sha256:"))
+                    else:
+                        with self.assertRaises(ContractError):
+                            transport._read_mechanical_scene(source, attached=attached, released=None if held else expected)
+                    # NaN is unequal to itself; ROS serialization padding is
+                    # not deterministic. The full message representation is.
+                    self.assertEqual(str(scene), str(untouched))
+
     def test_native_v5_live_snapshot_requests_latest_state_not_history(self):
         policy = dict(schema_version="fr5.gripper_temporal_policy.v2",
             incarnation=[1, 2, 3, 4], connection_epoch=1, configuration_epoch=0,

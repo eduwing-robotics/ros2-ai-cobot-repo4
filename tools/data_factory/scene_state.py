@@ -239,12 +239,13 @@ class SceneStateStore:
             trace = diagnostic["execution_trace"]
             binding = validate_scene_binding(plan["scene_binding"])
             failure = result["code"]
-            # A MODEL_BINDING failure in before()/consume() is not eligible:
+            # A model/scene binding failure in before()/consume() is not eligible:
             # those paths already have a retained prospective_contact context.
             prepare_failed = (
                 failure == "CONTACT_PROFILE_UNAVAILABLE"
                 and evidence.get("prospective_contact") == {"status": "UNAVAILABLE", "code": failure}
-            ) or (failure == "CONTACT_MODEL_BINDING" and "prospective_contact" not in evidence)
+            ) or (failure in {"CONTACT_MODEL_BINDING", "PLANNING_SCENE_MISMATCH"}
+                  and "prospective_contact" not in evidence)
             prior_cell = self._cell._validate(prior_confirmation["after_cell"])
             if prior_confirmation.get("schema_version") == "data_factory.no_dispatch_recovery.v1":
                 retained_path = self._cell.runtime_path(f"no_dispatch_recovery-{prior_cell['run_id']}.json")
@@ -253,7 +254,8 @@ class SceneStateStore:
                             k:v for k,v in prior_confirmation.items() if k != "receipt_digest"})
                         or prior_confirmation["basis"] not in {
                             "INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE",
-                            "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE"}
+                            "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE",
+                            "INITIAL_CONTACT_SCENE_REJECTION_BEFORE_START_PHASE"}
                         or prior_confirmation["new_human_confirmation"] is not False
                         or prior_confirmation["execution_authorized"] is not False):
                     raise ContractError(code)
@@ -334,6 +336,7 @@ class SceneStateStore:
                      "run_id": result["run_id"], "plan_digest": result["plan_digest"]}
             receipt = {"schema_version": "data_factory.no_dispatch_recovery.v1",
                        "basis": ("INITIAL_CONTACT_PROFILE_REJECTION_BEFORE_START_PHASE" if failure == "CONTACT_PROFILE_UNAVAILABLE"
+                                 else "INITIAL_CONTACT_SCENE_REJECTION_BEFORE_START_PHASE" if failure == "PLANNING_SCENE_MISMATCH"
                                  else "INITIAL_CONTACT_MODEL_REJECTION_BEFORE_START_PHASE"),
                        "prior_confirmation_digest": canonical_digest(prior_confirmation),
                        "lifecycle_result_digest": diagnostic["lifecycle_result_digest"],
