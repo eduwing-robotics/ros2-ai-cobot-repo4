@@ -320,6 +320,36 @@ class NativePolicyTest(unittest.TestCase):
         release.set()
         producer.join(1.)
 
+    def test_task_scope_preserves_startup_failure_and_live_owner_if_cleanup_fails(self):
+        from lerobot.rollout.inference.rtc import RTCInferenceEngine
+        from lerobot_strategy_fr5 import acknowledged_queue
+
+        native = self.async_native(_AsyncPolicy())
+        started = []
+        real_start = acknowledged_queue.start_with_acknowledged_queue
+        real_stop = RTCInferenceEngine.stop
+        def broken_start(engine):
+            real_start(engine)
+            started.append(engine)
+            raise RuntimeError("primary startup failure")
+        try:
+            with mock.patch.object(acknowledged_queue, "start_with_acknowledged_queue", side_effect=broken_start):
+                with mock.patch.object(RTCInferenceEngine, "stop", side_effect=RuntimeError("secondary cleanup")):
+                    with self.assertRaisesRegex(RuntimeError, "primary startup failure") as raised:
+                        with native.prepare_task_inference(instruction="pick", fps=30):
+                            self.fail("startup should fail")
+            self.assertIn("LEARNED_INFERENCE_STOP_UNCONFIRMED", raised.exception.__notes__)
+            self.assertTrue(started[0]._rtc_thread.is_alive())
+            self.assertIs(native._retained_inference_thread, started[0]._rtc_thread)
+            with self.assertRaisesRegex(ContractError, "LEARNED_REENTRANT_INFERENCE"):
+                with native.prepare_inference():
+                    self.fail("live producer lost ownership")
+        finally:
+            for engine in started:
+                real_stop(engine)
+        with native.prepare_inference():
+            pass
+
     def test_component_loader_accepts_canonically_admitted_native_image_slots(self):
         from lerobot.configs import FeatureType, PolicyFeature
         from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig

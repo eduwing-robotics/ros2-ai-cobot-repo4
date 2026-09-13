@@ -579,17 +579,19 @@ class NativeSmolVLA:
                     engine.notify_observation(raw)
 
             available = True
-            try:
-                yield engine, queue, notify_observation
-            except BaseException as exc:
-                body_error = exc
-                raise
+            yield engine, queue, notify_observation
+        except BaseException as exc:
+            body_error = exc
+            raise
         finally:
             with notification_lock:
                 available = False
             stop_error = None
             try:
                 if engine is not None:
+                    if producer_thread is None:
+                        # Startup can fail after creating the native thread.
+                        producer_thread = engine._rtc_thread
                     try:
                         engine.stop()
                     except BaseException as exc:
