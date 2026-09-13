@@ -1638,7 +1638,8 @@ def build_operator_runtime(*, effect_scope: str = "FAKE", **kwargs) -> OperatorR
         from tools.data_factory.operator.workflow.learned_run import LearnedRunApplication
         application = LearnedRunApplication(payload=load_json_strict(Path(learned_request)),
             operator_label=kwargs.get("operator_label", "local-operator"), session_id=kwargs.get("session_id"),
-            run_live_call=kwargs.get("run_live_call"))
+            run_live_call=kwargs.get("run_live_call"),
+            repository_root=kwargs.get("repository_root") or ROOT)
         bridge = LoopbackBridge(core=application.core, ui_root=ROOT / "operator-ui",
             port=kwargs.get("port", 4174), index_page="learned.html")
         return OperatorRuntime(bridge=bridge,

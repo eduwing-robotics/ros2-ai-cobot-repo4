@@ -1363,6 +1363,33 @@ failure, data deficiency, whole-run non-dispatch or execution/training authority
 - **AND** validation success alone SHALL NOT grant FR5 motion or training authority
 
 
+### Requirement: Scoped learned pick-place retains original task wording
+
+The normal scoped learned pick-place application SHALL derive its episode
+instruction binding from the validated source/destination jobs and existing
+repository region binding before starting the run. The derived instruction
+SHALL match the task grant and be consumed by native inference and retained in
+the existing preapproval evidence for original-condition Collection advice.
+Descriptive lineage SHALL NOT require a synthetic Collection campaign,
+checklist approval, new execution owner or new policy input. Existing physical
+binding status SHALL be preserved without promotion. Unscoped and bound-runtime
+callers SHALL retain their existing approval and binding contracts.
+
+#### Scenario: Scoped execution retains the original transition
+
+- **WHEN** a scoped grant matches the repository-derived pick-place instruction
+- **THEN** the normal caller passes the exact binding through existing run_live
+  validation and preapproval persistence
+- **AND** source/destination frame, sheet and pose mismatches are rejected
+- **AND** this lineage alone grants no task success or training authority
+
+#### Scenario: A description cannot substitute for a task grant
+
+- **WHEN** an unbound caller supplies an episode binding without a matching
+  scoped generation grant
+- **THEN** the existing episode-scope rejection remains effective
+- **AND** the ordinary assisted caller retains its exact-plan decision path
+
 ### Requirement: Prospective scoped generation qualification
 
 The system SHALL preserve the default v1 finite learned proposal interpretation,

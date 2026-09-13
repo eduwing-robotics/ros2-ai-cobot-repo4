@@ -1707,7 +1707,7 @@ def _write_preapproval_evidence(
 
 def _validate_episode_instruction_scope(
     value, *, validated, scene_binding, preapproval_checklist,
-    repository_root,
+    repository_root, task_grant=None,
 ):
     """Close one language label over its resolved source, release, and profile."""
     try:
@@ -1764,7 +1764,22 @@ def _validate_episode_instruction_scope(
                 }
             ):
                 raise ContractError("EPISODE_INSTRUCTION_SCOPE")
-        if (
+        if task_grant is not None:
+            from tools.data_factory.rollout.task_authority import uses_scoped_generation
+            if (preapproval_checklist is not None or not uses_scoped_generation(task_grant)
+                    or task_grant["scope"].get("task") != checked["instruction"]):
+                raise ContractError("EPISODE_INSTRUCTION_SCOPE")
+            destination = validated.get("destination_resolved_inputs", {}).get("normalized_job")
+            if task_binding["task_id"] != "pick_place" or not isinstance(destination, Mapping):
+                raise ContractError("EPISODE_INSTRUCTION_SCOPE")
+            endpoint = release_bindings[0]
+            if (endpoint["workspace_id"] != destination["place_id"]
+                    or endpoint["frame_id"] != destination["cell_calibration_id"]
+                    or endpoint["sheet_digest"] != destination["sheet_manifest_digest"]
+                    or endpoint["pose"] != {key: destination[key] for key in
+                                            ("place_id", "yaw_deg", "x_mm", "y_mm")}):
+                raise ContractError("EPISODE_INSTRUCTION_SCOPE")
+        elif (
             not isinstance(preapproval_checklist, Mapping)
             or preapproval_checklist.get("task_binding") != task_binding
             or preapproval_checklist.get("episode_instruction_binding")
@@ -4014,7 +4029,10 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
             or not preapproval_checklist
         ):
             raise ContractError("PREAPPROVAL_CHECKLIST_SCOPE")
-        if (
+        from tools.data_factory.rollout.task_authority import uses_scoped_generation
+        scoped_instruction = (episode_instruction_binding is not None and not bound_runtime
+                              and learned is not None and uses_scoped_generation(payload.get("task_grant")))
+        if not scoped_instruction and (
             (episode_instruction_binding is not None)
             != (
                 isinstance(preapproval_checklist, Mapping)
@@ -4041,6 +4059,7 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                 scene_binding=scene_binding,
                 preapproval_checklist=preapproval_checklist,
                 repository_root=repository_root,
+                task_grant=payload["task_grant"] if scoped_instruction else None,
             )
             if episode_instruction_binding is not None else None
         )

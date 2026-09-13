@@ -1787,6 +1787,42 @@ class RunJobTest(unittest.TestCase):
             instruction_binding,
         )
 
+        # Scoped learned wording is descriptive lineage, not a synthetic
+        # Collection campaign/checklist. Its exact grant and destination still bind.
+        from tools.data_factory.rollout.finite_plan import SCOPED_SCHEMAS
+        destination = task_binding["spatial_bindings"][1]
+        scoped_validated = copy.deepcopy(validated)
+        scoped_validated["destination_resolved_inputs"] = {"normalized_job": {
+            **destination["pose"], "cell_calibration_id": destination["frame_id"],
+            "sheet_manifest_digest": destination["sheet_digest"],
+        }}
+        grant = {"schema_version": "data_factory.learned_task_grant.v1", "grant_id": "g",
+                 "issued_by": "operator", "run_id": "run", "deadline_s": 100.,
+                 "terminal_reserve_s": 10., "max_outputs": 2, "revoked": False,
+                 "scope": {"task": instruction_binding["instruction"],
+                           "adaptation": {"schema_version": sorted(SCOPED_SCHEMAS)[0]}}}
+        grant["grant_digest"] = run_job.canonical_digest(grant)
+        def check_scoped(value=scoped_validated, authority=grant):
+            return run_job._validate_episode_instruction_scope(
+                instruction_binding, validated=value, scene_binding=scene,
+                preapproval_checklist=None, repository_root=Path(__file__).resolve().parents[2],
+                task_grant=authority)
+        self.assertEqual(check_scoped(), instruction_binding)
+        for key in ("place_id", "cell_calibration_id", "sheet_manifest_digest", "x_mm"):
+            with self.subTest(scoped_destination=key):
+                changed = copy.deepcopy(scoped_validated)
+                changed["destination_resolved_inputs"]["normalized_job"][key] = "wrong"
+                with self.assertRaisesRegex(run_job.ContractError, "EPISODE_INSTRUCTION_SCOPE"):
+                    check_scoped(changed)
+        changed_grant = copy.deepcopy(grant)
+        changed_grant["scope"]["task"] = "another instruction"
+        changed_grant["grant_digest"] = run_job.canonical_digest({
+            key: value for key, value in changed_grant.items() if key != "grant_digest"})
+        with self.assertRaisesRegex(run_job.ContractError, "EPISODE_INSTRUCTION_SCOPE"):
+            check_scoped(authority=changed_grant)
+        with self.assertRaisesRegex(run_job.ContractError, "EPISODE_INSTRUCTION_SCOPE"):
+            check_scoped(authority=None)
+
         for label, mutate in (
             (
                 "source",

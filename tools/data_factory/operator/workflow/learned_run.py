@@ -7,18 +7,153 @@ import threading
 import time
 
 from tools.data_factory import run_job
+from tools.data_factory.operator.registries.region import (
+    load_workspace_region_binding,
+)
 from tools.data_factory.operator.workflow.intents import (
     ButtonDecisionPort, OperatorCheckpointPort, OperatorIntentCore, INTENT_SCHEMA,
 )
-from tools.fr5_data_factory import ContractError, canonical_digest, load_json_strict
+from tools.data_factory.task_recipe import (
+    compile_episode_instruction_binding,
+    compile_task_binding,
+)
+from tools.a4_place_yaw.region_layout import (
+    make_red_blue_region_layout,
+    workspace_region,
+)
+from tools.fr5_data_factory import (
+    ContractError,
+    canonical_digest,
+    load_json_strict,
+    validate_job_spec,
+)
+
+
+def compile_learned_episode_instruction(payload, *, repository_root):
+    """Compile one scoped pick-place label from the repository's region SSOT."""
+    checked = run_job._run_payload(copy.deepcopy(payload))
+    destination = checked.get("destination")
+    if (
+        checked["mode"] != "live"
+        or run_job._learned_options(checked) is None
+        or checked["job"].get("task") != "pick_place"
+        or not isinstance(destination, dict)
+    ):
+        raise ContractError("EPISODE_INSTRUCTION_SCOPE")
+    source = validate_job_spec(
+        checked["job"],
+        paths={
+            "selected_sheet": checked["selected_sheet"],
+            "yaw0_sheet": checked["yaw0_sheet"],
+        },
+        config_root=checked["config_root"],
+    )
+    target = validate_job_spec(
+        destination["job"],
+        paths={
+            "selected_sheet": destination["selected_sheet"],
+            "yaw0_sheet": destination["yaw0_sheet"],
+        },
+        config_root=checked["config_root"],
+    )
+    shared_job = (
+        "task", "robot_system_id", "collection_profile_id",
+        "object_profile_id", "grasp_profile_id", "instruction",
+        "episode_intent",
+    )
+    shared_inputs = (
+        "robot_system", "collection_profile", "object_profile",
+        "grasp_profile",
+    )
+    if (
+        target["normalized_job"]["place_id"]
+        == source["normalized_job"]["place_id"]
+        or any(
+            target["normalized_job"][field]
+            != source["normalized_job"][field]
+            for field in shared_job
+        )
+        or any(
+            target["input_digests"][field]
+            != source["input_digests"][field]
+            for field in shared_inputs
+        )
+    ):
+        raise ContractError("EPISODE_INSTRUCTION_SCOPE")
+
+    try:
+        repository = Path(repository_root).resolve(strict=True)
+        layout = make_red_blue_region_layout()
+        persisted = load_workspace_region_binding(repository, layout)
+        persisted_endpoints = {
+            item["place_id"]: item for item in persisted["bindings"]
+        }
+
+        def endpoint(resolved, role):
+            job = resolved["normalized_job"]
+            region = workspace_region(layout, job["place_id"])
+            stored = persisted_endpoints.get(job["place_id"])
+            if stored != {
+                "place_id": job["place_id"],
+                "frame_id": job["cell_calibration_id"],
+                "region_id": region["region_id"],
+            }:
+                raise ContractError("EPISODE_INSTRUCTION_SCOPE")
+            return {
+                "role": role,
+                "workspace_id": job["place_id"],
+                "frame_id": job["cell_calibration_id"],
+                "pose": {
+                    key: job[key]
+                    for key in ("place_id", "yaw_deg", "x_mm", "y_mm")
+                },
+                "sheet_digest": job["sheet_manifest_digest"],
+                "family_digest": resolved["calibration"]["document"][
+                    "a4_family_digest"
+                ],
+                "region_binding": {
+                    "layout_id": layout["layout_id"],
+                    "layout_digest": layout["layout_digest"],
+                    "region_id": region["region_id"],
+                    "physical_binding_status": persisted[
+                        "physical_binding_status"
+                    ],
+                },
+            }
+
+        task = compile_task_binding(
+            "pick_place",
+            source=endpoint(source, "SOURCE"),
+            destination=endpoint(target, "DESTINATION"),
+        )
+        return compile_episode_instruction_binding(task, source["object_profile"])
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise ContractError("EPISODE_INSTRUCTION_SCOPE") from exc
 
 
 class LearnedRunApplication:
-    def __init__(self, *, payload, operator_label, session_id=None, run_live_call=None):
+    def __init__(self, *, payload, operator_label, session_id=None,
+                 run_live_call=None, repository_root=None):
         self.payload = run_job._run_payload(copy.deepcopy(payload))
         if (self.payload["mode"] != "live" or run_job._learned_options(self.payload) is None
                 or self.payload["job"].get("operator_or_agent_id") != operator_label):
             raise ContractError("LEARNED_WEB_CONFIGURATION")
+        from tools.data_factory.rollout.task_authority import uses_scoped_generation
+        self.repository_root = repository_root or run_job.ROOT
+        self.episode_instruction_binding = None
+        if (
+            uses_scoped_generation(self.payload.get("task_grant"))
+            and self.payload["job"].get("task") == "pick_place"
+        ):
+            self.episode_instruction_binding = compile_learned_episode_instruction(
+                self.payload,
+                repository_root=self.repository_root,
+            )
+            if (
+                self.payload["task_grant"]["scope"].get("task")
+                != self.episode_instruction_binding["instruction"]
+            ):
+                raise ContractError("TASK_GRANT_SCOPE")
         self.session_id = session_id or "learned-web-" + self.payload["run_id"]
         self.plan = ButtonDecisionPort(session_id=self.session_id + "-plan", operator_label=operator_label)
         self.checkpoint = OperatorCheckpointPort(operator_label=operator_label)
@@ -90,9 +225,19 @@ class LearnedRunApplication:
         try:
             def no_tty(*_args, **_kwargs):
                 raise ContractError("LEARNED_WEB_TTY_FORBIDDEN")
+            instruction = (
+                {}
+                if self.episode_instruction_binding is None
+                else {
+                    "episode_instruction_binding": copy.deepcopy(
+                        self.episode_instruction_binding
+                    ),
+                    "repository_root": self.repository_root,
+                }
+            )
             result = self.run_live_call(copy.deepcopy(self.payload), self.cancel_event, self._publish,
                 decision_provider=self._decision, checkpoint_provider=self._checkpoint,
-                approval_scope="HUMAN_GATED", tty_decision=no_tty)
+                approval_scope="HUMAN_GATED", tty_decision=no_tty, **instruction)
             self.core.transition(lambda: setattr(self, "result", copy.deepcopy(result)))
             lifecycle = None
             path = Path(self.payload["run_root"]) / self.payload["run_id"] / "learned_lifecycle_result.json"
