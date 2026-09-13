@@ -18,6 +18,32 @@ from tools.data_factory.motion.moveit_transport import RosMoveItTransport
 
 
 class TestExecutionTransport(unittest.TestCase):
+    def test_native_v5_live_snapshot_requests_latest_state_not_history(self):
+        policy = dict(schema_version="fr5.gripper_temporal_policy.v2",
+            incarnation=[1, 2, 3, 4], connection_epoch=1, configuration_epoch=0,
+            max_age_s=.1, host_clock_tolerance_s=.001)
+        topics = {"/dynamic_joint_states", "/joint_states",
+            "/fairino5_controller/controller_state", "/gripper_controller/controller_state"}
+        for configured, supplied, expected in ((True, policy, 1), (False, policy, 10), (True, None, 10)):
+            with self.subTest(configured=configured, policy=supplied):
+                subscriptions = {}
+                def subscribe(kind, topic, callback, qos):
+                    subscriptions[topic] = qos
+                    return object()
+                node = SimpleNamespace(create_subscription=subscribe)
+                with mock.patch("rclpy.action.ActionClient"):
+                    RosMoveItTransport(node, gripper_temporal_policy=supplied,
+                        allow_clock_configuration=configured)
+                self.assertEqual({topic: subscriptions[topic] for topic in topics},
+                                 dict.fromkeys(topics, expected))
+                from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+                qos = QoSProfile(depth=expected)
+                self.assertEqual(qos.history, HistoryPolicy.KEEP_LAST)
+                self.assertEqual(qos.reliability, ReliabilityPolicy.RELIABLE)
+                self.assertEqual(qos.durability, DurabilityPolicy.VOLATILE)
+                self.assertEqual(subscriptions["/robot_description"].durability,
+                                 DurabilityPolicy.TRANSIENT_LOCAL)
+
     def test_native_snapshot_drains_old_source_samples_within_original_budget(self):
         from tools.data_factory.rollout.finite_plan import check_execution_start
         description = (

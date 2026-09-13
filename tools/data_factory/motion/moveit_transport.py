@@ -552,23 +552,30 @@ class RosMoveItTransport:
         self._robot_description_subscription = None
         self._robot_description_client = None
         if hasattr(node, "create_subscription"):
+            # Native v5 publishes current state plus latched command/fault proof.
+            # This getter is not a recorder: queued history after inference can
+            # spend nearly the whole admission budget before a callback runs.
+            state_depth = 1 if (
+                self._allow_clock_configuration and self._gripper_source_clock is not None
+                and self._gripper_source_clock["schema_version"] == "fr5.gripper_temporal_policy.v2"
+            ) else 10
             # Observe identity before qualification; subscription grants no authority.
             self._gripper_hardware_subscription = node.create_subscription(
-                DynamicJointState, "/dynamic_joint_states", self._on_gripper_hardware_state, 10)
+                DynamicJointState, "/dynamic_joint_states", self._on_gripper_hardware_state, state_depth)
             self._joint_state_subscription = node.create_subscription(
-                JointState, "/joint_states", self._on_joint_state, 10
+                JointState, "/joint_states", self._on_joint_state, state_depth
             )
             self._arm_controller_subscription = node.create_subscription(
                 JointTrajectoryControllerState,
                 "/fairino5_controller/controller_state",
                 self._on_arm_controller_state,
-                10,
+                state_depth,
             )
             self._gripper_controller_subscription = node.create_subscription(
                 JointTrajectoryControllerState,
                 "/gripper_controller/controller_state",
                 self._on_gripper_controller_state,
-                10,
+                state_depth,
             )
             self._robot_description_subscription = node.create_subscription(
                 String,

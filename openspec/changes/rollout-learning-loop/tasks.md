@@ -36,10 +36,30 @@ bounded continuity question only; learned task success remains unproven.
   consume its original-condition recommendation through existing Collection.
   September13 r2 now passes native generation, plan admission and recorder
   readiness (153.664ms inference,239.675ms oldest observation), but execute
-  admission rejects `LEARNED_STALE_STATE` before any goal.14 diagnostic rows
+  admission rejects `LEARNED_STALE_STATE`.14 diagnostic rows
   retained, no admitted episode or task success. Resolve the actual snapshot
   acquisition/consumption boundary; source/receipt age divergence was observed
   in a later read-only probe, not proven as the original rejection's cause.
+  The returned execute-count0 was a fixed failed-start projection, not a retained
+  native counter. Empty phase events are consistent with pre-send failure but
+  do not independently restore physical continuity. Cell remains blocked and
+  Scene314 is UNKNOWN; existing recovery inputs are required before a new run.
+- [x] Correct native snapshot acquisition without extending freshness limits:
+  `5f4b7ef` waits for original source stamps within the existing deadline
+  (13 focused tests PASS0.672s; independent review found no issues). The opted-in
+  v5 current-state reader also uses KEEP_LAST1 instead of10 on all four state
+  topics; command result channels, recorder QoS and native latched completion/
+  fault checks remain unchanged.11 affected tests PASS0.522s and independent
+  scoped review accepted. Integrated read-only three-snapshot check passed;
+  after0.8s idle, source ages were9.23/1.68ms versus prior99.54/92.62ms.
+  Evidence: `.agent-local/work/lerobot-fr5/scoped-return-snapshot-followup-`
+  `{source-aware,latest-qos,integrated-latest-qos}.json`. These observations do
+  not reconstruct r2 or qualify physical Pick/stop. Queue-depth rationale:
+  https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+- [x] Preserve failed-start lifecycle through the existing canonical diagnostic
+  consumer (`0491ea2`); do not claim zero sends when post-readiness evidence is
+  absent/malformed. Five affected persistence/Collection checks PASS1.710s.
+  This is prospective only: no r2 lifecycle or Scene evidence was reconstructed.
 - [x] Connect completed scoped-attempt/mechanical-terminal lineage to explicit
   original-condition validation advice without human FAIL fabrication. Focused
   software tests cover recommendation rejection/legacy compatibility and the
