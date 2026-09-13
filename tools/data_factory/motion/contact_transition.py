@@ -319,6 +319,29 @@ def intended_request_contact(context, plan, hypothesis, contact, *, gripper_pose
     queried joint/gripper state, not a measured object pose or a policy phase.
     """
     _request_geometry_binding(context, plan, hypothesis)
+    return _intended_request_contact(context, hypothesis, contact,
+                                     gripper_pose=gripper_pose, gripper_m=gripper_m)
+
+
+def bind_request_contacts(context, plan):
+    """Bind a detached batch once, rather than rehash its plan per contact.
+
+    The returned classifier owns its copy. It has no execution authority and
+    still needs exact-query FK plus the caller's complete native contact set.
+    A changed Scene/model/trajectory requires its owner's new batch admission.
+    """
+    retained, selected = copy.deepcopy((context, plan))
+    _request_geometry_binding(retained, selected, "source")
+
+    def classify(hypothesis, contact, *, gripper_pose=None, gripper_m=None):
+        if hypothesis not in {"source", "carried", "released"}:
+            raise ContractError("CONTACT_REQUEST_BINDING")
+        return _intended_request_contact(retained, hypothesis, contact,
+                                        gripper_pose=gripper_pose, gripper_m=gripper_m)
+    return classify
+
+
+def _intended_request_contact(context, hypothesis, contact, *, gripper_pose, gripper_m):
     source = context["source_object_id"]
     bodies = {(contact.contact_body_1, contact.body_type_1), (contact.contact_body_2, contact.body_type_2)}
     values = [contact.depth, contact.position.x, contact.position.y, contact.position.z,

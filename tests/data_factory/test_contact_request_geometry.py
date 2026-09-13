@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from moveit_msgs.msg import ContactInformation
 from rclpy.serialization import deserialize_message, serialize_message
@@ -11,7 +12,7 @@ from moveit_msgs.srv import GetStateValidity
 
 from tools.data_factory.run_job import resolve_inputs
 from tools.data_factory.motion.contact_transition import (
-    TIPS, intended_request_contact, prepare_request_geometry, request_geometry,
+    TIPS, bind_request_contacts, intended_request_contact, prepare_request_geometry, request_geometry,
 )
 from tools.fr5_data_factory import ContractError, TASK_CONTRACTS, canonical_digest, compose_rigid_transform
 
@@ -131,6 +132,26 @@ class RequestContactGeometryTest(unittest.TestCase):
         contact.header.frame_id = "unknown"
         self.assertFalse(intended_request_contact(self.context, self.plan, "carried", contact))
 
+    def test_batch_classifier_binds_owned_inputs_once_without_repeated_plan_hashes(self):
+        from tools.data_factory.motion import contact_transition
+        C = ContactInformation
+        contact = self.contact("cube", C.WORLD_OBJECT,
+                               self.context["proxies"]["carried"]["object_id"], C.ROBOT_ATTACHED)
+        with mock.patch.object(contact_transition, "canonical_digest", wraps=canonical_digest) as digest:
+            classify = bind_request_contacts(self.context, self.plan)
+            binding_calls = digest.call_count
+            self.assertGreater(binding_calls, 0)
+            self.context["source_object_id"] = "changed"
+            self.plan["policy"]["robot_description"] = "changed"
+            for _ in range(10):
+                self.assertTrue(classify("carried", contact))
+                self.assertFalse(classify("released", contact))
+            self.assertEqual(digest.call_count, binding_calls)
+            with self.assertRaisesRegex(ContractError, "CONTACT_REQUEST_BINDING"):
+                classify("detected-success", contact)
+        with self.assertRaisesRegex(ContractError, "CONTACT_REQUEST_BINDING"):
+            bind_request_contacts(self.context, self.plan)
+
     def test_top_pressing_is_not_intended_side_jaw_contact(self):
         C = ContactInformation
         source = self.plan["source_program"]
@@ -147,13 +168,18 @@ class RequestContactGeometryTest(unittest.TestCase):
         contact.normal.x, contact.normal.y, contact.normal.z = datum["rotation_columns"][0]
         contact.depth = .003
         args = dict(gripper_pose=gripper, gripper_m=.01176)
+        classify = bind_request_contacts(self.context, self.plan)
         self.assertTrue(intended_request_contact(self.context, self.plan, "source", contact, **args))
+        self.assertTrue(classify("source", contact, **args))
         self.assertFalse(intended_request_contact(self.context, self.plan, "source", contact))
+        self.assertFalse(classify("source", contact))
         contact.normal.x, contact.normal.y, contact.normal.z = datum["rotation_columns"][2]
         self.assertFalse(intended_request_contact(self.context, self.plan, "source", contact, **args))
+        self.assertFalse(classify("source", contact, **args))
         contact.normal.x, contact.normal.y, contact.normal.z = datum["rotation_columns"][0]
         contact.position.z += .2
         self.assertFalse(intended_request_contact(self.context, self.plan, "source", contact, **args))
+        self.assertFalse(classify("source", contact, **args))
 
     def test_released_cube_does_not_hide_top_collision_behind_native_touch_links(self):
         from tools.fr5_data_factory import inverse_rigid_transform
