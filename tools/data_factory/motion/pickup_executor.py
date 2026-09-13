@@ -1810,6 +1810,7 @@ class PickupExecutor:
             run["state"] = "EXECUTING"
         try:
             self.transport.open_learned_actuator_stream(deadline=run["task_deadline"])
+            run["execution"]["actuator_stream_opened"] = True
             run["execution"]["native_stream"]["status"] = "WAITING_FOR_POLICY"
         except Exception as exc:
             self._fault(run, exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_OPEN")
@@ -2228,6 +2229,7 @@ class PickupExecutor:
             "status": "NATIVE_HANDLES_TERMINAL", "fenced": True, "owns_goals": False,
         }
         execution["active"] = False
+        execution["actuator_stream_opened"] = False
         execution["cancel_error"] = None
         if "native_stream" in execution:
             execution["native_stream"]["status"] = "NATIVE_HANDLES_TERMINAL"
@@ -2270,7 +2272,10 @@ class PickupExecutor:
             execution["actuator_stream_drain_error"] = (
                 exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_STATUS"
             )
-        stream_owned = bool(stream_status and stream_status["active"] or stream_status_error)
+        # Losing the status projection does not release a port we opened.
+        # Only the same native drain/close owner can settle that ownership.
+        stream_owned = bool(stream_status and stream_status["active"] or stream_status_error
+                            or execution.get("actuator_stream_opened") is True)
         if stream_owned:
             execution["active"] = True
             execution["actuator_stream_stop_pending"] = True
@@ -2442,6 +2447,14 @@ class PickupExecutor:
                 try:
                     self._retain_actuator_stream_events(execution, self.transport.poll_learned_actuator_stream())
                 except Exception as exc:
+                    # Native polling may already have removed acceptance/result
+                    # facts before raising. Draining cannot recover that batch.
+                    try:
+                        self._retain_actuator_stream_events(execution, getattr(exc, "actuator_stream_events", []))
+                    except Exception as retention_error:
+                        execution["actuator_stream_drain_error"] = (
+                            retention_error.code if isinstance(retention_error, ContractError)
+                            else "ROS_EXEC_STREAM_EVENTS")
                     self._fault(run, exc.code if isinstance(exc, ContractError) else "ROS_EXEC_POLL_FAILED")
             else:
                 try:

@@ -490,6 +490,44 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
         self.assertEqual(scene.updates, [])
         self.assertTrue(cell.ready)
 
+    def test_native_poll_failure_retains_its_last_events_without_masking_primary_fault(self):
+        for events in ([{"event": "TERMINAL", "actuator": "arm", "revision": "r1",
+                         "result_status": 6, "error_code": -4}], [None]):
+            with self.subTest(events=events):
+                job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+                self.assertTrue(started["ok"])
+                failure = ContractError("ROS_EXEC_RESULT_FAILED")
+                failure.actuator_stream_events = copy.deepcopy(events)
+                with mock.patch.object(transport, "poll_learned_actuator_stream",
+                                       side_effect=[failure, *([[]] * 10)]):
+                    job.poll()
+                run = executor.runs["run"]
+                self.assertEqual(run["failure_code"], "ROS_EXEC_RESULT_FAILED")
+                self.assertEqual(run["execution"]["native_stream"]["task_outcome"], "UNKNOWN")
+                if events[0] is not None:
+                    self.assertEqual(run["execution"]["actuator_stream_events"], events)
+                else:
+                    self.assertEqual(run["execution"]["actuator_stream_drain_error"], "ROS_EXEC_STREAM_EVENTS")
+                self.assertEqual(transport.sent, [])
+
+    def test_opened_native_port_cannot_release_on_missing_or_inactive_status(self):
+        for unavailable in (None, lambda self: {"active": False, "fenced": False, "owns_goals": False}):
+            with self.subTest(unavailable=unavailable):
+                job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+                self.assertTrue(started["ok"])
+                with mock.patch.object(type(transport), "learned_actuator_stream_status", unavailable):
+                    job.cancel()
+                    self.assertFalse(executor.close())
+                    self.assertEqual(recorder.state, "RECORDING")
+                    self.assertNotIn(("recorder", "retain"), calls)
+                    self.assertTrue(executor.runs["run"]["execution"]["actuator_stream_stop_pending"])
+                    self.assertIsNotNone(transport.stream)
+                job.cancel()
+                self.assertIsNone(transport.stream)
+                self.assertEqual(recorder.state, "QUARANTINED_COMMIT")
+                self.assertFalse(executor.runs["run"]["execution"]["actuator_stream_opened"])
+                self.assertEqual(scene.updates, [])
+
 
 class CurrentStateTest(unittest.TestCase):
     def fixture(self, *, v5=False):
