@@ -483,6 +483,51 @@ physical execution and Pick/release outcomes remain unproven.
 
 ### Native rolling-trajectory migration
 
+#### Nonblocking geometry consumer: bounded source evidence
+
+The existing native-pair checker makes `1 + 6N` synchronous state-validity
+service calls. Those calls spin callbacks but retain the sole Python command
+owner until the entire batch ends; placing them on each revision would again
+couple geometry work to lease/cancel arbitration. Installed native MoveIt C++
+provides local PlanningScene/RobotState collision and FK; its Python bindings
+are not installed. The selected implementation direction is one task-owned,
+node-less native batch helper over a detached full scene, with completion polled
+by the existing owner. It has no actuator or Scene-write authority. Initialize
+the bound model before fresh inference inputs; preserve world, attachments, ACM,
+transforms, octomap and padding/scaling rather than reconstructing a weaker scene.
+The owner must still bind checked geometry to the actual selected reference and
+current dispatch conditions. This consumer is not yet implemented/deployed.
+
+Two CPU-only r7 probes support this choice, not physical qualification. Existing
+bounded gripper projection exactly reproduced retained actions. Across 301
+sampled states, source/carried hypotheses had no native collisions, but a
+base-link-attached released proxy collided with the conservative floor at every
+sample (about 1 mm). A separate private-world-object variant removed that
+representation artifact without changing floor tolerance or ACM. A synthetic
+cube placed against a fingertip at an actual retained joint state still produced
+four native top contacts. Thus a stationary released model belongs in the private
+scene world, not on the robot; do not add a floor-contact exemption. This does
+not choose a phase detector or require all three hypotheses at runtime.
+
+Each probe ran one stored batch of 903 native checks: roughly 41/44 ms excluding
+model initialization (1.56/1.31 s). These are single-run feasibility observations,
+not latency guarantees. The original Python classifier took about 1.97 s for
+1,204 contacts because it rebound the full context/plan per contact; the new
+owned batch classifier performs that binding once without changing predicates.
+Production still needs full-scene equivalence, explicit native-to-ROS body-type
+mapping (native WORLD/ATTACHED enums differ), complete/non-saturated contacts,
+released WORLD_OBJECT side-contact semantics and asynchronous consumer wiring.
+
+Evidence is retained in `.agent-local/work/lerobot-fr5/` as
+`request-geometry-batch-probe{.py,.cpp,-result.json}` and
+`request-geometry-private-world-probe{.py,.cpp,-result.json}`. Both use r7
+`preapproval_evidence.json` SHA-256
+`8e8dfba201ff735e2085a8bdceb15b744485f526ff4e05fa61f97b080f26f02c`.
+The original negative probe's enum adapter is not reusable for general contact
+classification; its sole forbidden proxy/floor result is unaffected, and the
+variant maps enums explicitly. Current local SRDF, default ACM and reconstructed
+floor/wall/source geometry are not evidence of a retained live full scene.
+
 Finish one plain normal baseline and a bounded physical rollout before adding
 execution optimizations. Prediction horizon belongs to the saved policy;
 execution/commit horizon belongs to the selected policy-row prefix; controller
