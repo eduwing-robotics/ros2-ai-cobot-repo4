@@ -1018,6 +1018,49 @@ class RosMoveItTransport:
         stream = ActuatorStream(client, self.gripper, deadline=deadline, clock=self._clock)
         self._active = stream
 
+    def build_learned_actuator_goals(self, initial_state, actions, *, period_s, start_time_ns):
+        """Build native timelines, without admission, retiming or side effects.
+
+        The initial anchor is not a policy row. ARM uses its native interpolation
+        from that anchor. JTC gripper interpolation=none selects the NEXT point
+        in each interval, so the same anchor makes action[i]'s gripper target
+        active over [i*period, (i+1)*period). Omitting it skips the first target.
+        This reference schedule is not proof of individual SDK command delivery.
+        The dispatch owner must qualify the current start and controller settings.
+        """
+        try:
+            if (type(start_time_ns) is not int or not 0 < start_time_ns < 2**31 * 10**9
+                    or type(period_s) not in (int, float) or not math.isfinite(period_s) or period_s <= 0
+                    or not isinstance(actions, (list, tuple)) or not actions):
+                raise ContractError("ROS_EXEC_STEP")
+            rows = copy.deepcopy([initial_state, *actions])
+            for row in rows:
+                if (not isinstance(row, (list, tuple)) or len(row) != 7
+                        or any(type(value) not in (int, float) or not math.isfinite(value) for value in row)):
+                    raise ContractError("ROS_EXEC_STEP")
+        except OverflowError as exc:
+            raise ContractError("ROS_EXEC_STEP") from exc
+        arm, gripper = self._FollowJointTrajectory.Goal(), self._FollowJointTrajectory.Goal()
+        arm.trajectory.joint_names = list(JOINT_ORDER)
+        gripper.trajectory.joint_names = ["finger_right_joint"]
+        previous = -1
+        for index, row in enumerate(rows):
+            seconds = index * period_s
+            if not math.isfinite(seconds) or seconds >= 2**31:
+                raise ContractError("ROS_EXEC_STEP")
+            timestamp = round(seconds * 1_000_000_000)
+            if timestamp <= previous:
+                raise ContractError("ROS_EXEC_STEP")
+            previous = timestamp
+            for goal, positions in ((arm, row[:6]), (gripper, row[6:])):
+                point = self._JointTrajectoryPoint()
+                point.positions = list(map(float, positions))
+                point.time_from_start.sec, point.time_from_start.nanosec = divmod(timestamp, 1_000_000_000)
+                goal.trajectory.points.append(point)
+        for goal in (arm, gripper):
+            goal.trajectory.header.stamp.sec, goal.trajectory.header.stamp.nanosec = divmod(start_time_ns, 1_000_000_000)
+        return arm, gripper
+
     def submit_learned_actuator_revision(self, arm_goal, gripper_goal, *, revision, dispatch_guard):
         """Submit exact native timelines without row-level completion barriers.
 

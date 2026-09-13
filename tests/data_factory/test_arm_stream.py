@@ -442,6 +442,7 @@ class TransportActuatorStreamTest(unittest.TestCase):
         self.transport._clock = lambda: 10.
         self.transport.node = object()
         self.transport._FollowJointTrajectory = FollowJointTrajectory
+        self.transport._JointTrajectoryPoint = JointTrajectoryPoint
         self.client = Mock()
         self.response = Future()
         self.client.send_goal_async.return_value = self.response
@@ -483,6 +484,103 @@ class TransportActuatorStreamTest(unittest.TestCase):
         self.assertEqual(self.transport._execute_goal_count, 1)
         self.assertEqual(self.transport._gripper_goal_count, 1)
         self.assertEqual(self.transport.poll_learned_actuator_stream(), [])
+
+    def test_builder_preserves_all_rows_and_shared_native_time_without_sending(self):
+        initial = [0.] * 6 + [.021]
+        actions = [[.001 * i + j / 10 for j in range(6)] + [.012 + i * .0001]
+                   for i in range(50)]
+        original = copy.deepcopy(actions)
+        arm, gripper = self.transport.build_learned_actuator_goals(
+            initial, actions, period_s=1 / 30, start_time_ns=42_123_456_789)
+        self.assertEqual(arm.trajectory.header, gripper.trajectory.header)
+        self.assertEqual(arm.trajectory.header.stamp.sec, 42)
+        self.assertEqual(arm.trajectory.header.stamp.nanosec, 123_456_789)
+        self.assertEqual(arm.trajectory.joint_names, [f"j{i}" for i in range(1, 7)])
+        self.assertEqual(gripper.trajectory.joint_names, ["finger_right_joint"])
+        self.assertEqual(len(arm.trajectory.points), 51)
+        self.assertEqual(len(gripper.trajectory.points), 51)
+        for index, (a, g) in enumerate(zip(arm.trajectory.points, gripper.trajectory.points)):
+            expected = initial if index == 0 else original[index - 1]
+            self.assertEqual(list(a.positions) + list(g.positions), expected)
+            self.assertEqual(a.time_from_start, g.time_from_start)
+            self.assertEqual(a.time_from_start.sec * 10**9 + a.time_from_start.nanosec,
+                             round(index / 30 * 10**9))
+            self.assertFalse(a.velocities or a.accelerations or g.velocities or g.accelerations)
+        initial[0] = actions[0][0] = 9.
+        self.assertEqual(arm.trajectory.points[0].positions[0], 0.)
+        self.assertEqual(arm.trajectory.points[1].positions[0], original[0][0])
+        self.transport._ActionClient.assert_not_called()
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+        self.assertIsNone(self.transport._active)
+        # The pure builder's exact output is accepted by the existing pair port;
+        # admission remains the owner's responsibility, not builder authority.
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        guard = Mock()
+        self.transport.submit_learned_actuator_revision(arm, gripper, revision="built", dispatch_guard=guard)
+        guard.assert_called_once_with({"arm": arm, "gripper": gripper}, None)
+        self.client.send_goal_async.assert_called_once()
+        self.transport.gripper.send_goal_async.assert_called_once()
+
+    def test_builder_rejects_unrepresentable_inputs_without_effects(self):
+        base = dict(initial_state=[0.] * 7, actions=[[0.] * 7],
+                    period_s=1 / 30, start_time_ns=42_000_000_000)
+        cases = [
+            {"start_time_ns": value} for value in (0, -1, True, 42., 2**31 * 10**9)
+        ] + [{"period_s": value} for value in
+             (0, -1, True, "0.03", float("nan"), float("inf"), 1e-12, 2**31, 10**400)]
+        cases += [{"actions": []}, {"initial_state": [0.] * 6}, {"actions": [[0.] * 8]}]
+        for bad in (True, "0", float("nan"), float("inf"), 10**400):
+            cases.extend(({"initial_state": [0.] * 6 + [bad]}, {"actions": [[bad] + [0.] * 6]}))
+        for changes in cases:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ContractError, "ROS_EXEC_STEP"):
+                    self.transport.build_learned_actuator_goals(**(base | changes))
+        self.transport._ActionClient.assert_not_called()
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+        self.assertIsNone(self.transport._active)
+
+    def test_built_pair_uses_native_sampler_without_skipping_first_gripper_row(self):
+        import pathlib
+        import subprocess
+        import tempfile
+
+        initial = [0.] * 6 + [.021]
+        actions = [[.001 * i] * 6 + [g] for i, g in enumerate((.012, .018, .014), 1)]
+        arm, gripper = self.transport.build_learned_actuator_goals(
+            initial, actions, period_s=.1, start_time_ns=10_200_000_000)
+        # Reuse the native sampler fixture: it splits these same 7D knots back
+        # into ARM spline and gripper NONE, with JTC's next-update sample time.
+        knots = [(a.time_from_start.sec * 10**9 + a.time_from_start.nanosec,
+                  *a.positions, *g.positions)
+                 for a, g in zip(arm.trajectory.points, gripper.trajectory.points)]
+        fixture = pathlib.Path(__file__).parent / "rollout" / "native_sampling_fixture.cpp"
+        ros = pathlib.Path("/opt/ros/jazzy")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "sampling"
+            compiled = subprocess.run([
+                "g++", "-std=c++17", *["-I" + str(p) for p in (ros / "include").iterdir() if p.is_dir()],
+                str(fixture), "-L" + str(ros / "lib"), "-Wl,-rpath," + str(ros / "lib"),
+                "-ljoint_trajectory_controller", "-lrclcpp", "-lrcutils", "-o", str(binary)],
+                capture_output=True, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            def sample(points):
+                data = str(len(points)) + "\n" + "\n".join(" ".join(map(str, p)) for p in points) + "\n"
+                result = subprocess.run([str(binary), "mixed", "0", "0", "0", ".021"],
+                                        input=data, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return [[float(v) for v in line.split()] for line in result.stdout.splitlines()]
+            sampled = sample(knots)
+            for index, tick in enumerate((20, 30, 40)):
+                self.assertEqual(sampled[tick][-1], actions[index][-1])
+            self.assertAlmostEqual(sampled[20][3], .0001)
+            self.assertEqual(sampled[-1][3:], actions[-1])
+            no_anchor = sample(knots[1:])
+            self.assertEqual(no_anchor[20][-1], initial[-1])
+            self.assertNotIn(actions[0][-1], [row[-1] for row in no_anchor])
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
 
     def test_generic_cancel_never_reports_async_fence_as_completed_stop(self):
         self.transport.open_learned_actuator_stream(deadline=20.)
