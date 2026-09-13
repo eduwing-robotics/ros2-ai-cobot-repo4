@@ -505,7 +505,9 @@ class OneJob:
         return self._result(False, code, **({"retention_error": error} if error else {}))
 
     def _abort(self, code):
-        learned = isinstance(self.plan_envelope, dict) and "learned_proposal" in self.plan_envelope.get("plan", {})
+        from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA
+        plan = self.plan_envelope.get("plan", {}) if isinstance(self.plan_envelope, dict) else {}
+        learned = "learned_proposal" in plan or plan.get("schema_version") == PLAN_SCHEMA
         if self.recorder_state == "QUARANTINED_COMMIT" and not learned:
             self.state = "QUARANTINED_COMMIT"
             return self._result(False, code)
@@ -517,6 +519,11 @@ class OneJob:
                     self.cancel_error = data.get("cancel_error") or "CANCEL_UNCONFIRMED"
                 elif data.get("cancel_error"):
                     self.cancel_error = data["cancel_error"]
+                elif (self.cancel_error in {"ROS_EXEC_CANCEL_UNCERTAIN", "CANCEL_UNCONFIRMED"}
+                      and data.get("actuator_stream_drain", {}).get("status") == "NATIVE_HANDLES_TERMINAL"):
+                    # Resolve only native-drain uncertainty. Recorder freeze or
+                    # other lifecycle errors still require their own evidence.
+                    self.cancel_error = None
             except ContractError as exc:
                 self.cancel_error = exc.code
         if self.cancel_error:

@@ -12,10 +12,13 @@ import math
 import threading
 import time
 import xml.etree.ElementTree as ET
-from functools import lru_cache
 
 from tools.fr5_data_factory import ContractError, DIGEST, canonical_digest
 from tools.data_factory.learned_action_adapter import _action, _rgb
+from .execution_state import (
+    JOINTS, _number, _limits, _parsed_limits, controller_state,
+    check_acquisition_stamps, check_runtime_binding,
+)
 
 PROGRAM_SCHEMA = "fr5.learned_motion_program.v1"
 PROPOSAL_SCHEMA = "data_factory.finite_learned_proposal.v1"
@@ -48,19 +51,9 @@ def generation_spec(checkpoint, *, instruction, robot_description, period_s,
 
 
 ROBOT_MODEL_TRIAL_SCHEMA = "data_factory.robot_model_trial.v1"
-JOINTS = ["j1", "j2", "j3", "j4", "j5", "j6", "finger_right_joint"]
 UNITS = ["rad"] * 6 + ["m"]
 REFERENCE_TICK_S = .01
 GRIPPER_ENDPOINT_PROJECTION_QUANTA = 2
-
-
-def _number(value, code):
-    try:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ContractError(code)
-        return float(value)
-    except OverflowError as exc:
-        raise ContractError(code) from exc
 
 
 def check_freshness(proposal, now):
@@ -68,32 +61,6 @@ def check_freshness(proposal, now):
     stamps = proposal["source_timestamps_s"]
     if any(now < stamp or now - stamp > proposal["max_observation_age_s"] for stamp in stamps.values()):
         raise ContractError("LEARNED_STALE_OBSERVATION")
-
-
-def _limits(xml):
-    if not isinstance(xml, str):
-        raise ContractError("LEARNED_URDF_LIMITS")
-    return _parsed_limits(xml)
-
-
-@lru_cache(maxsize=16)
-def _parsed_limits(xml):
-    try:
-        root = ET.fromstring(xml)
-        joints = {joint.get("name"): joint for joint in root.findall("joint")}
-        result = []
-        for name in JOINTS:
-            joint = joints[name]
-            if joint.get("type") != ("prismatic" if name == JOINTS[-1] else "revolute"):
-                raise ValueError("joint type")
-            limit = joint.find("limit")
-            values = [float(limit.attrib[key]) for key in ("lower", "upper", "velocity")]
-            if not all(math.isfinite(v) for v in values) or values[0] >= values[1] or values[2] <= 0:
-                raise ValueError("limit")
-            result.append(tuple(values))
-        return tuple(result)
-    except (ET.ParseError, KeyError, AttributeError, TypeError, ValueError) as exc:
-        raise ContractError("LEARNED_URDF_LIMITS") from exc
 
 
 def validate_proposal(value):
@@ -343,28 +310,8 @@ def held_target_segments(source, proposal):
 
 def _execution_state(step, evidence, now):
     try:
-        observed = evidence["snapshot"]
-        elapsed = _number(now, "LEARNED_SOURCE_CLOCK") - _number(evidence["captured_at_s"], "LEARNED_SOURCE_CLOCK")
-        ages = [_number(age, "LEARNED_STALE_STATE") for age in
-                (observed["joint_state_age_s"], observed["arm_controller"]["age_s"], observed["gripper_controller"]["age_s"])]
-        if elapsed < 0 or any(age < 0 or age + elapsed > step["max_joint_state_age_s"] for age in ages):
-            raise ContractError("LEARNED_STALE_STATE")
-        if any(observed[key]["ready"] is not True for key in ("arm_controller", "gripper_controller")):
-            raise ContractError("CONTROLLER_NOT_READY")
-        # A successful action/reference match cannot authorize an arm handoff
-        # while a controller reports paused time. Positive scaling alone is
-        # still not same-command hardware completion or physical acknowledgement.
-        for key in ("arm_controller", "gripper_controller"):
-            if _number(observed[key]["speed_scaling"], "LEARNED_STATE_SCHEMA") <= 0:
-                raise ContractError("LEARNED_CONTROLLER_PAUSED")
-            from tools.data_factory.motion.moveit_transport import validate_controller_sample
-            validate_controller_sample(observed[key])
-        gripper = observed["gripper_controller"]
-        state = list(_action([*observed["joint_positions"], gripper["feedback_position_m"]]))
-        limits = _limits(step["learned_proposal"]["robot_description"])
-        if any(not low <= value <= high for value, (low, high, _) in zip(state, limits)):
-            raise ContractError("LEARNED_JOINT_LIMIT")
-        return state
+        return controller_state(step["learned_proposal"], evidence, now,
+                                max_age_s=step["max_joint_state_age_s"])
     except ContractError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
@@ -378,11 +325,7 @@ def check_execution_start(step, evidence, now, *, steady_now):
             raise ContractError("LEARNED_HARDWARE_UNBOUND")
         state = _execution_state(step, evidence, now)
         observed = evidence["snapshot"]
-        stamps = [observed["joint_state_stamp_ns"],
-                  *[observed[k]["sample"]["ros_stamp_ns"] for k in ("arm_controller", "gripper_controller")]]
-        for stamp in stamps:
-            if type(stamp) is not int or not 0 <= now - stamp / 1e9 <= step["max_joint_state_age_s"]:
-                raise ContractError("LEARNED_STALE_STATE")
+        check_acquisition_stamps(evidence, now, max_age_s=step["max_joint_state_age_s"])
         if "action_range" in step:
             if "initial_gripper_reference_m" in step:
                 gripper = observed["gripper_controller"]
@@ -401,11 +344,7 @@ def check_execution_start(step, evidence, now, *, steady_now):
         wire = check_hardware(evidence, now, steady_now, step["max_joint_state_age_s"])
         if "initial_gripper_reference_m" in step and abs(wire["raw_reference_m"] - step["initial_gripper_reference_m"]) > 1e-9:
             raise ContractError("LEARNED_START_STATE")
-        inputs = step["learned_proposal"].get("runtime_inputs")
-        if inputs is not None and "hardware_wire_version" in inputs and wire["version"] != inputs["hardware_wire_version"]:
-            raise ContractError("LEARNED_HARDWARE_INVALID")
-        if inputs is not None and observed["gripper_controller"]["hardware_execution"]["clock_binding"] != inputs["clock_binding"]:
-            raise ContractError("LEARNED_HARDWARE_CLOCK_BINDING")
+        check_runtime_binding(step["learned_proposal"], evidence, wire)
         if "initial_hardware_binding" in step:
             binding = step["initial_hardware_binding"]
             if (not isinstance(binding, dict) or set(binding) != {"incarnation", "generation"}

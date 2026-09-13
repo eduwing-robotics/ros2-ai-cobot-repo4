@@ -16,6 +16,8 @@ from pathlib import Path
 
 from tools.fr5_data_factory import ContractError, canonical_digest, validate_motion_program
 from tools.data_factory.learned_action_adapter import fake_rgb
+from tools.data_factory.rollout.execution_state import current_state
+from tools.data_factory.rollout.gripper_evidence import SNAPSHOT_FIELDS
 from tools.data_factory.rollout.finite_plan import (
     FinitePolicyInference, JOINTS, compile_program, validate_proposal,
     _limits, GRIPPER_ENDPOINT_PROJECTION_QUANTA,
@@ -403,6 +405,209 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
         job = OneJob(recorder, tampered, cell)
         self.assertEqual(job.plan_stream("run", src, SCENE, policy)["code"], "EXECUTOR_RESPONSE")
         self.assertIsNone(job.approval_scope)
+
+    def started_owner(self, *, prepare_error=None):
+        """Real OneJob/executor lifecycle; native transport and geometry are synthetic."""
+        class Port(Transport):
+            def __init__(self):
+                super().__init__()
+                self.hardware = True
+                self.stream = None
+                self.polls = 0
+                self.settle = True
+            def open_learned_actuator_stream(self, *, deadline):
+                self.stream = {"active": True, "fenced": False, "owns_goals": False}
+            def poll_learned_actuator_stream(self):
+                self.polls += 1
+                if self.stream and self.stream["fenced"] and self.settle:
+                    self.stream["owns_goals"] = False
+                return []
+            def learned_actuator_stream_status(self):
+                return self.stream or {"active": False, "fenced": False, "owns_goals": False}
+            def fence_learned_actuator_stream(self):
+                self.stream["fenced"] = True
+            def close_learned_actuator_stream(self):
+                if not self.stream["fenced"] or self.stream["owns_goals"]:
+                    raise ContractError("ROS_EXEC_ACTIVE")
+                self.stream = None
+            def poll_active(self):
+                raise AssertionError("Normal stream must not poll finite completion")
+        transport, calls, cell, scene = Port(), [], Cell(), Scene()
+        recorder = Recorder(calls)
+        executor = PickupExecutor(transport, source_clock=lambda: 10., monotonic_clock=lambda: 10.,
+            cell_state_store=cell, scene_state_store=scene, execution_enabled=True)
+        job = OneJob(recorder, executor.process, cell.read)
+        src, policy = cross_workspace_source(), self.policy()
+        self.assertTrue(job.plan_stream("run", src, SCENE, policy)["ok"])
+        self.assertTrue(job.admit_task(task_grant(src, SCENE, policy))["ok"])
+        with mock.patch("tools.data_factory.motion.contact_transition.prepare_request_geometry",
+                        return_value={"status": "PROSPECTIVE"}, side_effect=prepare_error):
+            started = job.start()
+        return job, executor, transport, recorder, calls, cell, scene, started
+
+    def test_normal_start_and_poll_own_native_port_without_finite_steps_or_goals(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+        self.assertEqual((job.state, recorder.state), ("EXECUTING", "RECORDING"))
+        self.assertFalse(cell.ready)
+        self.assertEqual(transport.sent, [])
+        self.assertEqual(calls[:2], [("recorder", "begin"), ("recorder", "status")])
+        self.assertTrue(job.poll()["ok"])
+        run = executor.runs["run"]
+        self.assertNotIn("steps", run["plan"])
+        self.assertNotIn("step_index", run["execution"])
+        self.assertEqual(run["execution"]["native_stream"]["reference_consumed_count"], 0)
+        self.assertNotIn("learned_execution", job.execution_evidence)
+        self.assertEqual(scene.updates, [])
+        self.assertFalse(executor.close())  # Live task ownership cannot be reported closed.
+
+    def test_normal_cancel_retains_recording_only_after_native_drain(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()
+        self.assertTrue(started["ok"], started)
+        # Model an outstanding native handle; no actual goal was sent by this fixture.
+        transport.stream["owns_goals"], transport.settle = True, False
+        cancelled = job.cancel()
+        self.assertFalse(cancelled["ok"])
+        self.assertEqual(job.state, "BLOCKED")
+        self.assertNotIn(("recorder", "retain"), calls)
+        self.assertEqual(recorder.state, "RECORDING")
+        transport.settle = True
+        job.cancel()
+        self.assertIsNone(transport.stream)
+        self.assertIn(("recorder", "retain"), calls)
+        self.assertNotIn(("recorder", "abort"), calls)
+        self.assertEqual(recorder.state, "QUARANTINED_COMMIT")
+        self.assertEqual(scene.updates, [])
+        self.assertEqual(executor.runs["run"]["execution"]["scene_preservation"]["reason_code"], "NO_DISPATCH")
+
+    def test_normal_start_geometry_rejection_sends_nothing_and_does_not_invent_scene_change(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner(
+            prepare_error=ContractError("CONTACT_SCENE_BINDING"))
+        self.assertFalse(started["ok"])
+        self.assertEqual(started["code"], "CONTACT_SCENE_BINDING")
+        self.assertEqual(transport.sent, [])
+        self.assertIsNone(transport.stream)
+        self.assertEqual(scene.updates, [])
+        self.assertTrue(cell.ready)
+
+
+class CurrentStateTest(unittest.TestCase):
+    def fixture(self, *, v5=False):
+        transport = Transport()
+        transport.hardware = True
+        evidence = {"captured_at_s": 10., "captured_monotonic_s": 10.,
+                    "snapshot": transport.snapshot()}
+        hardware = evidence["snapshot"]["gripper_controller"]["hardware_execution"]
+        if v5:
+            wire = {**dict.fromkeys(SNAPSHOT_FIELDS, 0.), **hardware["wire"]}
+            wire.update(version=5., current_max_age_s=.3, host_clock_tolerance_s=.001,
+                        host_receive_steady_s=10., source_progress_steady_s=10.,
+                        producer_sequence=1., connection_epoch=1., configuration_epoch=2.)
+            hardware["wire"] = wire
+            hardware["clock_binding"] = {
+                "schema_version": "fr5.gripper_temporal_policy.v2", "incarnation": [1, 2, 3, 4],
+                "max_age_s": .3, "host_clock_tolerance_s": .001,
+                "connection_epoch": 1, "configuration_epoch": 2}
+        policy = {"robot_description": XML, "runtime_inputs": {
+            "hardware_wire_version": hardware["wire"]["version"],
+            "clock_binding": copy.deepcopy(hardware["clock_binding"])}}
+        return policy, evidence
+
+    def check(self, policy, evidence, **kwargs):
+        return current_state(policy, evidence, 10., steady_now=10., max_age_s=.3, **kwargs)
+
+    def test_static_policy_and_detached_state_without_target_or_completion_rules(self):
+        for v5 in (False, True):
+            with self.subTest(v5=v5):
+                policy, evidence = self.fixture(v5=v5)
+                gripper = evidence["snapshot"]["gripper_controller"]
+                # Current reference need not equal feedback or a frozen output.
+                gripper["reference_position_m"] = .012
+                gripper["sample"]["reference_positions"] = [.012]
+                gripper["hardware_execution"]["wire"]["raw_reference_m"] = .012
+                original = copy.deepcopy((policy, evidence))
+                state = self.check(policy, evidence)
+                self.assertEqual(state, INITIAL)
+                state[0] = 2.
+                self.assertEqual((policy, evidence), original)
+                # Archived policies without runtime_inputs remain supported.
+                self.assertEqual(self.check({"robot_description": XML}, evidence), INITIAL)
+
+    def test_controller_and_acquisition_checks_preserve_failure_codes(self):
+        cases = (
+            ("joint_age", "LEARNED_STALE_STATE"), ("arm_age", "LEARNED_STALE_STATE"),
+            ("gripper_age", "LEARNED_STALE_STATE"), ("capture", "LEARNED_STALE_STATE"),
+            ("joint_stamp", "LEARNED_STALE_STATE"), ("arm_stamp", "LEARNED_STALE_STATE"),
+            ("gripper_stamp", "LEARNED_STALE_STATE"), ("future_stamp", "LEARNED_STALE_STATE"),
+            ("ready", "CONTROLLER_NOT_READY"), ("paused", "LEARNED_CONTROLLER_PAUSED"),
+            ("sample", "ROS_CONTROLLER_SAMPLE"), ("limit", "LEARNED_JOINT_LIMIT"),
+            ("missing_stamp", "LEARNED_STATE_SCHEMA"))
+        for kind, code in cases:
+            with self.subTest(kind=kind):
+                policy, evidence = self.fixture()
+                observed = evidence["snapshot"]
+                if kind == "joint_age": observed["joint_state_age_s"] = .31
+                elif kind in ("arm_age", "gripper_age"): observed[kind.split("_")[0] + "_controller"]["age_s"] = .31
+                elif kind == "capture": evidence["captured_at_s"] = 9.69
+                elif kind == "joint_stamp": observed["joint_state_stamp_ns"] = 9_690_000_000
+                elif kind in ("arm_stamp", "gripper_stamp"): observed[kind.split("_")[0] + "_controller"]["sample"]["ros_stamp_ns"] = 9_690_000_000
+                elif kind == "future_stamp": observed["joint_state_stamp_ns"] = 10_000_000_001
+                elif kind == "ready": observed["arm_controller"]["ready"] = False
+                elif kind == "paused": observed["gripper_controller"]["speed_scaling"] = 0.
+                elif kind == "sample": observed["arm_controller"]["sample"]["feedback_positions"] = []
+                elif kind == "limit": observed["joint_positions"][0] = 4.
+                elif kind == "missing_stamp": del observed["joint_state_stamp_ns"]
+                with self.assertRaisesRegex(ContractError, "^" + code + "$"):
+                    self.check(policy, evidence)
+
+    def test_pending_is_progress_only_and_keeps_fault_and_identity_checks(self):
+        for v5 in (False, True):
+            with self.subTest(v5=v5):
+                policy, evidence = self.fixture(v5=v5)
+                wire = evidence["snapshot"]["gripper_controller"]["hardware_execution"]["wire"]
+                wire.update(generation=1., active_generation=1., completed_generation=0.)
+                with self.assertRaisesRegex(ContractError, "^LEARNED_HARDWARE_UNRESOLVED$"):
+                    self.check(policy, evidence)
+                self.assertEqual(self.check(policy, evidence, allow_pending=True), INITIAL)
+                for field, value, code in (("error", 1., "LEARNED_HARDWARE_UNRESOLVED"),
+                                           ("incarnation_0", 9., "LEARNED_HARDWARE_INCARNATION"),
+                                           ("rpc_active", 1., "LEARNED_HARDWARE_UNRESOLVED"),
+                                           ("active_generation", 2., "LEARNED_HARDWARE_UNRESOLVED")):
+                    original = wire[field]
+                    wire[field] = value
+                    with self.subTest(field=field), self.assertRaisesRegex(ContractError, "^" + code + "$"):
+                        self.check(policy, evidence, allow_pending=True)
+                    wire[field] = original
+
+    def test_native_wire_version_and_clock_binding_are_not_rebound(self):
+        for v5 in (False, True):
+            for change in ("version", "clock"):
+                with self.subTest(v5=v5, change=change):
+                    policy, evidence = self.fixture(v5=v5)
+                    inputs = policy["runtime_inputs"]
+                    if change == "version":
+                        inputs["hardware_wire_version"] = 4
+                        code = "LEARNED_HARDWARE_INVALID"
+                    else:
+                        inputs["clock_binding"]["incarnation"][0] = 9
+                        code = "LEARNED_HARDWARE_CLOCK_BINDING"
+                    with self.assertRaisesRegex(ContractError, "^" + code + "$"):
+                        self.check(policy, evidence)
+
+    def test_v5_delivery_and_sample_coherence_remain_required_while_moving(self):
+        for change, code in (("progress", "LEARNED_HARDWARE_STALE"),
+                             ("sample", "LEARNED_HARDWARE_SAMPLE_BINDING"),
+                             ("epoch", "LEARNED_HARDWARE_INCARNATION"),
+                             ("fault", "LEARNED_HARDWARE_INVALID")):
+            with self.subTest(change=change):
+                policy, evidence = self.fixture(v5=True)
+                wire = evidence["snapshot"]["gripper_controller"]["hardware_execution"]["wire"]
+                wire.update(generation=1., active_generation=1.)
+                wire[{"progress": "source_progress_steady_s", "sample": "arm_j1_rad",
+                      "epoch": "connection_epoch", "fault": "device_main_error"}[change]] = {
+                          "progress": 9.69, "sample": .1, "epoch": 2., "fault": 1.}[change]
+                with self.assertRaisesRegex(ContractError, "^" + code + "$"):
+                    self.check(policy, evidence, allow_pending=True)
 
 
 class FinitePlanTest(unittest.TestCase):

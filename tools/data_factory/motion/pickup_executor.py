@@ -317,6 +317,7 @@ class PickupExecutor:
         observer_closed = self._close_policy_observer()
         streams_owned = any(
             run.get("execution", {}).get("actuator_stream_stop_pending") is True
+            or self._native_task(run) and run.get("state") in ACTIVE_STATES
             for run in self.runs.values()
         )
         if self._phase_event_writer is None:
@@ -1592,6 +1593,8 @@ class PickupExecutor:
             raise ContractError("EXECUTE_SCHEMA")
         if run["state"] != "APPROVED":
             raise ContractError("NOT_APPROVED")
+        if self._native_task(run):
+            return self._execute_stream(run, payload)
         if run.get("precommit_safety", {}).get("status") != "PENDING":
             raise ContractError("PRECOMMIT_SAFETY_REQUIRED")
         if "task_grant" in run:
@@ -1714,6 +1717,104 @@ class PickupExecutor:
             return _response(code="CELL_STATE_ARMING_FAILED", run_id=payload["run_id"], plan_digest=payload["plan_digest"], state="APPROVED")
         return self._execution_response(run, payload["run_id"], payload["plan_digest"], "EXECUTING")
 
+    @staticmethod
+    def _native_task(run):
+        from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA
+        return run["plan"].get("schema_version") == PLAN_SCHEMA
+
+    @classmethod
+    def _run_program(cls, run):
+        return run["plan"]["source_program"] if cls._native_task(run) else run["plan"]
+
+    def _execute_stream(self, run, payload):
+        """Start the same task owner without inventing a first finite output.
+
+        This reserves the native actuator port but sends no goal. Each later
+        revision still needs its actual rows, executable timing and admission.
+        Recorder readiness is owned by the existing OneJob start caller.
+        """
+        from tools.data_factory.rollout.execution_state import current_state
+        from tools.data_factory.rollout.gripper_evidence import identity
+        from tools.data_factory.motion.contact_transition import prepare_request_geometry
+
+        if "task_grant" not in run:
+            raise ContractError("TASK_GRANT_REQUIRED")
+        self._check_task(run)
+        if not self._task_policy_window(run):
+            raise ContractError("TASK_POLICY_BUDGET_EXHAUSTED")
+        plan, source = run["plan"], self._run_program(run)
+        policy = plan["policy"]
+        if (policy["checkpoint"]["runtime"] == "SYNTHETIC_TEST_ONLY"
+                and self.transport.__class__.__module__ == "tools.data_factory.motion.moveit_transport"):
+            raise ContractError("LEARNED_SYNTHETIC_RUNTIME")
+        if not self.execution_enabled:
+            return _response(code="LIVE_EXECUTION_BLOCKED", run_id=payload["run_id"],
+                             plan_digest=run["digest"], state="APPROVED")
+        if getattr(self.transport, "owns_active_goal", True) is not False:
+            raise ContractError("ROS_EXEC_ACTIVE")
+        if self.cell_state_store is None or self.scene_state_store is None:
+            raise ContractError("CELL_NOT_READY" if self.cell_state_store is None else "SCENE_STATE_REQUIRED")
+        observed = self.transport.snapshot(source["planning"]["max_joint_state_age_s"])
+        captured = {"captured_at_s": self.source_clock(), "captured_monotonic_s": self.monotonic_clock(),
+                    "snapshot": observed}
+        state = current_state(policy, captured, self.source_clock(), steady_now=self.monotonic_clock(),
+                              max_age_s=source["planning"]["max_joint_state_age_s"])
+        settings = _gripper_settings(observed["gripper_settings"])
+        required = source["gripper_requirements"]
+        if (settings["hardware_plugin"] != "fairino_hardware/FairinoHardwareInterface"
+                or any(settings[key] != required.get(key, required[key.removeprefix("open_")])
+                       for key in ("velocity_percent", "force_percent", "open_velocity_percent", "open_force_percent"))):
+            raise ContractError("GRIPPER_SETTINGS_MISMATCH")
+        cell = self.cell_state_store.read()
+        if cell["robot_system_id"] != source["robot_system_id"] or cell["cell_ready"] is not True:
+            raise ContractError("CELL_NOT_READY")
+        binding = plan["scene_binding"]
+        digest, revision = binding["scene_state_digest"], binding["revision"]
+        if "source_slot" in binding:
+            slot = binding["source_slot"]
+            if slot["allowed_run_id"] != plan["run_id"]:
+                raise ContractError("SCENE_SLOT_NEXT_RUN")
+            consumed = self.scene_state_store.consume_next_source(slot_id=slot["slot_id"], run_id=plan["run_id"],
+                expected_scene_digest=digest, expected_slot_digest=slot["slot_digest"])
+            digest, revision = consumed["scene_state_digest"], consumed["scene_state"]["revision"]
+        with self.scene_state_store.locked_snapshot(digest, blocking=False) as snapshot:
+            scene = snapshot["scene_state"]
+            item = scene["objects"].get(binding["object_instance_id"])
+            if snapshot["scene_state_digest"] != digest or scene["revision"] != revision:
+                raise ContractError("SCENE_STATE_CHANGED")
+            if not isinstance(item, dict) or item.get("state") != "ON_SURFACE":
+                raise ContractError("SCENE_OBJECT_NOT_READY")
+            try:
+                geometry = prepare_request_geometry(self.transport, plan, item)
+            except ContractError:
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ContractError("CONTACT_REQUEST_GEOMETRY") from exc
+            # Preparation cannot extend either the task budget or source age.
+            self._check_task(run)
+            current_state(policy, captured, self.source_clock(), steady_now=self.monotonic_clock(),
+                          max_age_s=source["planning"]["max_joint_state_age_s"])
+            self.cell_state_store.mark_blocked("EXECUTION_IN_PROGRESS", plan["run_id"], run["digest"],
+                                               expected_state_digest=canonical_digest(cell), blocking=False)
+            run["execution"] = {
+                "lease_id": payload["lease_id"],
+                "lease_deadline": self.monotonic_clock() + source["execution_timeouts_s"]["heartbeat_lease"],
+                "active": False, "motion_dispatch_attempted": False,
+                "scene_object": copy.deepcopy(item), "scene_state_digest": digest, "scene_revision": revision,
+                "snapshot": copy.deepcopy(observed), "initial_state": state,
+                "initial_hardware_incarnation": identity(observed["gripper_controller"]["hardware_execution"]["wire"]),
+                "active_gripper_settings": settings, "request_contact_geometry": geometry,
+                "native_stream": {"status": "OPENING", "reference_consumed_count": 0, "task_outcome": "UNKNOWN"},
+            }
+            run["cancel_event"] = threading.Event()
+            run["state"] = "EXECUTING"
+        try:
+            self.transport.open_learned_actuator_stream(deadline=run["task_deadline"])
+            run["execution"]["native_stream"]["status"] = "WAITING_FOR_POLICY"
+        except Exception as exc:
+            self._fault(run, exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_OPEN")
+        return self._execution_response(run, plan["run_id"], run["digest"], "EXECUTING")
+
     def _execution_response(self, run, run_id, plan_digest, success_code):
         if run["state"] == "BLOCKED":
             response = _response(code=run["failure_code"], run_id=run_id, plan_digest=plan_digest, state="BLOCKED", data=self._execution_data(run))
@@ -1738,7 +1839,7 @@ class PickupExecutor:
             data["terminal_verification"] = copy.deepcopy(execution["terminal_verification"])
         if "scene_preservation" in execution:
             data["scene_preservation"] = copy.deepcopy(execution["scene_preservation"])
-        for key in ("actuator_stream_events", "actuator_stream_feedback", "actuator_stream_drain", "actuator_stream_drain_error"):
+        for key in ("native_stream", "actuator_stream_events", "actuator_stream_feedback", "actuator_stream_drain", "actuator_stream_drain_error"):
             if key in execution:
                 data[key] = copy.deepcopy(execution[key])
         if run.get("recycle_plan_digest") is not None:
@@ -1820,7 +1921,7 @@ class PickupExecutor:
 
     @contextmanager
     def _learned_dispatch_scene(self, run):
-        if "learned_proposal" not in run["plan"]:
+        if "learned_proposal" not in run["plan"] and not self._native_task(run):
             yield
             return
         if self.scene_state_store is None:
@@ -2127,6 +2228,9 @@ class PickupExecutor:
             "status": "NATIVE_HANDLES_TERMINAL", "fenced": True, "owns_goals": False,
         }
         execution["active"] = False
+        execution["cancel_error"] = None
+        if "native_stream" in execution:
+            execution["native_stream"]["status"] = "NATIVE_HANDLES_TERMINAL"
         execution.pop("actuator_stream_stop_pending", None)
 
     def _fault(self, run, code):
@@ -2197,14 +2301,14 @@ class PickupExecutor:
         if not stream_owned:
             execution["active"] = False
         try:
-            execution["snapshot"] = self.transport.snapshot(run["plan"]["planning"]["max_joint_state_age_s"])
+            execution["snapshot"] = self.transport.snapshot(self._run_program(run)["planning"]["max_joint_state_age_s"])
         except Exception as exc:
             execution["snapshot"] = None
             execution["snapshot_error"] = exc.code if isinstance(exc, ContractError) else "SNAPSHOT_FAILED"
         execution["durable_blocked"] = False
         try:
             if self.cell_state_store is not None:
-                options = {"blocking": False} if "learned_proposal" in run["plan"] else {}
+                options = {"blocking": False} if "learned_proposal" in run["plan"] or self._native_task(run) else {}
                 if run.get("continuation_requested") or run.get("learned_history"):
                     cell = self.cell_state_store.read()
                     if (cell.get("run_id") != run["plan"]["run_id"] or cell.get("plan_digest") != run["digest"]
@@ -2221,7 +2325,7 @@ class PickupExecutor:
             item = execution.get("scene_object")
             binding = run["plan"]["scene_binding"]
             if self.scene_state_store is not None and isinstance(item, dict):
-                scene_options = {"blocking": False} if "learned_proposal" in run["plan"] else {}
+                scene_options = {"blocking": False} if "learned_proposal" in run["plan"] or self._native_task(run) else {}
                 slot = binding.get("release_slot")
                 if execution.get("motion_dispatch_attempted") is False:
                     # No transport dispatch was entered in this execution or
@@ -2235,7 +2339,7 @@ class PickupExecutor:
                         "bound_scene_state_digest": execution.get("scene_state_digest", binding["scene_state_digest"]),
                         "bound_scene_revision": execution.get("scene_revision", binding["revision"]),
                     }
-                elif slot is None or "learned_proposal" in run["plan"]:
+                elif slot is None or "learned_proposal" in run["plan"] or self._native_task(run):
                     execution["scene_transition"] = self.scene_state_store.update_object(
                         instance_id=binding["object_instance_id"],
                         object_profile_id=item["object_profile_id"],
@@ -2334,6 +2438,11 @@ class PickupExecutor:
             elif run["state"] in {"PRECONTACT_HUMAN", "GRASP_VERDICT", "SEMANTIC_VERDICT", "LEARNED_CHUNK_COMPLETE", "RELEASE_VERDICT"}:
                 if now > execution["wait_deadline"]:
                     self._fault(run, {"PRECONTACT_HUMAN": "PRECONTACT_TIMEOUT", "GRASP_VERDICT": "GRASP_VERDICT_TIMEOUT", "SEMANTIC_VERDICT": "SEMANTIC_TIMEOUT", "LEARNED_CHUNK_COMPLETE": "LEARNED_CHUNK_TIMEOUT", "RELEASE_VERDICT": "RELEASE_VERDICT_TIMEOUT"}[run["state"]])
+            elif self._native_task(run):
+                try:
+                    self._retain_actuator_stream_events(execution, self.transport.poll_learned_actuator_stream())
+                except Exception as exc:
+                    self._fault(run, exc.code if isinstance(exc, ContractError) else "ROS_EXEC_POLL_FAILED")
             else:
                 try:
                     active = self.transport.poll_active()
@@ -2545,7 +2654,7 @@ class PickupExecutor:
         if not alive or error is not None:
             self._fault(run, failure_code)
             return self._execution_response(run, payload["run_id"], payload["plan_digest"], "HEARTBEAT_OK")
-        run["execution"]["lease_deadline"] = self.monotonic_clock() + run["plan"]["execution_timeouts_s"]["heartbeat_lease"]
+        run["execution"]["lease_deadline"] = self.monotonic_clock() + self._run_program(run)["execution_timeouts_s"]["heartbeat_lease"]
         return self._execution_response(run, payload["run_id"], payload["plan_digest"], "HEARTBEAT_OK")
 
     def _confirm(self, payload):
