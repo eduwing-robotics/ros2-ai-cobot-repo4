@@ -31,7 +31,7 @@
 
 ## Scene & Execution
 
-![Collection의 MoveIt 궤적과 VLA action chunk가 공통 Collision Check를 거친다. PlanningScene의 바닥·후면 벽을 적용하고 읽어 확인하며 궤적 표본과 그리퍼 범위를 검사한다. Bounded Execution은 검사한 계획과 현재 Scene State·시작 상태를 결속해 제어기로 전달한다.](portfolio/execution-safety.drawio.svg)
+![Collection 궤적과 VLA 출력에서 구성한 실행 계획이 같은 계획 검사를 거친다. PlanningScene의 등록 형상과 Scene State의 물체 상태는 각 검사에 입력되며, PickupExecutor가 계획과 실행을 함께 소유한다.](portfolio/execution-safety.drawio.svg)
 
 충돌 검사는 등록된 환경 형상과 궤적 표본을 기준으로 한다.
 
@@ -45,9 +45,9 @@
 | [RosMoveItTransport](../tools/data_factory/motion/moveit_transport.py) | 환경 apply/readback, 직렬화한 궤적의 관절·그리퍼 표본 유효성 |
 | [PickupExecutor](../tools/data_factory/motion/pickup_executor.py) | 검사·승인한 계획 식별값, 시작 관측·장비·장면과 단일 실행 owner |
 
-바닥·후면 벽은 현재 등록된 환경 장애물이다. 큐브의 위치 기록은 충돌 물체 등록이나 grasp attachment를 의미하지 않는다. 검사는 궤적 knot와 구간별 네 보간 표본을 사용하며, 연속 충돌 검증이나 미등록 물체와의 접촉 회피를 보장하지 않는다.
+바닥·후면 벽은 현재 등록된 환경 장애물이다. 물체 위치 기록과 충돌 형상 등록은 별도이다. 기계적 release/reset 경로는 접촉 근거에 결속된 물체를 충돌 형상으로 추가한다. 검사는 궤적 knot와 구간별 네 보간 표본을 사용하며, 연속 충돌 검증이나 미등록 물체와의 접촉 회피를 보장하지 않는다.
 
-구현 근거: main `44b1ee1` · [Collection 회귀](../tests/data_factory/test_motion.py) · [학습 궤적 충돌 회귀](../tests/data_factory/rollout/test_finite_plan.py)
+구현 근거: main `68466a9` · [Collection 회귀](../tests/data_factory/test_motion.py) · [학습 궤적 충돌 회귀](../tests/data_factory/rollout/test_finite_plan.py)
 
 </details>
 
