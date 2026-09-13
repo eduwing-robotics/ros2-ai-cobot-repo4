@@ -246,6 +246,100 @@ class Recorder:
                    if op == "retain" else {})}
 
 
+class AdmissionFreshnessEvidenceTest(unittest.TestCase):
+    def test_expired_admission_survives_one_job_without_effects(self):
+        program = compile_program(source(), proposal())
+        original = copy.deepcopy(program)
+        transport, recorder = mock.Mock(), mock.Mock()
+        clock = mock.Mock(return_value=10.31)
+        executor = PickupExecutor(transport, source_clock=clock)
+        responses = []
+        commands = []
+
+        def request(command):
+            commands.append(copy.deepcopy(command))
+            result = executor.process(command)
+            responses.append(copy.deepcopy(result))
+            return result
+
+        result = OneJob(recorder, request).plan_only("age-check", program, SCENE)
+        self.assertEqual(result["code"], "LEARNED_STALE_OBSERVATION")
+        self.assertEqual(result["planning_response"], responses[0])
+        self.assertEqual(responses[0]["data"]["planning_failure"], {
+            "stage": "INITIAL_PLAN_ADMISSION",
+            "motion_program_digest": canonical_digest(program),
+            "checked_at_s": 10.31,
+            "source_timestamps_s": program["learned_proposal"]["source_timestamps_s"],
+            "inference_completed_at_s": 10.,
+            "max_observation_age_s": .3,
+        })
+        self.assertEqual(executor.runs, {})
+        self.assertEqual(program, original)
+        transport.assert_not_called()
+        self.assertEqual(transport.mock_calls, [])
+        recorder.assert_not_called()
+        clock.return_value = 20.
+        self.assertEqual(executor.process(commands[0]), responses[0])
+        self.assertEqual(clock.call_count, 1)
+
+        for field, value in (("checked_at_s", 10.1), ("checked_at_s", float("nan")),
+                             ("stage", "CONTINUATION_PLAN_ADMISSION"),
+                             ("max_observation_age_s", 1.),
+                             ("inference_completed_at_s", 9.9)):
+            with self.subTest(field=field, value=value):
+                altered = copy.deepcopy(responses[0])
+                altered["data"]["planning_failure"][field] = value
+                failed = OneJob(recorder, lambda _: altered).plan_only("age-check", program, SCENE)
+                self.assertEqual(failed["code"], "EXECUTOR_RESPONSE")
+                self.assertNotIn("planning_response", failed)
+        recorder.assert_not_called()
+
+    def test_public_plan_only_preserves_failure_and_closes_child(self):
+        from tools.data_factory import run_job
+        from tests.data_factory.operator.fixtures import payload, runtime_validated
+
+        program = compile_program(source(), proposal())
+        transport = mock.Mock()
+        executor = PickupExecutor(transport, source_clock=lambda: 10.31)
+        child = SimpleNamespace(request=lambda request, *_: executor.process(request), close=mock.Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_job.run_plan_only(
+                {**payload(), "run_root": directory}, threading.Event(), lambda _: None,
+                resolver=lambda _: (runtime_validated(), program, SCENE),
+                executor_factory=lambda *_: child,
+            )
+            self.assertEqual(result["code"], "LEARNED_STALE_OBSERVATION")
+            failure = result["data"]["planning_response"]["data"]["planning_failure"]
+            self.assertEqual(failure["checked_at_s"], 10.31)
+            self.assertEqual(failure["motion_program_digest"], canonical_digest(program))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        child.close.assert_called_once()
+        self.assertEqual(executor.runs, {})
+        self.assertEqual(transport.mock_calls, [])
+
+    def test_diagnostic_failure_preserves_original_rejection(self):
+        from tools.data_factory.motion import pickup_executor
+        program = compile_program(source(), proposal())
+        transport = mock.Mock()
+        executor = PickupExecutor(transport, source_clock=lambda: 10.31)
+        real_digest = canonical_digest
+
+        def digest(value):
+            if value == program:
+                raise ValueError("diagnostic unavailable")
+            return real_digest(value)
+
+        command = {"schema_version": "fr5.pickup_executor.command.v4", "op_id": "age-check",
+                   "op": "plan", "payload": {"run_id": "age-check", "motion_program": program,
+                                               "scene_binding": SCENE}}
+        with mock.patch.object(pickup_executor, "canonical_digest", side_effect=digest):
+            result = executor.process(command)
+        self.assertEqual(result["code"], "LEARNED_STALE_OBSERVATION")
+        self.assertIsNone(result["data"])
+        self.assertEqual(executor.runs, {})
+        self.assertEqual(transport.mock_calls, [])
+
+
 class FinitePlanTest(unittest.TestCase):
     def setUp(self):
         # Legacy lifecycle tests isolate contact just as they isolate planning.

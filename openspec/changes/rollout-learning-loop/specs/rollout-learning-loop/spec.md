@@ -688,6 +688,12 @@ controller start/pause coherence, staged-release consumption or physical
 qualification. Generation freshness and execution freshness remain distinct
 requirements; original input timestamps SHALL NOT be silently refreshed.
 
+#### Scenario: Initial plan admission rejects an observation that expired after inference
+- **WHEN** a proposal passed inference-time freshness but the sole executor rejects it at initial plan admission
+- **THEN** the original freshness predicate and rejection SHALL remain unchanged, with no motion, recorder, dataset or Scene effects
+- **AND** the existing planning failure response SHALL retain the exact admission-check stage and time, original source timestamps, inference completion, age limit and motion-program digest through OneJob and the public plan-only caller
+- **AND** consumers SHALL reject mismatched or non-rejecting evidence; diagnostic construction failure SHALL preserve the original rejection, and replay SHALL preserve the original check time rather than renew it.
+
 ### Requirement: Frozen approval and current execution evidence have distinct freshness
 
 A finite proposal SHALL retain its original observation timestamps and prove its

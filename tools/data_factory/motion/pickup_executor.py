@@ -575,7 +575,24 @@ class PickupExecutor:
             if "release_slot" in scene_binding:
                 from tools.data_factory.scene_state import validate_release_slot
                 validate_release_slot(scene_binding["release_slot"], motion_program["robot_system_id"])
-            check_freshness(proposal, self.source_clock())
+            checked_at = self.source_clock()
+            try:
+                check_freshness(proposal, checked_at)
+            except ContractError as exc:
+                if exc.code != "LEARNED_STALE_OBSERVATION" or chunk_binding is not None:
+                    raise
+                try:
+                    return _response(code=exc.code, run_id=run_id, data={"planning_failure": {
+                        "stage": "INITIAL_PLAN_ADMISSION",
+                        "motion_program_digest": canonical_digest(motion_program),
+                        "checked_at_s": checked_at,
+                        "source_timestamps_s": copy.deepcopy(proposal["source_timestamps_s"]),
+                        "inference_completed_at_s": proposal["inference_completed_at_s"],
+                        "max_observation_age_s": proposal["max_observation_age_s"],
+                    }})
+                except Exception:
+                    # Diagnostic construction must not replace the original rejection.
+                    raise exc
         action_graph = self._validated_preflight(motion_program)
         observed = self.transport.snapshot(motion_program["planning"]["max_joint_state_age_s"])
         observed = _exact(

@@ -126,6 +126,7 @@ direnv exec . python3 -m unittest tests.data_factory.rollout.test_policy_observa
 
 ## Frozen-plan execution freshness
 
+- [x] Retain initial admission freshness rejection timing through the existing executor/OneJob/public plan-only failure response, with exact proposal binding, unchanged predicate, immutable replay and original-exception preservation. Focused CPU evidence only; actual post-inference stage cost and physical qualification remain open.
 - [x] Preserve inference/plan-admission source-age checks while replacing post-approval input-age reuse with current full-state/controller/hardware admission.
 - [x] Bind the first dispatch to the planning hardware incarnation/generation; leave offline plans without that evidence reviewable but non-executable.
 - [x] Retain original JointState/JTC stamps and validate freshness again after native goal deserialization; reject stale, paused, rebound, superseded or out-of-limit state without sends.

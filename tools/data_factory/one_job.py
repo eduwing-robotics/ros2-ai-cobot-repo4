@@ -565,6 +565,29 @@ class OneJob:
         if not isinstance(data, dict) or set(data) != {"planning_failure"}:
             raise ContractError("EXECUTOR_RESPONSE")
         failure = data["planning_failure"]
+        if response["code"] == "LEARNED_STALE_OBSERVATION":
+            from tools.data_factory.rollout.finite_plan import check_freshness
+
+            proposal = program.get("learned_proposal")
+            fields = {"stage", "motion_program_digest", "checked_at_s", "source_timestamps_s",
+                      "inference_completed_at_s", "max_observation_age_s"}
+            if (
+                not isinstance(proposal, dict) or not isinstance(failure, dict) or set(failure) != fields
+                or response["mode"] not in (MODE, LIVE_MODE, MOTION_ONLY_MODE)
+                or response["run_id"] != run_id or response["state"] != "IDLE"
+                or response["plan_digest"] is not None
+                or failure["stage"] != "INITIAL_PLAN_ADMISSION"
+                or failure["motion_program_digest"] != canonical_digest(program)
+                or any(failure[key] != proposal[key] for key in (
+                    "source_timestamps_s", "inference_completed_at_s", "max_observation_age_s"))
+            ):
+                raise ContractError("EXECUTOR_RESPONSE")
+            try:
+                check_freshness(proposal, failure["checked_at_s"])
+            except ContractError as exc:
+                if exc.code == "LEARNED_STALE_OBSERVATION":
+                    return
+            raise ContractError("EXECUTOR_RESPONSE")
         fields = {"phase", "motion_program_digest", "planned_duration_s", "execution_timeout_s", "result_margin_s"}
         if not isinstance(failure, dict) or set(failure) != fields:
             raise ContractError("EXECUTOR_RESPONSE")

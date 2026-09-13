@@ -57,6 +57,21 @@ directory above. No tests, inference or hardware ran in this review. Independent
 S/D software preparation carries no model-load/inference or physical
 qualification claim.
 
+The next bounded correction now retains `INITIAL_PLAN_ADMISSION` failure timing
+in the existing `planning_failure` response: actual check time, original source
+stamps, inference completion, age limit and program digest. OneJob verifies the
+exact program and reuses the unchanged freshness predicate before forwarding
+evidence; the public plan-only caller already preserves this response. A failed
+diagnostic construction still returns the original rejection; cached operation
+replay retains the original timestamp. Continuation and other failure cases are
+unchanged. Before the correction, the focused consumer test failed because
+`planning_response` was absent. Afterward, the three new evidence checks,
+existing planning-failure tests and native public zero-effects check passed:
+13 tests in0.301s. No full regression, model inference or physical retry ran.
+Logs are `owner-20260913/admission-freshness-{before,final}.log` in the evidence
+directory above. This makes the next natural rejection diagnosable; it does not
+claim a latency improvement or resolve frozen-plan visual validity.
+
 ## September 12 continuation: LeRobot pick-place integration
 
 ### Current boundary: Scene-slot correction CPU-reviewed; physical replay paused
