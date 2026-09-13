@@ -19,6 +19,13 @@ from tools.fr5_data_factory import (
 TIPS = ["finger_tip_left_link", "finger_tip_right_link"]
 
 
+def _binding_inputs(plan):
+    """Read the normal task or historical finite binding, without translating it."""
+    if plan.get("schema_version") == "data_factory.native_learned_task_plan.v1":
+        return plan["source_program"], plan["policy"]["robot_description"]
+    return plan["learned_source_program"], plan.get("learned_proposal", {}).get("robot_description")
+
+
 def lateral_envelope(relation, dimensions, mid, closed_gap):
     """Union initial projection with possible opposed-jaw lateral centering."""
     half = [sum(abs(relation["rotation_columns"][j][i]) * dimensions[j] / 2 for j in range(3)) for i in range(3)]
@@ -44,11 +51,15 @@ def bound_robot_description(transport, plan):
     Every link, joint, collision shape and other model element remains exact.
     """
     actual = transport._robot_description
-    expected_digest = plan["learned_source_program"]["binding_digests"]["robot_description_digest"]
+    program, source = _binding_inputs(plan)
+    expected_digest = program["binding_digests"]["robot_description_digest"]
+    if plan.get("schema_version") == "data_factory.native_learned_task_plan.v1" and (
+            not isinstance(source, str)
+            or "sha256:" + hashlib.sha256(source.encode()).hexdigest() != expected_digest):
+        raise ContractError("CONTACT_MODEL_BINDING")
     if "sha256:" + hashlib.sha256(actual.encode()).hexdigest() == expected_digest:
         return actual
     try:
-        source = plan["learned_proposal"]["robot_description"]
         if "sha256:" + hashlib.sha256(source.encode()).hexdigest() != expected_digest:
             raise ContractError("CONTACT_MODEL_BINDING")
         deployed = ET.fromstring(actual)
@@ -65,7 +76,7 @@ def bound_robot_description(transport, plan):
 
 def prepare(transport, plan, scene_object):
     """Resolve only existing pinned qualified inputs before the first command."""
-    source = plan["learned_source_program"]
+    source, _ = _binding_inputs(plan)
     pins = source["binding_digests"]
     root = getattr(transport, "contact_config_root", Path(__file__).resolve().parents[3] / "config/data_factory")
     _, qualification = bound_document(root, "motion_qualifications", pins["motion_qualification"])
@@ -143,6 +154,217 @@ def prepare(transport, plan, scene_object):
             "closed_gap_bound_m": max(gap(v) for v in grasp["gripper_close"]["acceptable_feedback_m"].values()),
             "fingertip_boxes": [{"center": r[0], "dimensions": r[2]} for r in rows],
             "qualification": qualification, "checked_segments": [], "close": None}
+
+
+def prepare_request_geometry(transport, plan, scene_object):
+    """Bind prospective source/carry/release models; never apply a Scene change.
+
+    Hypotheses are geometry, not detected phases or evidence of successful grip.
+    The qualified nominal relation/lateral envelope is not a bound on arbitrary
+    slip. Existing task admission and subsequent outcome evaluation own that
+    distinction; no stationary close or completion handshake is imposed here.
+    """
+    from tools.fr5_data_factory import validate_motion_program
+    from .moveit_transport import _rotation_quaternion
+
+    plan, scene_object = copy.deepcopy((plan, scene_object))
+    source, _ = _binding_inputs(plan)
+    source = validate_motion_program(source)
+    if source["schema_version"] != "fr5.motion_program.v4":
+        raise ContractError("CONTACT_DESTINATION_BINDING")
+    context = prepare(transport, plan, scene_object)
+    root = getattr(transport, "contact_config_root", Path(__file__).resolve().parents[3] / "config/data_factory")
+    pins, destination = source["binding_digests"], source["destination_binding_digests"]
+    _, grasp = bound_document(root, "grasps", pins["grasp_profile"])
+    _, robot = bound_document(root, "robot_systems", pins["robot_system"])
+    _, qualification = bound_document(root, "motion_qualifications", destination["motion_qualification"])
+    if (any(destination[key] != pins[key] for key in ("object_profile", "grasp_profile", "robot_system", "robot_description_digest"))
+            or qualification["qualification_status"] != "QUALIFIED"
+            or qualification["robot_description_digest"] != pins["robot_description_digest"]
+            or qualification["frames"] != source["frames"]
+            or qualification["robot_system_id"] != source["robot_system_id"]
+            or any(qualification["profile_digests"][key] != destination[key]
+                   for key in ("object_profile", "grasp_profile", "robot_system", "cell_calibration"))
+            or qualification["datum_to_tcp_grasp"] != context["qualification"]["datum_to_tcp_grasp"]
+            or qualification["tool_to_tcp"] != context["qualification"]["tool_to_tcp"]):
+        raise ContractError("CONTACT_DESTINATION_BINDING")
+    _, cell = bound_document(root, "cells", destination["cell_calibration"])
+    _, yaw0 = bound_document(root, "workspace_sheets", destination["yaw0_sheet"])
+    calibration = validate_cell_calibration_document(cell, yaw0=yaw0, robot=robot, required_status="QUALIFIED")
+    pose = plan["scene_binding"]["release_slot"]["pose"]
+    if pose["place_id"] != cell["place_id"]:
+        raise ContractError("CONTACT_DESTINATION_BINDING")
+    resolved = resolve_place_pose(calibration["center"], calibration["x"], calibration["y"], calibration["z"],
+                                  pose["yaw_deg"], pose["x_mm"], pose["y_mm"])
+    datum = {"translation_m": resolved["position_base_m"], "rotation_columns": resolved["rotation_base_columns"]}
+    expected = compose_rigid_transform(datum, qualification["datum_to_tcp_grasp"])
+    clearance = grasp["grasp_geometry"]["release_clearance_mm"] / 1000
+    expected["translation_m"] = [v + clearance * z for v, z in zip(expected["translation_m"], datum["rotation_columns"][2])]
+    lower = next(step["target"] for step in source["steps"] if step["phase"] == "LOWER_LIN")
+    if (canonical_digest(expected) != canonical_digest(lower["base_tcp"])
+            or canonical_digest(compose_rigid_transform(expected, inverse_rigid_transform(qualification["tool_to_tcp"])))
+            != canonical_digest(lower["base_tool"])):
+        raise ContractError("CONTACT_DESTINATION_BINDING")
+
+    # The qualified FR5 model has a fixed, translation-only wrist-to-gripper
+    # mount. Resolve its actual origins; do not hardcode a nominal TCP offset or
+    # ask live FK to manufacture a measured grasp relation.
+    model = ET.fromstring(bound_robot_description(transport, plan))
+    link, translation, visited = "gripper_link", [0., 0., 0.], set()
+    while link != source["frames"]["tool_link"]:
+        joints = [joint for joint in model.findall("joint") if joint.find("child").get("link") == link]
+        if link in visited or len(joints) != 1 or joints[0].get("type") != "fixed":
+            raise ContractError("CONTACT_MODEL_GEOMETRY")
+        visited.add(link)
+        joint = joints[0]
+        origin = joint.find("origin")
+        xyz = [float(v) for v in origin.get("xyz", "0 0 0").split()]
+        if len(xyz) != 3 or any(not math.isfinite(v) for v in xyz) or any(float(v) != 0 for v in origin.get("rpy", "0 0 0").split()):
+            raise ContractError("CONTACT_MODEL_GEOMETRY")
+        translation = [a + b for a, b in zip(translation, xyz)]
+        link = joint.find("parent").get("link")
+    mount = {"translation_m": translation, "rotation_columns": [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]}
+    relation = compose_rigid_transform(inverse_rigid_transform(mount),
+        compose_rigid_transform(qualification["tool_to_tcp"], inverse_rigid_transform(qualification["datum_to_tcp_grasp"])))
+    envelope, dimensions = lateral_envelope(relation, context["dimensions_m"], context["jaw_midplane_m"], context["closed_gap_bound_m"])
+    object_id = plan["scene_binding"]["object_instance_id"]
+    frame = source["frames"]["planning_frame"]
+    if (not isinstance(object_id, str) or not object_id
+            or object_id in {source["planning_scene"][key]["id"] for key in ("floor", "wall")}
+            or frame not in {item.get("name") for item in model.findall("link")}
+            or frame in {joint.find("child").get("link") for joint in model.findall("joint")}):
+        raise ContractError("CONTACT_MODEL_GEOMETRY")
+    proxies = {}
+    for hypothesis, parent, transform, size in (("carried", "gripper_link", envelope, dimensions),
+                                              ("released", frame, datum, context["dimensions_m"])):
+        proxies[hypothesis] = {"object_id": object_id + "::prospective:" + hypothesis,
+            "link_name": parent, "dimensions_m": size, "translation_m": transform["translation_m"],
+            "rotation_xyzw": _rotation_quaternion(transform["rotation_columns"]),
+            "touch_links": TIPS[:] if hypothesis == "carried" else []}
+    result = {"schema_version": "data_factory.request_contact_geometry.v1", "status": "PROSPECTIVE",
+        "semantics": "QUALIFIED_NOMINAL_MODEL_EXPECTATION", "physical_success": False,
+        "plan_digest": canonical_digest(plan), "source_program_digest": canonical_digest(source),
+        "runtime_robot_description_digest": context["runtime_robot_description_digest"],
+        "scene_binding": copy.deepcopy(plan["scene_binding"]), "scene_object": scene_object,
+        "planning_frame": frame, "source_object_id": object_id, "proxies": proxies,
+        "source_datum": context["datum"], "released_datum": datum,
+        "source_dimensions_m": context["dimensions_m"],
+        "fingertip_boxes": context["fingertip_boxes"], "open_m": context["open_m"],
+        "orientation_tolerance_rad": source["planning"]["goal_tolerances"]["orientation_rad"]}
+    result["geometry_digest"] = canonical_digest(result)
+    return result
+
+
+def _request_geometry_binding(context, plan, hypothesis):
+    if (hypothesis not in {"source", "carried", "released"}
+            or context.get("schema_version") != "data_factory.request_contact_geometry.v1"
+            or context.get("status") != "PROSPECTIVE" or context.get("physical_success") is not False
+            or context.get("plan_digest") != canonical_digest(plan)
+            or context.get("geometry_digest") != canonical_digest({k: v for k, v in context.items() if k != "geometry_digest"})):
+        raise ContractError("CONTACT_REQUEST_BINDING")
+
+
+def request_geometry(context, plan, joints, gripper_m, *, hypothesis):
+    """Build one additive /check_state_validity request; caller owns the query."""
+    from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
+    from moveit_msgs.srv import GetStateValidity
+    from shape_msgs.msg import SolidPrimitive
+    from geometry_msgs.msg import Pose
+    _request_geometry_binding(context, plan, hypothesis)
+    values = [*joints, gripper_m]
+    if len(joints) != 6 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        raise ContractError("CONTACT_REQUEST_GEOMETRY")
+    request = GetStateValidity.Request()
+    request.group_name = ""
+    request.robot_state.is_diff = True  # Preserve native existing attachments.
+    request.robot_state.joint_state.name = ["j1", "j2", "j3", "j4", "j5", "j6", "finger_right_joint"]
+    request.robot_state.joint_state.position = list(map(float, values))
+    if hypothesis != "source":
+        obj = context["proxies"][hypothesis]
+        parent = "gripper_link" if hypothesis == "carried" else context["planning_frame"]
+        touch_links = TIPS if hypothesis == "carried" else []
+        if (obj["link_name"] != parent or obj["object_id"] != context["source_object_id"] + "::prospective:" + hypothesis
+                or obj["touch_links"] != touch_links):
+            raise ContractError("CONTACT_REQUEST_GEOMETRY")
+        for key, length in (("dimensions_m", 3), ("translation_m", 3), ("rotation_xyzw", 4)):
+            value = obj[key]
+            if (not isinstance(value, list) or len(value) != length
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in value)
+                    or key == "dimensions_m" and any(v <= 0 for v in value)):
+                raise ContractError("CONTACT_REQUEST_GEOMETRY")
+        if abs(sum(v * v for v in obj["rotation_xyzw"]) - 1) > 1e-9:
+            raise ContractError("CONTACT_REQUEST_GEOMETRY")
+        # A carried model permits its own gripping links. A released cube is
+        # stationary geometry: native touch-links would hide top pressing as
+        # well as legitimate side-jaw contact before our classifier can see it.
+        attached = AttachedCollisionObject(link_name=parent, touch_links=touch_links[:])
+        attached.object.id, attached.object.operation = obj["object_id"], CollisionObject.ADD
+        attached.object.header.frame_id = parent  # No conversion fallback transform.
+        attached.object.pose.orientation.w = 1.
+        attached.object.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=obj["dimensions_m"])]
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = obj["translation_m"]
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = obj["rotation_xyzw"]
+        attached.object.primitive_poses = [pose]
+        request.robot_state.attached_collision_objects = [attached]
+    return request
+
+
+def intended_request_contact(context, plan, hypothesis, contact, *, gripper_pose=None, gripper_m=None):
+    """Only inner-jaw side contact and artificial same-cube duplication are exempt.
+
+    This classifies one contact, not a response. The caller must still reject
+    incomplete/saturated contact results, constraints and every other collision.
+    For fingertip contact the caller supplies native model FK at the exact
+    queried joint/gripper state, not a measured object pose or a policy phase.
+    """
+    _request_geometry_binding(context, plan, hypothesis)
+    source = context["source_object_id"]
+    bodies = {(contact.contact_body_1, contact.body_type_1), (contact.contact_body_2, contact.body_type_2)}
+    values = [contact.depth, contact.position.x, contact.position.y, contact.position.z,
+              contact.normal.x, contact.normal.y, contact.normal.z]
+    if (contact.header.frame_id != context["planning_frame"] or not all(math.isfinite(v) for v in values)
+            or contact.depth < 0 or sum(v * v for v in values[4:]) <= 0):
+        return False
+    if hypothesis != "source":
+        proxy = context["proxies"][hypothesis]["object_id"]
+        if bodies == {(source, contact.WORLD_OBJECT), (proxy, contact.ROBOT_ATTACHED)}:
+            return True
+    object_body = (source, contact.WORLD_OBJECT)
+    datum = context["source_datum"]
+    if hypothesis == "released" and any(
+            bodies == {(context["proxies"]["released"]["object_id"], contact.ROBOT_ATTACHED), (tip, contact.ROBOT_LINK)}
+            for tip in TIPS):
+        object_body = (context["proxies"]["released"]["object_id"], contact.ROBOT_ATTACHED)
+        datum = context["released_datum"]
+    tip = next((tip for tip in TIPS if bodies == {object_body, (tip, contact.ROBOT_LINK)}), None)
+    if tip is None or gripper_pose is None or type(gripper_m) not in (int, float) or not 0 <= gripper_m <= context["open_m"]:
+        return False
+    try:
+        gripper_pose = validate_rigid_transform(gripper_pose, "CONTACT_REQUEST_GEOMETRY")
+    except ContractError:
+        return False
+    def project(frame, vector, *, point=False):
+        if point:
+            vector = [v - t for v, t in zip(vector, frame["translation_m"])]
+        return [sum(a * b for a, b in zip(column, vector)) for column in frame["rotation_columns"]]
+    point, normal = values[1:4], values[4:]
+    source_point = project(datum, point, point=True)
+    jaw_point = project(gripper_pose, point, point=True)
+    normal_length = math.sqrt(sum(v * v for v in normal))
+    minimum_lateral = math.cos(context["orientation_tolerance_rad"])
+    if any(abs(project(frame, normal)[0]) / normal_length < minimum_lateral
+           for frame in (datum, gripper_pose)):
+        return False  # In particular, pressing on the cube's top is not jaw contact.
+    if any(abs(v) > size / 2 + 1e-9 for v, size in zip(source_point, context["source_dimensions_m"])):
+        return False
+    right = tip == "finger_tip_right_link"
+    box = context["fingertip_boxes"][0 if right else 1]
+    center = [box["center"][0] + (gripper_m if right else -gripper_m), *box["center"][1:]]
+    if any(abs(v - c) > size / 2 + 1e-9 for v, c, size in zip(jaw_point, center, box["dimensions"])):
+        return False
+    inner = center[0] + (-1 if right else 1) * box["dimensions"][0] / 2
+    return abs(jaw_point[0] - inner) <= contact.depth + 1e-9
 
 
 def before(transport, plan, step, observation, context):

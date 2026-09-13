@@ -12,10 +12,11 @@ from tools.fr5_data_factory import ContractError, canonical_digest
 from tools.data_factory.motion.moveit_transport import RosMoveItTransport
 from tools.data_factory.motion.pickup_executor import PickupExecutor
 from tools.data_factory.rollout.finite_plan import JOINTS
+from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA, POLICY_SCHEMA
 
 
 class PolicyObservationTest(unittest.TestCase):
-    def task_observer(self):
+    def task_observer(self, *, native_task=False):
         """An already-admitted synthetic task; not physical plan qualification."""
         from tools.data_factory.one_job import OneJob
         from tools.data_factory.rollout.task_authority import task_scope
@@ -32,8 +33,14 @@ class PolicyObservationTest(unittest.TestCase):
         proposal = {"checkpoint": {}, "instruction": "pick", "schema_version": "test-observation-fixture",
                     "robot_description": "test", "velocity_scaling": .1, "period_s": 1/30,
                     "max_observation_age_s": .3, "runtime_inputs": {"camera_topics": topics}}
-        plan = {"run_id": "active-task", "scene_binding": {}, "learned_source_program": source,
-                "learned_proposal": proposal}
+        if native_task:
+            proposal["schema_version"] = POLICY_SCHEMA
+        plan = ({"schema_version": PLAN_SCHEMA,
+                 "run_id": "active-task", "scene_binding": {}, "source_program": source,
+                 "resolved_job_digest": canonical_digest("resolved-job"), "policy": proposal}
+                if native_task else
+                {"run_id": "active-task", "scene_binding": {}, "learned_source_program": source,
+                 "learned_proposal": proposal})
         grant = {"schema_version": "data_factory.learned_task_grant.v1", "grant_id": "grant",
                  "issued_by": "test", "run_id": plan["run_id"], "scope": task_scope(source, {}, proposal),
                  "deadline_s": 200., "terminal_reserve_s": 10., "max_outputs": 2, "revoked": False}
@@ -51,6 +58,68 @@ class PolicyObservationTest(unittest.TestCase):
         job.plan_envelope = {"plan": plan}
         job.execution_evidence = {"actual_owner_event": "unchanged"}
         return job, executor, transport, stream, run, topics
+
+    def test_native_task_plan_reads_and_pending_samples_through_existing_owner(self):
+        # Test-only EXECUTING setup exercises the observer seam; it does not
+        # implement or claim normal task start, dispatch or physical readiness.
+        job, executor, transport, stream, run, topics = self.task_observer(native_task=True)
+        first = job.observe_policy(topics)
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["code"], "LEARNED_OBSERVATION")
+        self.assertEqual(first["observation"]["source_timestamps_s"]["state"], 100.)
+        self.assertEqual((job.state, run["state"]), ("EXECUTING", "EXECUTING"))
+        self.assertEqual(run["execution"]["lease_deadline"], 40.)
+        transport.poll_active.assert_not_called()
+        executor.close()
+
+        job, executor, transport, stream, run, topics = self.task_observer(native_task=True)
+        stream.poll.return_value = None
+        pending = job.observe_policy(topics)
+        self.assertTrue(pending["ok"], pending)
+        self.assertEqual(pending["code"], "LEARNED_OBSERVATION_PENDING")
+        self.assertEqual((job.state, run["execution"]["lease_deadline"]), ("EXECUTING", 40.))
+        executor.close()
+
+    def test_native_task_plan_keeps_cancel_lease_and_topic_scope(self):
+        for change, code in (("lease", "LEASE_BINDING"), ("topic", "LEARNED_CAMERA_MAPPING"),
+                             ("cancel", "LEARNED_CANCELLED")):
+            with self.subTest(change=change):
+                job, executor, transport, stream, run, topics = self.task_observer(native_task=True)
+                if change == "lease":
+                    job.lease_id = "foreign"
+                elif change == "topic":
+                    topics = {**topics, "camera1": "/foreign"}
+                else:
+                    run["cancel_event"].set()
+                result = job.observe_policy(topics)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["code"], code)
+                transport.policy_observation_stream.assert_not_called()
+                self.assertEqual(job.state, "EXECUTING")
+                executor.close()
+
+        job, executor, transport, stream, run, topics = self.task_observer(native_task=True)
+        stream.poll.side_effect = lambda: (run["cancel_event"].set() or {
+            "source_timestamps_s": dict.fromkeys(("state", "camera1", "camera2"), 100.),
+        })
+        self.assertEqual(job.observe_policy(topics)["code"], "LEARNED_CANCELLED")
+        executor.close()
+
+    def test_native_task_plan_preserves_requested_and_source_freshness(self):
+        job, executor, transport, stream, run, topics = self.task_observer(native_task=True)
+        too_old = job.observe_policy(topics, max_observation_age_s=.31)
+        self.assertFalse(too_old["ok"])
+        self.assertEqual(too_old["code"], "LEARNED_STALE_OBSERVATION")
+        transport.policy_observation_stream.assert_not_called()
+        executor.close()
+
+        job, executor, transport, stream, run, topics = self.task_observer(native_task=True)
+        stream.poll.return_value["source_timestamps_s"]["camera2"] = 99.
+        stale = job.observe_policy(topics)
+        self.assertFalse(stale["ok"])
+        self.assertEqual(stale["code"], "LEARNED_STALE_OBSERVATION")
+        self.assertEqual(job.state, "EXECUTING")
+        executor.close()
 
     def test_normal_owner_observation_does_not_require_or_replace_execution_trace(self):
         job, executor, transport, stream, run, topics = self.task_observer()

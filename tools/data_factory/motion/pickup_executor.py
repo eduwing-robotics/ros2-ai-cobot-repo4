@@ -497,7 +497,13 @@ class PickupExecutor:
         """
         run = self._policy_observation_owner(payload)
         from tools.data_factory.rollout.finite_plan import _number, check_freshness
-        proposal = run["plan"]["learned_proposal"]
+        from tools.data_factory.rollout.stream_plan import PLAN_SCHEMA
+        plan = run["plan"]
+        proposal = (
+            plan["policy"]
+            if plan.get("schema_version") == PLAN_SCHEMA
+            else plan["learned_proposal"]
+        )
         age = _number(payload["max_observation_age_s"], "LEARNED_SOURCE_CLOCK")
         if not 0 < age <= proposal["max_observation_age_s"]:
             raise ContractError("LEARNED_STALE_OBSERVATION")
