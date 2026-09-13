@@ -78,6 +78,8 @@ Collection 전용 계획 작성·campaign 운영 기능은 책임을 식별할 �
 - **AND** 영향을 받지 않는 근거와 완료된 물리 효과는 보존하며 독립적인 적격 작업은 계속한다
 
 ### Requirement: Continuous policy execution is independent of evidence observation
+상위 아키텍처는 실제 제품의 실행 요구·책임 경계·네이티브 인터페이스 근거로 선택해야 한다(SHALL). 최소 수정량·기존 구현의 매몰비용·Ponytail 등의 구현 휴리스틱으로 그 선택을 제한해서는 안 된다(MUST NOT). 구현 단순화는 적합한 구조를 선택한 뒤 적용하며, 폴더 분리만으로 실행·추론·증거의 시간적 결합이 해소됐다고 간주해서는 안 된다(MUST NOT).
+
 정책 실행은 목표 주기에 맞춰 연속적으로 동작해야 하며(SHALL), 추론·증거 기록·진단의 주기를 고주기 제어의 완료 장벽으로 사용해서는 안 된다(MUST NOT). 증거 계층은 실제 추론·명령 소비·제어기 결과·관측 owner가 생산한 정보를 연결하는 관찰 책임을 갖는다(SHALL). 증거를 만들기 위해 사용하지 않을 별도 실행 제품이나 행별 정지 경로를 추가해서는 안 된다(MUST NOT). 실행 전 승인·현재 상태·충돌 및 장치 이상에 대한 중단은 기존 단일 실행 owner가 책임진다(SHALL); 관찰자 분리는 해당 조건의 우회를 뜻하지 않는다. 기록의 누락·지연은 사실대로 보존하고, 이를 완전한 실행·성공·학습 승인으로 표시해서는 안 된다(MUST NOT).
 
 #### Scenario: Observation or diagnosis is slower than actuation

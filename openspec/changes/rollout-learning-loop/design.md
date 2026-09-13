@@ -435,6 +435,19 @@ servo/gripper behavior on the installed controller. Before removing this barrier
 attribute the native servo-mode interaction using existing runtime evidence;
 do not add a duplicate Python scheduler or silently reinterpret command order.
 
+Historical attribution found `_restart_servo_after_gripper` in `55ffaf0` and
+pause-until-completion in `056f688f`. The pinned SDK `0553c35`'s `MoveGripper`
+wrapper sends XML-RPC without locally changing the ARM servo session. Archived
+September 2 UDP errors also occur during startup before any gripper command;
+they do not establish that gripper overlap caused the servo failures. Accordingly,
+pause-until-completion is an unverified integration assumption, not a manufacturer
+requirement. Its current protective behavior is not removed by this attribution.
+The native ARM writer and non-realtime gripper worker are reusable interfaces;
+their simultaneous physical operation on this controller remains UNKNOWN. A
+future bounded overlap check must distinguish continued hold packets from actual
+ARM motion, RPC acknowledgement from gripper completion, and native rejection
+from application-inserted pause/restart.
+
 Terminal handling must retain the exact action result and the coherent native
 observation actually used to confirm completion. A fresh buffered sample is not
 necessarily ordered after that result. Existing v5 delivery/source-progress
