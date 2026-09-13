@@ -659,6 +659,93 @@ class TransportActuatorStreamTest(unittest.TestCase):
         consume()
         self.assertEqual(progress.selected_count, 4)
 
+    def test_native_collision_queries_actual_mixed_references_without_motion(self):
+        from moveit_msgs.msg import RobotState
+        from moveit_msgs.srv import GetStateValidity
+        from sensor_msgs.msg import JointState
+        from tools.fr5_data_factory import canonical_digest
+
+        self.transport._GetStateValidity = GetStateValidity
+        self.transport._RobotState = RobotState
+        self.transport._JointState = JointState
+        self.transport._service = Mock(return_value=SimpleNamespace(valid=True, constraint_result=[]))
+        plan = {"frames": {"planning_group": "arm"}, "initial_joint_state": [0.] * 6, "steps": []}
+        pair = self.transport.build_learned_actuator_goals(
+            [0.] * 6 + [.021], [[.001] * 6 + [.012], [.002] * 6 + [.018]],
+            period_s=.1, start_time_ns=42_000_000_000)
+        original = copy.deepcopy(pair)
+        report = self.transport.check_learned_actuator_collision(plan, *pair)
+        self.assertEqual(pair, original)
+        self.assertEqual(report["plan_digest"], canonical_digest(plan))
+        self.assertEqual(report["sample_count"], 13)
+        self.assertFalse(report["physical_tracking_qualified"])
+        samples = report["samples"]
+        self.assertEqual(samples[0]["finger_right_joint_m"], .021)
+        self.assertEqual(samples[1]["joints_rad"], [0.] * 6)
+        self.assertEqual(samples[1]["finger_right_joint_m"], .012)
+        self.assertAlmostEqual(samples[2]["joints_rad"][0], .0002)
+        self.assertEqual(samples[2]["finger_right_joint_m"], .012)
+        self.assertEqual(samples[-1]["joints_rad"], [.002] * 6)
+        self.assertEqual(samples[-1]["finger_right_joint_m"], .018)
+        for call in self.transport._service.call_args_list:
+            request = call.args[2]
+            self.assertEqual(request.group_name, "")  # Whole robot, including gripper.
+            self.assertEqual(list(request.robot_state.joint_state.name),
+                             [f"j{i}" for i in range(1, 7)] + ["finger_right_joint"])
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+        self.assertIsNone(self.transport._active)
+
+        # A unified 7D interpolation would check .0192 here and miss this
+        # native next-point gripper collision at the same ARM reference.
+        def validity(_kind, _name, request, _code):
+            q = request.robot_state.joint_state.position
+            return SimpleNamespace(valid=not (abs(q[0] - .0002) < 1e-12 and q[-1] == .012),
+                                   constraint_result=[])
+        self.transport._service.side_effect = validity
+        with self.assertRaisesRegex(ContractError, "COLLISION_DETECTED"):
+            self.transport.check_learned_actuator_collision(plan, *pair)
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+
+        def mutate_caller(*_args):
+            pair[0].trajectory.points[-1].positions[0] = .9
+            plan["frames"]["planning_group"] = "changed"
+            return SimpleNamespace(valid=True, constraint_result=[])
+        self.transport._service.side_effect = mutate_caller
+        detached = self.transport.check_learned_actuator_collision(plan, *pair)
+        self.assertEqual(detached, report)
+        self.assertEqual(pair[0].trajectory.points[-1].positions[0], .9)
+
+        # Header is part of the exact queried pair, not interchangeable timing.
+        self.transport._service.side_effect = None
+        later = copy.deepcopy(original)
+        for item in later:
+            item.trajectory.header.stamp.sec += 1
+        self.assertNotEqual(self.transport.check_learned_actuator_collision(plan, *later)["native_pair_digest"],
+                            report["native_pair_digest"])
+
+    def test_native_collision_rejects_unsupported_timing_or_derivatives_before_query(self):
+        pair = self.transport.build_learned_actuator_goals(
+            [0.] * 6 + [.021], [[.001] * 6 + [.012]], period_s=.1, start_time_ns=42_000_000_000)
+        self.transport._service = Mock()
+        for change in (
+            lambda a, g: setattr(a.trajectory.points[1], "velocities", [0.] * 6),
+            lambda a, g: setattr(g.trajectory.points[1], "accelerations", [0.]),
+            lambda a, g: setattr(g.trajectory.points[1].time_from_start, "nanosec", 200_000_000),
+            lambda a, g: g.trajectory.points.pop(),
+            lambda a, g: setattr(a.trajectory.points[0].time_from_start, "nanosec", 1),
+            lambda a, g: setattr(g.trajectory.header.stamp, "sec", 43),
+        ):
+            with self.subTest(change=change):
+                arm, gripper = copy.deepcopy(pair)
+                change(arm, gripper)
+                with self.assertRaises(ContractError):
+                    self.transport.check_learned_actuator_collision({}, arm, gripper)
+        self.transport._service.assert_not_called()
+        self.client.send_goal_async.assert_not_called()
+        self.transport.gripper.send_goal_async.assert_not_called()
+
     def test_native_send_failure_preserves_actual_attempt_counts(self):
         for failed_actuator, expected in (("arm", (1, 0)), ("gripper", (1, 1))):
             with self.subTest(actuator=failed_actuator):

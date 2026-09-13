@@ -1070,6 +1070,20 @@ class RosMoveItTransport:
         """
         if self._execution_locked or not isinstance(self._active, ActuatorStream):
             raise ContractError("ROS_EXEC_ACTIVE")
+        self._validate_learned_actuator_goals(arm_goal, gripper_goal)
+        stream = self._active
+        before = stream.submission_attempts
+        try:
+            stream.submit(arm_goal, gripper_goal, revision=revision, dispatch_guard=dispatch_guard)
+        finally:
+            # A native send may have been entered before its response fails.
+            # Count attempts, never turn missing acknowledgement into no-send.
+            after = stream.submission_attempts
+            self._execute_goal_count += after["arm"] - before["arm"]
+            self._gripper_goal_count += after["gripper"] - before["gripper"]
+
+    def _validate_learned_actuator_goals(self, arm_goal, gripper_goal):
+        """Shared message checks for native submission and geometry consumers."""
         for goal, names in ((arm_goal, JOINT_ORDER), (gripper_goal, ["finger_right_joint"])):
             if (not isinstance(goal, self._FollowJointTrajectory.Goal)
                     or list(goal.trajectory.joint_names) != names
@@ -1094,16 +1108,46 @@ class RosMoveItTransport:
                 or stamp.sec < 0 or not 0 <= stamp.nanosec < 1_000_000_000
                 or stamp.sec == 0 and stamp.nanosec == 0):
             raise ContractError("ROS_EXEC_STEP")
-        stream = self._active
-        before = stream.submission_attempts
-        try:
-            stream.submit(arm_goal, gripper_goal, revision=revision, dispatch_guard=dispatch_guard)
-        finally:
-            # A native send may have been entered before its response fails.
-            # Count attempts, never turn missing acknowledgement into no-send.
-            after = stream.submission_attempts
-            self._execute_goal_count += after["arm"] - before["arm"]
-            self._gripper_goal_count += after["gripper"] - before["gripper"]
+
+    def check_learned_actuator_collision(self, plan, arm_goal, gripper_goal):
+        """Check the exact native reference pair, not a unified 7D spline.
+
+        This is a geometry consumer for position-only ARM linear interpolation
+        and gripper NONE (next-point selection). It reuses the existing sampled
+        MoveIt checks, not a physical tracking/contact guarantee or admission.
+        Current Scene, carried-object geometry and permitted contact must be
+        supplied by the existing execution owner before this query. No goal is
+        sent or stream opened, and neither input message is changed.
+        """
+        from rosidl_runtime_py.convert import message_to_ordereddict
+
+        plan = copy.deepcopy(plan)
+        arm_goal, gripper_goal = copy.deepcopy((arm_goal, gripper_goal))
+        self._validate_learned_actuator_goals(arm_goal, gripper_goal)
+        arm, gripper = arm_goal.trajectory.points, gripper_goal.trajectory.points
+        if (len(arm) < 2 or len(arm) != len(gripper)
+                or arm[0].time_from_start.sec != 0 or arm[0].time_from_start.nanosec != 0
+                or any(a.time_from_start != g.time_from_start for a, g in zip(arm, gripper))
+                or any(p.velocities or p.accelerations or p.effort for p in [*arm, *gripper])):
+            raise ContractError("COLLISION_NATIVE_INTERPOLATION")
+
+        def references():
+            yield "initial", list(arm[0].positions), gripper[0].positions[0]
+            for index, (prior, current) in enumerate(zip(arm, arm[1:])):
+                # Include interval entry: NONE already selects the next
+                # gripper target while ARM still starts from the prior point.
+                for part in range(6):
+                    joints = [a + (b - a) * part / 5
+                              for a, b in zip(prior.positions, current.positions)]
+                    yield f"reference:{index}:{part}", joints, gripper[index + 1].positions[0]
+
+        report = self._check_plan_collision(plan, gripper[0].positions[0], reference_samples=references())
+        return {**report, "schema_version": "data_factory.native_actuator_collision_report.v1",
+                "native_pair_digest": canonical_digest({
+                    "arm": message_to_ordereddict(arm_goal),
+                    "gripper": message_to_ordereddict(gripper_goal)}),
+                "reference_semantics": "ARM_LINEAR_GRIPPER_NEXT_POINT",
+                "physical_tracking_qualified": False}
 
     def poll_learned_actuator_stream(self):
         if not isinstance(self._active, ActuatorStream):
@@ -1788,7 +1832,7 @@ class RosMoveItTransport:
         if not response.goals_canceling:
             raise ContractError("ROS_PLAN_CANCEL_REJECTED")
 
-    def _check_plan_collision(self, plan, initial_gripper):
+    def _check_plan_collision(self, plan, initial_gripper, *, reference_samples=None):
         request_type = self._GetStateValidity.Request
         gripper = float(initial_gripper)
         samples, failures = [], []
@@ -1800,7 +1844,7 @@ class RosMoveItTransport:
             positions = [gripper] if feedback_bounds is None else sorted({gripper, *feedback_bounds.values()})
             for position in positions:
                 request = request_type()
-                request.group_name = "" if "learned_proposal" in plan or plan.get("mechanical_terminal") else plan["frames"]["planning_group"]
+                request.group_name = "" if reference_samples is not None or "learned_proposal" in plan or plan.get("mechanical_terminal") else plan["frames"]["planning_group"]
                 request.robot_state = self._RobotState(
                     joint_state=self._JointState(
                         name=[*JOINT_ORDER, "finger_right_joint"],
@@ -1841,8 +1885,13 @@ class RosMoveItTransport:
                 if not evidence["valid"]:
                     failures.append(evidence)
 
-        check("initial", plan["initial_joint_state"])
-        for step in (segment for outer in plan["steps"] for segment in outer.get("held_target_segments", [outer])):
+        if reference_samples is None:
+            check("initial", plan["initial_joint_state"])
+        else:
+            for label, joints, gripper in reference_samples:
+                check(label, joints)
+        for step in (segment for outer in (plan["steps"] if reference_samples is None else [])
+                     for segment in outer.get("held_target_segments", [outer])):
             feedback_bounds = step.get("acceptable_feedback_m") if step["type"] == "ARM" else None
             if feedback_bounds is not None and "native_close_feedback" in step:
                 calibrated = step["native_close_feedback"]["requirements"]["acceptable_feedback_m"]

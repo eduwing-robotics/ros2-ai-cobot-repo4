@@ -518,6 +518,18 @@ producer, inference scheduler or cursor advancement is introduced. This software
 seam does not itself qualify concurrent hardware commands; normal task admission,
 driver coexistence/retargeting and full 7D consumption still require integration.
 
+The native-pair geometry consumer checks the actual position-only ARM-linear /
+gripper-next-point references through the existing whole-robot MoveIt validity
+query. It includes interval entry, where the new gripper reference is already
+selected but ARM remains at the preceding point. A unified seven-axis linear
+interpolation can miss a collision at that combination. The detached report
+binds the original plan and exact pair (including timestamps); it neither sends
+goals nor changes Collection interpolation. This is sampled reference geometry,
+not physical tracking or close/carry/open qualification. Normal stream admission
+must still supply its current Scene/contact context and consume this report;
+the old stationary, source-only contact checks cannot authorize a whole learned
+pick-and-place horizon merely because this reference check passes.
+
 The installed JTC `4.40.1-1noble.20260615.171409` predates the native preemption
 result-delivery fix; its binary retains the old `Current goal cancelled due to
 new incoming action.` branch. Waiting for its lost predecessor result could

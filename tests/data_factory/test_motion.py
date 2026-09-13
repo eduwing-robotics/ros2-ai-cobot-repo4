@@ -549,7 +549,15 @@ class Test(unittest.TestCase):
      else:
       executor._fault(executor.runs["run"],"TEST_CANCEL")
      self.assertEqual(executor.runs["run"]["state"],"BLOCKED")
-     self.assertEqual(executor.runs["run"]["execution"]["scene_state_error"],"SCENE_STATE_BUSY")
+     execution=executor.runs["run"]["execution"]
+     if chunk=="1":
+      self.assertIs(execution["motion_dispatch_attempted"],False)
+      self.assertNotIn("scene_state_error",execution)
+      self.assertEqual(execution["scene_preservation"]["status"],"NOT_UPDATED")
+      self.assertEqual(execution["scene_preservation"]["reason_code"],"NO_DISPATCH")
+     else:
+      self.assertTrue(execution["motion_dispatch_attempted"])
+      self.assertEqual(execution["scene_state_error"],"SCENE_STATE_BUSY")
      self.assertEqual(len(transport.sent),int(chunk)-1)
      self.assertEqual(scene._path().read_bytes(),before)
     finally:
