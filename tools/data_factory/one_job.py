@@ -453,8 +453,9 @@ class OneJob:
                              else self.plan_digest)
             if expected_plan is not None and response["plan_digest"] not in ({expected_plan} if response["ok"] else {None, expected_plan}):
                 raise ContractError("EXECUTOR_BINDING")
-            self.executor_state = response["state"]
-            if op != "plan" and isinstance(response.get("data"), dict):
+            if op != "observe_policy":
+                self.executor_state = response["state"]
+            if op not in {"plan", "observe_policy"} and isinstance(response.get("data"), dict):
                 if self.plan_envelope and "learned_proposal" in self.plan_envelope["plan"]:
                     from tools.data_factory.rollout.finite_plan import validate_execution_trace
                     from tools.data_factory.rollout.finite_plan import validate_execution_history
@@ -1207,6 +1208,33 @@ class OneJob:
             return self._abort(exc.code)
         self.state = "EXECUTING"
         return self._result(True, "GRASP_VERDICT_ACCEPTED")
+
+    def observe_policy(self, camera_topics, max_observation_age_s=.3):
+        """Poll task-scoped inputs independently of reference completion.
+
+        The response is observation evidence only. Do not replace canonical
+        execution evidence with RGB or require a finite trace for this read.
+        Normal polling/heartbeats retain their existing lifecycle ownership.
+        """
+        if self.state not in {"EXECUTING", "LEARNED_CHUNK_COMPLETE"} or self.approval_scope != "SCOPED_TASK_GRANT":
+            return self._result(False, "TASK_GRANT_STATE")
+        try:
+            response = self._request("executor", "observe_policy", {
+                "run_id": self.run_id, "plan_digest": self.plan_digest,
+                "lease_id": self.lease_id, "camera_topics": camera_topics,
+                "max_observation_age_s": max_observation_age_s,
+            }, allowed_failure=True, update_state=False)
+            if not response["ok"]:
+                return self._result(False, response["code"])
+            data = response["data"]
+            if (response["state"] not in {"EXECUTING", "LEARNED_CHUNK_COMPLETE"}
+                    or not isinstance(data, dict)
+                    or response["code"] not in {"LEARNED_OBSERVATION", "LEARNED_OBSERVATION_PENDING"}
+                    or set(data) != ({"observation"} if response["code"] == "LEARNED_OBSERVATION" else set())):
+                raise ContractError("LEARNED_OBSERVATION_SCHEMA")
+            return self._result(True, response["code"], **copy.deepcopy(data))
+        except ContractError as exc:
+            return self._result(False, exc.code)
 
     def observe_learned_boundary(self, camera_topics, max_observation_age_s=.3):
         """Read fresh inputs under the existing lease; grant no next-plan authority."""

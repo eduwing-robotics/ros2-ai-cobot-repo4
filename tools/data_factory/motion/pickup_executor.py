@@ -50,7 +50,7 @@ PHASES = (
 ARM_PHASES = frozenset(PHASES) - {"GRIPPER_CLOSE", "GRIPPER_OPEN"}
 JOINT_ORDER = ["j1", "j2", "j3", "j4", "j5", "j6"]
 COMMAND_FIELDS = {"schema_version", "op_id", "op", "payload"}
-COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "plan", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
+COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "observe_policy", "plan", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
 ACTIVE_STATES = {"EXECUTING", "PRECONTACT_HUMAN", "GRASP_VERDICT", "SEMANTIC_VERDICT", "LEARNED_CHUNK_COMPLETE", "RELEASE_VERDICT"}
 RECYCLE_PHASES = ("RECYCLE_APPROACH_PTP", "LOWER_LIN", "GRIPPER_OPEN", "RETREAT_LIN", "SAFE_POSE_PTP")
 EXECUTION_RESULT_MARGIN_S = 2.0
@@ -305,6 +305,7 @@ class PickupExecutor:
         )
         self.cache = {}
         self._cached_observation = None
+        self._policy_observer = None
         self.runs = {}
         self._generation = None  # One pending output on this existing command owner.
         self._phase_event_writer = None
@@ -313,14 +314,27 @@ class PickupExecutor:
         if self._generation is not None:
             self._generation["cancelled"] = True
         self._retire_observation_cache()
+        observer_closed = self._close_policy_observer()
         if self._phase_event_writer is None:
-            return True
+            return observer_closed
         ok = self._phase_event_writer.close()
         if not ok:
             for run in self.runs.values():
                 if "execution" in run:
                     run["execution"]["behavior_report_status"] = "BEHAVIOR_REPORT_UNAVAILABLE"
-        return ok
+        return ok and observer_closed
+
+    def _close_policy_observer(self):
+        if self._policy_observer is None:
+            return True
+        try:
+            self._policy_observer[1].close()
+        except Exception:
+            # Observation cleanup cannot prevent the actual motion stop owner.
+            # Keep the handle so close() can retry and report incomplete cleanup.
+            return False
+        self._policy_observer = None
+        return True
 
     def _emit_phase_event(self, run, event, step, action_status, evidence):
         if "mechanical_terminal" in run and step["phase"] in RECYCLE_PHASES:
@@ -402,11 +416,21 @@ class PickupExecutor:
         except ContractError as exc:
             return _response(code=exc.code, mode=self.mode)
 
-        # Idempotent retries still give the existing lease/stop owner a tick.
-        self.tick()
+        # Input reads do not drive actuation/completion. Normal polling and
+        # heartbeats retain the lease/stop owner's tick; reads check their scope.
+        if op != "observe_policy":
+            self.tick()
         previous = self.cache.get(op_id)
         if previous is not None:
             if previous[0] == request_digest:
+                if op == "observe_policy":
+                    try:
+                        self._policy_observation_owner(request["payload"])
+                    except ContractError as exc:
+                        self._retire_observation_cache(exc.code)
+                        self.cache[op_id] = (request_digest, {
+                            **previous[1], "ok": False, "code": exc.code, "data": None})
+                        return copy.deepcopy(self.cache[op_id][1])
                 if self._cached_observation is not None and self._cached_observation[0] == op_id:
                     from tools.data_factory.rollout.finite_plan import check_freshness
                     age = request["payload"]["max_observation_age_s"]
@@ -438,9 +462,62 @@ class PickupExecutor:
             # deep copies, avoiding a full history copy per heartbeat in cache.
             data["learned_history"] = history
         self.cache[op_id] = (request_digest, snapshot)
-        if op == "capture_observation" and snapshot["ok"]:
+        if op in {"capture_observation", "observe_policy"} and snapshot["ok"] and "observation" in (snapshot.get("data") or {}):
             self._cached_observation = (op_id, self.monotonic_clock())
         return copy.deepcopy(snapshot)
+
+    def _policy_observation_owner(self, payload):
+        run = self._bound(payload)
+        if (self.motion_only_binding_digest is not None or "task_grant" not in run
+                or "mechanical_terminal" in run
+                or run["state"] not in {"EXECUTING", "LEARNED_CHUNK_COMPLETE"}):
+            raise ContractError("TASK_GRANT_STATE")
+        self._check_task(run)
+        execution = run["execution"]
+        if payload["lease_id"] != execution["lease_id"]:
+            raise ContractError("LEASE_BINDING")
+        if run["cancel_event"].is_set():
+            raise ContractError("LEARNED_CANCELLED")
+        if self.monotonic_clock() >= execution["lease_deadline"]:
+            raise ContractError("HEARTBEAT_TIMEOUT")
+        return run
+
+    def _observe_policy(self, payload):
+        """Read the current task's source observer without waiting for motion.
+
+        This does not advance references, admit an output, renew a lease or
+        change Scene/evidence authority. Initial absence is a pending sample,
+        not a physical failure or a fabricated fresh observation.
+        """
+        fields = {"run_id", "plan_digest", "lease_id", "camera_topics", "max_observation_age_s"}
+        run = self._policy_observation_owner(_exact(payload, fields, "LEARNED_OBSERVATION_SCHEMA"))
+        from tools.data_factory.rollout.finite_plan import _number, check_freshness
+        proposal = run["plan"]["learned_proposal"]
+        age = _number(payload["max_observation_age_s"], "LEARNED_SOURCE_CLOCK")
+        if not 0 < age <= proposal["max_observation_age_s"]:
+            raise ContractError("LEARNED_STALE_OBSERVATION")
+        inputs = proposal.get("runtime_inputs")
+        if inputs is None or payload["camera_topics"] != inputs["camera_topics"]:
+            raise ContractError("LEARNED_CAMERA_MAPPING")
+        binding = copy.deepcopy(payload)
+        if self._policy_observer is not None and self._policy_observer[0] != binding:
+            if not self._close_policy_observer():
+                raise ContractError("LEARNED_OBSERVATION_CLOSE_UNCONFIRMED")
+        if self._policy_observer is None:
+            factory = getattr(self.transport, "policy_observation_stream", None)
+            if not callable(factory):
+                raise ContractError("LEARNED_OBSERVATION_UNAVAILABLE")
+            self._policy_observer = (binding, factory(payload["camera_topics"], age))
+        observer = self._policy_observer[1]
+        observation = self.transport.poll_policy_observation(observer)
+        self._policy_observation_owner(payload)  # Late conversion cannot revive authority.
+        if observation is None:
+            return _response(code="LEARNED_OBSERVATION_PENDING", ok=True,
+                run_id=payload["run_id"], plan_digest=payload["plan_digest"], state=run["state"], data={})
+        check_freshness({"source_timestamps_s": observation["source_timestamps_s"],
+                         "max_observation_age_s": age}, self.source_clock())
+        return _response(code="LEARNED_OBSERVATION", ok=True, run_id=payload["run_id"],
+            plan_digest=payload["plan_digest"], state=run["state"], data={"observation": observation})
 
     def _capture_observation(self, payload):
         self._check_pending_generation()
@@ -2031,6 +2108,15 @@ class PickupExecutor:
             self._tick()
         finally:
             self._ticking = False
+            if self._policy_observer is not None:
+                binding, _ = self._policy_observer
+                run = self.runs.get(binding["run_id"])
+                if (run is None or run.get("digest") != binding["plan_digest"]
+                        or run["state"] not in {"EXECUTING", "LEARNED_CHUNK_COMPLETE"}
+                        or "mechanical_terminal" in run
+                        or run.get("cancel_event") is not None and run["cancel_event"].is_set()):
+                    self._retire_observation_cache()
+                    self._close_policy_observer()
 
     def _tick(self):
         for run in self.runs.values():

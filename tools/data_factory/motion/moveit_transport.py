@@ -1315,6 +1315,15 @@ class RosMoveItTransport:
             lambda: (self._joint_state, self._joint_state_received_at),
             camera_topics, max_age_s, clock=self._clock)
 
+    def poll_policy_observation(self, observer):
+        """Service this owner's callbacks once without waiting for motion.
+
+        Called on the low-rate observation path, including between outputs.
+        This is not a second ROS executor or a motion completion barrier.
+        """
+        self._rclpy.spin_once(self.node, timeout_sec=0.0)
+        return observer.poll()
+
     def capture_policy_observation(self, camera_topics, max_age_s):
         """Legacy bounded capture, using the same source observer as streaming.
 

@@ -1,5 +1,6 @@
 """Actual ROS message serialization and native capture methods, without ROS init."""
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -7,13 +8,131 @@ from unittest import mock
 from rclpy.serialization import deserialize_message, serialize_message
 from sensor_msgs.msg import Image, JointState
 
-from tools.fr5_data_factory import ContractError
+from tools.fr5_data_factory import ContractError, canonical_digest
 from tools.data_factory.motion.moveit_transport import RosMoveItTransport
 from tools.data_factory.motion.pickup_executor import PickupExecutor
 from tools.data_factory.rollout.finite_plan import JOINTS
 
 
 class PolicyObservationTest(unittest.TestCase):
+    def task_observer(self):
+        """An already-admitted synthetic task; not physical plan qualification."""
+        from tools.data_factory.one_job import OneJob
+        from tools.data_factory.rollout.task_authority import task_scope
+        observation = {"source_timestamps_s": dict.fromkeys(("state", "camera1", "camera2"), 100.),
+                       "observation.state": [0.] * 7,
+                       "observation.images.camera1": {"data_hex": "010203"}}
+        stream = SimpleNamespace(poll=mock.Mock(return_value=observation), close=mock.Mock())
+        transport = SimpleNamespace(policy_observation_stream=mock.Mock(return_value=stream),
+            poll_policy_observation=lambda observer: observer.poll(),
+            poll_active=mock.Mock(return_value=None))
+        executor = PickupExecutor(transport, source_clock=lambda: 100., monotonic_clock=lambda: 20.)
+        source = {"robot_system_id": "fr5", "steps": []}
+        topics = {"camera1": "/up", "camera2": "/wrist"}
+        proposal = {"checkpoint": {}, "instruction": "pick", "schema_version": "test-observation-fixture",
+                    "robot_description": "test", "velocity_scaling": .1, "period_s": 1/30,
+                    "max_observation_age_s": .3, "runtime_inputs": {"camera_topics": topics}}
+        plan = {"run_id": "active-task", "scene_binding": {}, "learned_source_program": source,
+                "learned_proposal": proposal}
+        grant = {"schema_version": "data_factory.learned_task_grant.v1", "grant_id": "grant",
+                 "issued_by": "test", "run_id": plan["run_id"], "scope": task_scope(source, {}, proposal),
+                 "deadline_s": 200., "terminal_reserve_s": 10., "max_outputs": 2, "revoked": False}
+        grant["grant_digest"] = canonical_digest(grant)
+        digest = canonical_digest(plan)
+        run = {"plan": plan, "digest": digest, "state": "EXECUTING", "task_grant": grant,
+               "task_deadline": 40., "cancel_event": threading.Event(),
+               "execution": {"lease_id": "lease", "lease_deadline": 40., "active": True}}
+        executor.runs[plan["run_id"]] = run
+        recorder = mock.Mock(side_effect=AssertionError("observation called recorder"))
+        job = OneJob(recorder, executor.process)
+        job.state, job.approval_scope = "EXECUTING", "SCOPED_TASK_GRANT"
+        job.executor_state = "EXECUTING"
+        job.run_id, job.plan_digest, job.lease_id = plan["run_id"], digest, "lease"
+        job.plan_envelope = {"plan": plan}
+        job.execution_evidence = {"actual_owner_event": "unchanged"}
+        return job, executor, transport, stream, run, topics
+
+    def test_normal_owner_observation_does_not_require_or_replace_execution_trace(self):
+        job, executor, transport, stream, run, topics = self.task_observer()
+        with mock.patch("tools.data_factory.rollout.finite_plan.validate_execution_trace",
+                        side_effect=AssertionError("observation required finite execution trace")):
+            first = job.observe_policy(topics)
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["code"], "LEARNED_OBSERVATION")
+            self.assertTrue(run["execution"]["active"])
+            self.assertEqual(job.execution_evidence, {"actual_owner_event": "unchanged"})
+            self.assertEqual(run["execution"]["lease_deadline"], 40.)
+            transport.poll_active.assert_not_called()
+            for _ in range(4):
+                self.assertTrue(job.observe_policy(topics)["ok"])
+            self.assertEqual(transport.policy_observation_stream.call_count, 1)
+            bodies = [r for _, r in executor.cache.values() if "observation" in (r.get("data") or {})]
+            self.assertEqual(len(bodies), 1)
+        executor.close()
+        stream.close.assert_called_once()
+
+    def test_owner_observation_pending_is_not_failure_or_task_outcome(self):
+        job, executor, transport, stream, run, topics = self.task_observer()
+        stream.poll.return_value = None
+        result = job.observe_policy(topics)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["code"], "LEARNED_OBSERVATION_PENDING")
+        self.assertNotIn("observation", result)
+        self.assertEqual(job.state, "EXECUTING")
+        self.assertIsNone(job.semantic)
+        self.assertTrue(job.observe_policy(topics)["ok"])
+        self.assertEqual(transport.policy_observation_stream.call_count, 1)
+        executor.close()
+
+    def test_owner_observation_binding_and_late_cancel_remain_enforced(self):
+        for field, value, code in (("run_id", "foreign", "RUN_NOT_FOUND"),
+                                   ("plan_digest", "f" * 64, "PLAN_DIGEST_MISMATCH"),
+                                   ("lease_id", "foreign", "LEASE_BINDING")):
+            job, executor, transport, stream, run, topics = self.task_observer()
+            setattr(job, field, value)
+            self.assertEqual(job.observe_policy(topics)["code"], code)
+            self.assertEqual(job.executor_state, "EXECUTING")
+            transport.policy_observation_stream.assert_not_called()
+        job, executor, transport, stream, run, topics = self.task_observer()
+        self.assertEqual(job.observe_policy({**topics, "camera1": "/foreign"})["code"], "LEARNED_CAMERA_MAPPING")
+        transport.policy_observation_stream.assert_not_called()
+        def cancel_during_read():
+            run["cancel_event"].set()
+            return {"source_timestamps_s": dict.fromkeys(("state", "camera1", "camera2"), 100.)}
+        stream.poll.side_effect = cancel_during_read
+        result = job.observe_policy(topics)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "LEARNED_CANCELLED")
+        self.assertNotIn("observation", result)
+        self.assertEqual(job.execution_evidence, {"actual_owner_event": "unchanged"})
+        executor.close()
+
+    def test_cancel_retires_cached_observation_before_idempotent_retry(self):
+        job, executor, transport, stream, run, topics = self.task_observer()
+        with mock.patch.object(executor, "_process", wraps=executor._process) as process:
+            self.assertTrue(job.observe_policy(topics)["ok"])
+            request = process.call_args.args[0]
+        run["cancel_event"].set()
+        retry = executor.process(request)
+        self.assertFalse(retry["ok"])
+        self.assertIsNone(retry["data"])
+        self.assertEqual(stream.poll.call_count, 1)
+        executor.close()
+        stream.close.assert_called_once()
+        self.assertEqual(job.execution_evidence, {"actual_owner_event": "unchanged"})
+
+    def test_transport_observation_pump_does_not_wait_for_motion_completion(self):
+        transport = object.__new__(RosMoveItTransport)
+        transport.node = object()
+        transport._rclpy = SimpleNamespace(spin_once=mock.Mock())
+        stream = SimpleNamespace(poll=mock.Mock(return_value={"sample": "fresh"}))
+        # Neither an active action nor an idle chunk boundary prevents callbacks.
+        for active in (object(), None):
+            transport._active = active
+            self.assertEqual(transport.poll_policy_observation(stream), {"sample": "fresh"})
+            transport._rclpy.spin_once.assert_called_with(transport.node, timeout_sec=0.0)
+            self.assertIs(transport._active, active)
+
     def observer(self):
         callbacks, destroyed = {}, []
         transport = object.__new__(RosMoveItTransport)
