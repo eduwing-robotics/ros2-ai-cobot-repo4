@@ -11,12 +11,26 @@ bounded continuity question only; learned task success remains unproven.
   recorded in `design.md`: generation qualification and current execution
   admission are distinct; the current planning-entry/post-planning TTL is not a
   true first-action deadline. No deployed check has changed.
-- [ ] Implement and specify the prospective generation-context-bound scoped mode
+- [x] Implement and specify the prospective generation-context-bound scoped mode
   through the existing native caller/OneJob/PickupExecutor, preserving legacy
   contracts, original timestamps, task budget and all current-state/Scene gates.
-- [ ] Verify the controlled-clock placement discriminator and context/replay,
+  Integrated `6f8a1db` from independently reviewed `f97d733`.
+- [x] Verify the controlled-clock placement discriminator and context/replay,
   expiry/cancellation, start/hardware/Scene and legacy rejection counterexamples
   with focused producer/consumer tests, then independently review the cutoff.
+  Core scoped checks passed (11 tests on integrated `6f8a1db`); cleanup-error
+  preservation `8ca1d88` passed 14 scoped tests. The independent finding that
+  appended cleanup metadata diverged from the persisted canonical diagnostic
+  was corrected by `ffc00fd` (owner `0700a2c`): retain before persistence/hash.
+  Combined affected producer/Web/Collection checks passed 80 tests in 22.208s.
+  These scoped CPU checks do not qualify hardware effects or task success.
+- [x] Retain original SOURCE/DESTINATION episode-instruction provenance through
+  the normal scoped learned caller, not only the bound Collection campaign.
+  `eefc86a` derives the binding from validated current jobs and the persisted
+  region registry, checks the scoped task grant and retains it in preapproval.
+  Independent review found no issues; wrong-direction grant and injected public
+  binding rejected before worker startup. Existing task/region contracts are
+  reused without historical preapproval or another execution/approval owner.
 - [ ] Use a fresh qualified runtime and fresh run/grant/Scene binding for the
   next bounded learned Pick, mechanical release/reset and canonical diagnosis;
   consume its original-condition recommendation through existing Collection.

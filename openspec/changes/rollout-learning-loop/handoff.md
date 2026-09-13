@@ -37,16 +37,27 @@ This bootstrap is navigation and operating context, not another approval layer.
 
 ### Volatile checkpoint — refresh, do not inherit as authority
 
-As recorded here, main `a46f159` selected scoped temporal responsibility and
-`c6e84da` bounded S/D research; both were pushed. Temporal implementation and
-completed-scoped-attempt → Collection validation advice are under owner review,
-not yet a qualified live path. Current status belongs in `tasks.md` and Git, not
-in these stable lessons. The user has authorized physical return; old pause text
-is superseded, while fresh runtime/Scene/exact authority still belongs to its
-existing consumer. Physical Pick remains UNKNOWN.
+Main `6f8a1db` integrates the independently reviewed temporal implementation
+`f97d733` after decision `a46f159`. Main `8ca1d88` preserves the primary generation
+failure; `ffc00fd` retains optional unconfirmed cleanup evidence before lifecycle
+persistence and canonical diagnostic hashing, closing the actual Web reload
+mismatch. Main `eefc86a` derives SOURCE/DESTINATION wording through the normal
+scoped caller, independently reviewed without findings. Main `7f41f77` connects
+completed-scoped-attempt → Collection validation advice. The combined affected
+producer/Web/Collection suite passed 80 tests in 22.208s after integration;
+full discovery was not repeated. These are software contracts, not a qualified
+live Pick or evidence of physical stop. Independent correction review also
+confirmed actual temporary-file persistence and Web reload with/without cleanup
+metadata, matching digests and the unchanged primary error; no findings.
+Current status belongs in `tasks.md` and Git, not in these stable lessons.
+The user explicitly clarified again on September 13 that physical return IS
+authorized. The coordinator's brief contrary interpretation was corrected;
+do not inherit it as a pause. Fresh runtime/Scene/exact authority still belongs
+to its existing consumer. Physical Pick remains UNKNOWN.
 
-The first new S/D run has now finished in 87.25s and released its single model/GPU
-allocation; interpretation is being recorded in Learning's existing OpenSpec.
+The first new S/D run finished in 87.25s and released its single model/GPU
+allocation; `d7d16b0` records its inconclusive S and unresolved D reference in
+Learning's existing OpenSpec, without runtime promotion.
 Old D's NOT_RUN record remains historical. Check live resource ownership rather
 than inheriting old PID, free-memory or usage-limit screens. Preserve unrelated
 dirty files. Thin natural use is closed; its receipts below are provenance, not
