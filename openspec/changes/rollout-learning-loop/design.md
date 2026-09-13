@@ -384,3 +384,53 @@ arbitrary learned contact, attachment/slip and complete Pick outcome remain
 UNKNOWN until observed. The inactive candidate and its `TEST_ONLY_PLAN_ONLY`
 trial API stay non-executable: normal model selection and newly bound plans
 consume these successor qualifications, never a live trial bypass.
+
+## Execution granularity and terminal observation (2026-09-13)
+
+The retained `learned-scoped-return-20260913-r7` preapproval contains 50
+policy rows compiled into 50 ARM and 22 GRIPPER segments. Its first four ARM
+segments hold the same `0.021 m` gripper reference. The executor records two
+completed segments before `LEARNED_TERMINAL_STATE`; this is not a successful
+Pick. The rejected terminal sample and exact third action-result time were not
+retained, so later recorder convergence cannot retrospectively prove that sample.
+
+**Accepted responsibility correction:** evidence sampling granularity must not
+force Python-level completion barriers at every ARM reference. LeRobot owns
+policy inference/processors and, when selected, its existing async/RTC machinery.
+The existing JTC owns timed waypoint interpolation. FR5 retains whole-proposal
+admission, robot-specific command semantics, collision/contact scope, one active
+execution owner and cancellation. Monitoring requests cancellation through that
+owner; it does not become a second actuator or authorize later commands.
+
+The [official LeRobot async example](https://huggingface.co/docs/lerobot/async)
+separates prediction from action consumption. Installed LeRobot 0.6.1 additionally
+exposes `predict_action_chunk`; its `select_action` queue pops are not physical
+completion evidence. [RTC](https://huggingface.co/docs/lerobot/rtc) handles overlap
+between successive chunks, not the current first-chunk terminal-observation bug.
+The [Jazzy JTC](https://control.ros.org/jazzy/doc/ros2_controllers/joint_trajectory_controller/doc/userdoc.html)
+already consumes timed multi-waypoint trajectories; no replacement high-rate
+Python controller is required.
+
+The first bounded implementation candidate groups adjacent ARM ranges with an
+unchanged held gripper command, retaining every waypoint and its allocated
+duration. Never merge across a GRIPPER transition or silently drop small gripper
+changes. Preserve archived serialized-reference plan/trace replay through an
+explicit selection boundary. Grouping alone is not a complete continuous normal
+rollout: a common ARM/gripper timeline remains a separate candidate requiring
+native actuator-ordering evidence, not an assumed concurrency capability.
+
+Terminal handling must retain the exact action result and the coherent native
+observation actually used to confirm completion. A fresh buffered sample is not
+necessarily ordered after that result. Existing v5 delivery/source-progress
+evidence does not prove physical acquisition after the result; do not introduce
+such a claim or require a later host receipt when a valid endpoint is already
+available. After action success, an otherwise valid but off-target native sample
+means endpoint confirmation is pending within the original deadline, not an
+immediate physical-failure verdict. Fault, stale evidence, malformed data,
+incarnation changes and supersession still fail through existing checks.
+Persistent endpoint mismatch must expire with its actual witness retained.
+No tolerance increase, timestamp renewal, new settling budget or retry follows.
+The executor consumes the checked witness rather than replacing it with an
+unrelated second snapshot. Cancellation cannot relabel an already-successful
+action as canceled. CPU checks establish software behavior; fresh bounded
+physical execution and Pick/release outcomes remain unproven.
