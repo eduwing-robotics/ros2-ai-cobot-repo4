@@ -14,7 +14,7 @@ from unique_identifier_msgs.msg import UUID
 
 from tools.data_factory.motion.arm_stream import ArmStream
 from tools.data_factory.motion.moveit_transport import RosMoveItTransport
-from tools.fr5_data_factory import ContractError
+from tools.fr5_data_factory import ContractError, canonical_digest
 
 
 def done(value):
@@ -463,6 +463,53 @@ class TransportActuatorStreamTest(unittest.TestCase):
         point.time_from_start.nanosec = 100_000_000
         gripper.trajectory.points = [point]
         return arm, gripper
+
+    def test_geometry_capture_and_native_setup_are_polled_without_sending(self):
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        capture = Mock()
+        capture.poll.side_effect = [None, {"scene": "full-scene", "urdf": "native-model", "srdf": "native-srdf"}]
+        capture.close.return_value = True
+        ready = {"status": "READY", "initialization_digest": canonical_digest("initialized")}
+        helper = Mock()
+        helper.poll.side_effect = [None, ready]
+        helper.close.side_effect = [False, True]
+        self.transport._bound_native_geometry_scene = Mock(return_value="private-scene")
+        with patch("tools.data_factory.motion.geometry_capture.GeometryCapture", return_value=capture), \
+                patch("tools.data_factory.motion.native_geometry.NativeGeometry", return_value=helper) as create, \
+                patch("tools.data_factory.motion.contact_transition.bound_robot_description") as bind:
+            plan, context = {"plan": 1}, {"context": 1}
+            self.transport.start_learned_geometry(plan, context, deadline=20.)
+            plan["plan"], context["context"] = 2, 2
+            self.assertIsNone(self.transport.poll_learned_geometry())
+            create.assert_not_called()
+            self.assertIsNone(self.transport.poll_learned_geometry())
+            self.assertEqual(self.transport.poll_learned_geometry(), ready)
+            self.assertEqual(create.call_args.kwargs["plan"], {"plan": 1})
+            self.assertEqual(create.call_args.kwargs["context"], {"context": 1})
+            self.assertEqual(create.call_args.kwargs["srdf"], "native-srdf")
+            self.assertEqual(bind.call_args.args[0]._robot_description, "native-model")
+            self.client.send_goal_async.assert_not_called()
+            self.transport.gripper.send_goal_async.assert_not_called()
+            self.transport.fence_learned_actuator_stream()
+            self.assertIs(self.transport._native_geometry, helper)  # Teardown still pending.
+            self.transport.close_learned_actuator_stream()
+            self.assertIsNone(self.transport._native_geometry)
+            self.assertIsNone(self.transport._active)
+
+    def test_cancel_during_geometry_capture_discards_only_owned_read_resources(self):
+        self.transport.open_learned_actuator_stream(deadline=20.)
+        capture = Mock()
+        capture.poll.return_value = None
+        capture.close.side_effect = [False, True]
+        with patch("tools.data_factory.motion.geometry_capture.GeometryCapture", return_value=capture):
+            self.transport.start_learned_geometry({}, {}, deadline=20.)
+            self.assertIsNone(self.transport.poll_learned_geometry())
+            self.transport.fence_learned_actuator_stream()
+            self.assertIs(self.transport._native_geometry_capture, capture)
+            self.transport.close_learned_actuator_stream()
+            self.assertIsNone(self.transport._native_geometry_capture)
+            self.assertIsNone(self.transport._active)
+        self.client.send_goal_async.assert_not_called()
 
     def test_same_transport_slot_excludes_legacy_and_reuses_gripper_client(self):
         self.transport.open_learned_actuator_stream(deadline=20.)

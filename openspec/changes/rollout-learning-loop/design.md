@@ -496,8 +496,20 @@ by the existing owner. It has no actuator or Scene-write authority. Initialize
 the bound model before fresh inference inputs; preserve world, attachments, ACM,
 transforms, octomap and padding/scaling rather than reconstructing a weaker scene.
 The owner must still bind checked geometry to the actual selected reference and
-current dispatch conditions. The CPU helper and pollable Python adapter are
-implemented separately from normal runtime integration; neither enables dispatch.
+current dispatch conditions. Normal task start now polls full-Scene/model
+acquisition and native helper initialization through the existing transport.
+`OPENING` becomes `WAITING_FOR_POLICY` only on initialization completion; neither
+status proves dispatch. The revision/commit consumer remains unconnected.
+
+The Scene and model parameter services are read independently, not claimed as an
+atomic snapshot transaction. The captured MoveGroup URDF is checked against the
+qualified task model; its actual SRDF and full Scene initialize the CPU helper.
+A detached scene adds missing qualified floor/wall/source geometry from existing
+task inputs while preserving all native obstacles, attachments and settings.
+Conflicting existing objects/attachments or permissive contact overrides reject;
+they are not silently replaced. Existing pose-roundoff equivalence is reused.
+No shared PlanningScene apply operation is introduced. Read clients and the CPU
+helper remain task-owned and close through the existing fence/drain path.
 
 Current admitted execution, monitoring and cancellation continue while the next
 revision's geometry request is pending. Only the new revision waits for its
@@ -535,8 +547,9 @@ owned batch classifier performs that binding once without changing predicates.
 The native helper now maps native-to-ROS body types explicitly (WORLD/ATTACHED
 enums differ), retains contact saturation, and the adapter classifies released
 WORLD_OBJECT side contact without relaxing top-contact checks. Production still
-needs actual full-scene acquisition/binding and normal asynchronous consumer
-wiring. CPU tests are not a control-cadence or loaded-system latency guarantee.
+needs revision/commit identity checks and normal policy submission wiring, plus
+actual runtime verification of the newly connected full-scene acquisition path.
+CPU tests are not a control-cadence or loaded-system latency guarantee.
 
 Evidence is retained in `.agent-local/work/lerobot-fr5/` as
 `request-geometry-batch-probe{.py,.cpp,-result.json}` and

@@ -406,7 +406,7 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
         self.assertEqual(job.plan_stream("run", src, SCENE, policy)["code"], "EXECUTOR_RESPONSE")
         self.assertIsNone(job.approval_scope)
 
-    def started_owner(self, *, prepare_error=None):
+    def started_owner(self, *, prepare_error=None, geometry_ready=True):
         """Real OneJob/executor lifecycle; native transport and geometry are synthetic."""
         class Port(Transport):
             def __init__(self):
@@ -417,6 +417,10 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
                 self.settle = True
             def open_learned_actuator_stream(self, *, deadline):
                 self.stream = {"active": True, "fenced": False, "owns_goals": False}
+            def start_learned_geometry(self, plan, context, *, deadline):
+                self.geometry = {"status": "READY", "initialization_digest": canonical_digest("cpu-fixture")} if geometry_ready else None
+            def poll_learned_geometry(self):
+                return self.geometry
             def poll_learned_actuator_stream(self):
                 self.polls += 1
                 if self.stream and self.stream["fenced"] and self.settle:
@@ -460,6 +464,32 @@ class NativeTaskPlanConsumerTest(unittest.TestCase):
         self.assertNotIn("learned_execution", job.execution_evidence)
         self.assertEqual(scene.updates, [])
         self.assertFalse(executor.close())  # Live task ownership cannot be reported closed.
+
+    def test_normal_geometry_setup_pending_does_not_block_native_poll_or_cancel(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner(geometry_ready=False)
+        self.assertTrue(started["ok"], started)
+        before = transport.polls
+        for _ in range(5):
+            self.assertTrue(job.poll()["ok"])
+        self.assertGreaterEqual(transport.polls, before + 5)
+        self.assertEqual(executor.runs["run"]["execution"]["native_stream"]["status"], "OPENING")
+        self.assertEqual(transport.sent, [])
+        job.cancel()
+        self.assertTrue(transport.stream["fenced"])
+        job.cancel()  # Existing asynchronous drain observes settlement next tick.
+        self.assertIsNone(transport.stream)
+        self.assertEqual(scene.updates, [])
+        self.assertEqual(executor.runs["run"]["execution"]["scene_preservation"]["reason_code"], "NO_DISPATCH")
+
+    def test_normal_geometry_setup_ready_is_not_dispatch_or_reference_consumption(self):
+        job, executor, transport, recorder, calls, cell, scene, started = self.started_owner(geometry_ready=False)
+        transport.geometry = {"status": "READY", "initialization_digest": canonical_digest("prepared-scene")}
+        self.assertTrue(job.poll()["ok"])
+        execution = executor.runs["run"]["execution"]
+        self.assertEqual(execution["native_stream"], {"status": "WAITING_FOR_POLICY", "reference_consumed_count": 0, "task_outcome": "UNKNOWN"})
+        self.assertEqual(execution["geometry_initialization"], transport.geometry)
+        self.assertFalse(execution["motion_dispatch_attempted"])
+        self.assertEqual(transport.sent, [])
 
     def test_normal_cancel_retains_recording_only_after_native_drain(self):
         job, executor, transport, recorder, calls, cell, scene, started = self.started_owner()

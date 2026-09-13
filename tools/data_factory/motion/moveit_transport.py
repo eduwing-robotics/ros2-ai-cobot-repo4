@@ -1018,6 +1018,94 @@ class RosMoveItTransport:
         stream = ActuatorStream(client, self.gripper, deadline=deadline, clock=self._clock)
         self._active = stream
 
+    def start_learned_geometry(self, plan, context, *, deadline):
+        """Start task setup, not a per-row collision wait or a motion command."""
+        from .geometry_capture import GeometryCapture
+        if (not isinstance(self._active, ActuatorStream)
+                or getattr(self, "_native_geometry_capture", None) is not None
+                or getattr(self, "_native_geometry", None) is not None):
+            raise ContractError("NATIVE_GEOMETRY_ACTIVE")
+        self._native_geometry_plan, self._native_geometry_context = copy.deepcopy((plan, context))
+        self._native_geometry_deadline = deadline
+        self._native_geometry = None
+        self._native_geometry_ready = None
+        self._native_geometry_capture = GeometryCapture(self.node, deadline=deadline, clock=self._clock)
+
+    def _bound_native_geometry_scene(self, captured, plan, context):
+        """Add qualified geometry privately; preserve the complete native scene.
+
+        Missing qualified floor/wall/source geometry is supplied from the same
+        task's existing inputs, never by erasing other native obstacles. A
+        conflicting existing identity/attachment/ACM cannot be overwritten.
+        This neither applies a shared Scene nor asserts an observed task phase.
+        """
+        from .contact_transition import _request_geometry_binding
+        _request_geometry_binding(context, plan, "source")
+        scene = copy.deepcopy(captured)
+        source = plan["source_program"]
+        expected = self._planning_scene_objects(source["planning_scene"])
+        cube = self._collision_object(context["source_object_id"], context["source_dimensions_m"],
+                                      context["source_datum"]["translation_m"], context["planning_frame"])
+        q = _rotation_quaternion(context["source_datum"]["rotation_columns"])
+        cube.primitive_poses[0].orientation.x, cube.primitive_poses[0].orientation.y, \
+            cube.primitive_poses[0].orientation.z, cube.primitive_poses[0].orientation.w = q
+        expected.append(cube)
+        by_id = {item.id: item for item in scene.world.collision_objects}
+        attached = {item.object.id for item in scene.robot_state.attached_collision_objects}
+        matrix = scene.allowed_collision_matrix
+        if len(by_id) != len(scene.world.collision_objects):
+            raise ContractError("CONTACT_SCENE_BINDING")
+        if len(matrix.entry_names) != len(matrix.entry_values):
+            raise ContractError("CONTACT_COLLISION_POLICY")
+        for item in expected:
+            if item.id in attached or item.id in by_id and not self._same_collision_object_readback(by_id[item.id], item):
+                raise ContractError("CONTACT_SCENE_BINDING")
+            if (any(matrix.default_entry_values)
+                    or item.id in matrix.entry_names
+                    and any(matrix.entry_values[list(matrix.entry_names).index(item.id)].enabled)):
+                raise ContractError("CONTACT_COLLISION_POLICY")
+            if item.id not in by_id:
+                scene.world.collision_objects.append(item)
+        return scene
+
+    def poll_learned_geometry(self):
+        """Poll setup while the existing stream owner continues native polling."""
+        from types import SimpleNamespace
+        from .contact_transition import bound_robot_description
+        from .native_geometry import NativeGeometry
+        capture = getattr(self, "_native_geometry_capture", None)
+        if capture is not None and self._native_geometry is None:
+            result = capture.poll()
+            if result is None:
+                return None
+            plan, context = self._native_geometry_plan, self._native_geometry_context
+            # Bind the model actually exposed by the Scene provider, not a
+            # guessed local SRDF or merely the robot_state_publisher's model.
+            bound_robot_description(SimpleNamespace(_robot_description=result["urdf"]), plan)
+            scene = self._bound_native_geometry_scene(result["scene"], plan, context)
+            self._native_geometry = NativeGeometry(urdf=result["urdf"], srdf=result["srdf"], scene=scene,
+                context=context, plan=plan, deadline=self._native_geometry_deadline)
+        if capture is not None and capture.close():
+            self._native_geometry_capture = None
+        helper = getattr(self, "_native_geometry", None)
+        if helper is None:
+            raise ContractError("NATIVE_GEOMETRY_NOT_STARTED")
+        if self._native_geometry_ready is None:
+            self._native_geometry_ready = helper.poll()
+        return copy.deepcopy(self._native_geometry_ready) if self._native_geometry_capture is None else None
+
+    def _close_learned_geometry(self):
+        """Only owned CPU/read resources; no implied physical stop."""
+        closed = True
+        for name in ("_native_geometry_capture", "_native_geometry"):
+            resource = getattr(self, name, None)
+            if resource is not None:
+                if resource.close():
+                    setattr(self, name, None)
+                else:
+                    closed = False
+        return closed
+
     def build_learned_actuator_goals(self, initial_state, actions, *, period_s, start_time_ns):
         """Build native timelines, without admission, retiming or side effects.
 
@@ -1172,13 +1260,24 @@ class RosMoveItTransport:
             raise ContractError("ROS_EXEC_NO_ACTIVE")
         if self._active.owns_goals or not self._active.fenced:
             raise ContractError("ROS_EXEC_ACTIVE")
+        if not self._close_learned_geometry():
+            raise ContractError("NATIVE_GEOMETRY_CLOSE_PENDING")
         self._active = None
 
     def fence_learned_actuator_stream(self):
         """Request cancellation without representing it as completed stopping."""
         if not isinstance(self._active, ActuatorStream):
             raise ContractError("ROS_EXEC_NO_ACTIVE")
-        self._active.cancel()
+        try:
+            self._active.cancel()
+        finally:
+            try:
+                self._close_learned_geometry()
+            except Exception as exc:
+                # Cleanup cannot replace a native cancellation failure. Keep
+                # owned resources for close/drain to retry and report.
+                self._native_geometry_close_error = (
+                    exc.code if isinstance(exc, ContractError) else "NATIVE_GEOMETRY_CLOSE_FAILED")
 
     def poll_active(self):
         """Return None while active, or a successful phase handle when terminal."""

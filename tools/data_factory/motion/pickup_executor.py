@@ -1811,7 +1811,8 @@ class PickupExecutor:
         try:
             self.transport.open_learned_actuator_stream(deadline=run["task_deadline"])
             run["execution"]["actuator_stream_opened"] = True
-            run["execution"]["native_stream"]["status"] = "WAITING_FOR_POLICY"
+            self.transport.start_learned_geometry(plan, geometry, deadline=run["task_deadline"])
+            run["execution"]["geometry_initialization"] = {"status": "PENDING"}
         except Exception as exc:
             self._fault(run, exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_OPEN")
         return self._execution_response(run, plan["run_id"], run["digest"], "EXECUTING")
@@ -2446,6 +2447,15 @@ class PickupExecutor:
             elif self._native_task(run):
                 try:
                     self._retain_actuator_stream_events(execution, self.transport.poll_learned_actuator_stream())
+                    if execution["native_stream"]["status"] == "OPENING":
+                        geometry = self.transport.poll_learned_geometry()
+                        if geometry is not None:
+                            if (not isinstance(geometry, dict) or set(geometry) != {"status", "initialization_digest"}
+                                    or geometry["status"] != "READY" or not isinstance(geometry["initialization_digest"], str)
+                                    or not DIGEST.fullmatch(geometry["initialization_digest"])):
+                                raise ContractError("NATIVE_GEOMETRY_INITIALIZATION")
+                            execution["geometry_initialization"] = copy.deepcopy(geometry)
+                            execution["native_stream"]["status"] = "WAITING_FOR_POLICY"
                 except Exception as exc:
                     # Native polling may already have removed acceptance/result
                     # facts before raising. Draining cannot recover that batch.

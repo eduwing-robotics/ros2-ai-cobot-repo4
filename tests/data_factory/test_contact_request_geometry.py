@@ -120,6 +120,39 @@ class RequestContactGeometryTest(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "CONTACT_REQUEST_BINDING"):
             build("success", [0.] * 6, .012)
 
+    def test_full_scene_private_binding_keeps_other_obstacles_and_original_bytes(self):
+        from geometry_msgs.msg import Pose
+        from shape_msgs.msg import SolidPrimitive
+        from moveit_msgs.msg import CollisionObject, PlanningScene, AttachedCollisionObject
+        from tools.data_factory.motion.moveit_transport import RosMoveItTransport
+        native = object.__new__(RosMoveItTransport)
+        native._Pose, native._SolidPrimitive, native._CollisionObject = Pose, SolidPrimitive, CollisionObject
+        captured = PlanningScene(is_diff=False, robot_model_name="fairino5_v6_robot")
+        foreign = native._collision_object("other-obstacle", [.1] * 3, [1., 1., 1.], "base_link")
+        captured.world.collision_objects = [foreign]
+        original = serialize_message(captured)
+        bound = native._bound_native_geometry_scene(captured, self.plan, self.context)
+        self.assertEqual(serialize_message(captured), original)
+        self.assertEqual(bound.world.collision_objects[0], foreign)
+        self.assertEqual(len(bound.world.collision_objects), 4)
+        # Native pose roundoff does not change the qualified geometry identity.
+        bound.world.collision_objects[-1].primitive_poses[0].position.x += 1e-16
+        self.assertEqual(native._bound_native_geometry_scene(bound, self.plan, self.context), bound)
+        changed = copy.deepcopy(bound)
+        changed.world.collision_objects[-1].primitive_poses[0].position.x += .01
+        with self.assertRaisesRegex(ContractError, "CONTACT_SCENE_BINDING"):
+            native._bound_native_geometry_scene(changed, self.plan, self.context)
+        changed = copy.deepcopy(captured)
+        changed.robot_state.attached_collision_objects = [AttachedCollisionObject(
+            link_name="gripper_link", object=bound.world.collision_objects[-1])]
+        with self.assertRaisesRegex(ContractError, "CONTACT_SCENE_BINDING"):
+            native._bound_native_geometry_scene(changed, self.plan, self.context)
+        changed = copy.deepcopy(captured)
+        changed.allowed_collision_matrix.default_entry_names = ["cube"]
+        changed.allowed_collision_matrix.default_entry_values = [True]
+        with self.assertRaisesRegex(ContractError, "CONTACT_COLLISION_POLICY"):
+            native._bound_native_geometry_scene(changed, self.plan, self.context)
+
     def test_malformed_attachment_or_changed_context_never_reaches_native_conversion(self):
         for key, value in (("dimensions_m", []), ("dimensions_m", [-.024, .024, .024]),
                            ("rotation_xyzw", [0., 0., 0., 0.]), ("translation_m", [float("inf"), 0., 0.]),
