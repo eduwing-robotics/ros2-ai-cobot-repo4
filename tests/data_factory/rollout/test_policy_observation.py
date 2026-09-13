@@ -14,6 +14,76 @@ from tools.data_factory.rollout.finite_plan import JOINTS
 
 
 class PolicyObservationTest(unittest.TestCase):
+    def observer(self):
+        callbacks, destroyed = {}, []
+        transport = object.__new__(RosMoveItTransport)
+        transport._active = object()  # Observation is not actuation admission.
+        transport._execution_locked = False
+        transport._joint_state = None
+        transport._joint_state_received_at = None
+        transport._clock = lambda: 20.
+        def subscribe(_type, topic, callback, _qos):
+            callbacks[topic] = callback
+            return topic
+        transport.node = SimpleNamespace(create_subscription=subscribe,
+            destroy_subscription=destroyed.append,
+            get_parameter=lambda _: SimpleNamespace(value=False))
+        transport._rclpy = SimpleNamespace(spin_once=mock.Mock(side_effect=AssertionError("poll spun ROS")))
+        stream = transport.policy_observation_stream({"camera1": "/up", "camera2": "/wrist"}, .3)
+        return transport, stream, callbacks, destroyed
+
+    @mock.patch("tools.data_factory.motion.policy_observation.time.time", return_value=100.)
+    def test_stream_observes_without_waiting_for_active_motion_or_spinning(self, _wall):
+        transport, stream, callbacks, destroyed = self.observer()
+        active = transport._active
+        try:
+            self.assertIsNone(stream.poll())
+            state = JointState(name=list(JOINTS), position=[0.] * 7)
+            state.header.stamp.sec = 100
+            transport._joint_state = state
+            transport._joint_state_received_at = 20.
+            image = Image(height=1, width=1, encoding="rgb8", step=3, data=b"\x01\x02\x03")
+            image.header.stamp.sec = 100
+            for callback in callbacks.values():
+                callback(image)
+            first = stream.poll()
+            self.assertEqual(stream.poll(), first)
+            self.assertIs(transport._active, active)
+            transport._rclpy.spin_once.assert_not_called()
+            for _ in range(100):
+                callbacks["/up"](image)
+            self.assertEqual(len(stream.frames), 2)
+            self.assertEqual(len(stream.subscriptions), 2)
+            first["observation.state"][0] = 12.
+            self.assertEqual(stream.poll()["observation.state"][0], 0.)
+            with mock.patch("tools.data_factory.motion.policy_observation.time.time", return_value=100.31):
+                transport._clock = lambda: 20.31
+                stream.clock = transport._clock
+                with self.assertRaisesRegex(ContractError, "LEARNED_STALE_OBSERVATION"):
+                    stream.poll()
+        finally:
+            stream.close()
+        self.assertCountEqual(destroyed, ["/up", "/wrist"])
+        self.assertFalse(stream.frames)
+        callbacks["/up"](image)  # Late callbacks cannot revive a closed source.
+        self.assertFalse(stream.frames)
+        with self.assertRaisesRegex(ContractError, "LEARNED_OBSERVATION_CLOSED"):
+            stream.poll()
+        stream.close()
+        self.assertEqual(len(destroyed), 2)
+
+    @mock.patch("tools.data_factory.motion.policy_observation.time.time", return_value=100.)
+    def test_partial_subscription_failure_releases_created_subscription(self, _wall):
+        from tools.data_factory.motion.policy_observation import PolicyObservationStream
+        node = SimpleNamespace(
+            get_parameter=lambda _: SimpleNamespace(value=False),
+            create_subscription=mock.Mock(side_effect=["first", RuntimeError("DDS setup")]),
+            destroy_subscription=mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, "DDS setup"):
+            PolicyObservationStream(node, lambda: (None, None),
+                {"camera1": "/up", "camera2": "/wrist"}, .3, clock=lambda: 20.)
+        node.destroy_subscription.assert_called_once_with("first")
+
     def capture(self, *, stamp=100., received=20., state=True, malformed=False,
                 active=False, simulated=False, after_conversion=100., executor=False,
                 paused_system=False, cached=False):

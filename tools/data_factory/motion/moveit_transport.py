@@ -1303,100 +1303,39 @@ class RosMoveItTransport:
             raise ContractError(code)
         return age
 
-    def capture_policy_observation(self, camera_topics, max_age_s):
-        """Read one bounded observation on the sole transport node; send no goals.
+    def policy_observation_stream(self, camera_topics, max_age_s):
+        """Create a read-only observer on this node; caller must close it.
 
-        Wire images use hex only for JSON transport. Original source stamps are
-        retained; a new callback cannot renew a paused publisher's timestamp.
+        Polling never spins or consults action completion. The existing task
+        owner is responsible for its run/lease scope and spinning this node.
+        Observation availability grants no goal or Scene authority.
         """
-        from sensor_msgs.msg import Image
-        from rclpy.qos import qos_profile_sensor_data
-        from rclpy.validate_full_topic_name import validate_full_topic_name
-        from rclpy.exceptions import InvalidTopicNameException
-        from tools.ros_image import image_message_to_rgb
-        if (not isinstance(camera_topics, dict) or set(camera_topics) != {"camera1", "camera2"}
-                or any(not isinstance(t, str) or not t.startswith("/") or t == "/"
-                       for t in camera_topics.values())
-                or len(set(camera_topics.values())) != 2):
-            raise ContractError("LEARNED_CAMERA_TOPICS")
-        try:
-            for topic in camera_topics.values():
-                validate_full_topic_name(topic)
-        except InvalidTopicNameException as exc:
-            raise ContractError("LEARNED_CAMERA_TOPICS") from exc
-        if (isinstance(max_age_s, bool) or not isinstance(max_age_s, (int, float))
-                or not math.isfinite(max_age_s) or not 0 < max_age_s <= 5):
-            raise ContractError("LEARNED_SOURCE_CLOCK")
+        from .policy_observation import PolicyObservationStream
+        return PolicyObservationStream(self.node,
+            lambda: (self._joint_state, self._joint_state_received_at),
+            camera_topics, max_age_s, clock=self._clock)
+
+    def capture_policy_observation(self, camera_topics, max_age_s):
+        """Legacy bounded capture, using the same source observer as streaming.
+
+        Keep the existing idle-only wrapper and original timeout. Normal stream
+        consumers use the observer directly without a blocking capture loop.
+        """
         if self._execution_locked or self._active is not None:
             raise ContractError("ROS_EXEC_ACTIVE")
-        if self.node.get_parameter("use_sim_time").value is not False:
-            raise ContractError("LEARNED_SOURCE_CLOCK")
-        started, started_system = self._clock(), time.time()
-        previous_state = self._joint_state
+        stream = self.policy_observation_stream(camera_topics, max_age_s)
         deadline = time.monotonic() + self.graph_timeout_s
-        frames, subscriptions = {}, []
-        def receive(name, message):
-            frames[name] = (message, self._clock())
         try:
-            for name, topic in camera_topics.items():
-                subscriptions.append(self.node.create_subscription(
-                    Image, topic, lambda message, name=name: receive(name, message), qos_profile_sensor_data))
             while time.monotonic() < deadline:
                 self._rclpy.spin_once(self.node, timeout_sec=max(0., min(.05, deadline - time.monotonic())))
-                if (len(frames) == 2 and self._joint_state_received_at is not None
-                        and self._joint_state is not previous_state
-                        and self._joint_state_received_at >= started):
-                    break
-            if (len(frames) != 2 or self._joint_state_received_at is None
-                    or self._joint_state is previous_state
-                    or self._joint_state_received_at < started):
-                raise ContractError("LEARNED_OBSERVATION_UNAVAILABLE")
-            samples = {"state": (self._joint_state, self._joint_state_received_at), **frames}
-            now, steady = time.time(), self._clock()
-            if steady < started or abs((now - started_system) - (steady - started)) > max_age_s:
-                raise ContractError("LEARNED_SOURCE_CLOCK")
-            stamps = {}
-            for name, (message, received) in samples.items():
-                stamp = message.header.stamp
-                if stamp.sec < 0 or not 0 <= stamp.nanosec < 1_000_000_000:
-                    raise ContractError("LEARNED_SOURCE_CLOCK")
-                source = stamp.sec + stamp.nanosec / 1e9
-                if not 0 <= now - source <= max_age_s or not 0 <= steady - received <= max_age_s:
-                    raise ContractError("LEARNED_STALE_OBSERVATION")
-                stamps[name] = source
-            from tools.data_factory.rollout.finite_plan import JOINTS
-            names, positions = list(samples["state"][0].name), list(samples["state"][0].position)
-            if (len(names) != len(set(names)) or len(names) != len(positions)
-                    or not set(JOINTS).issubset(names)
-                    or any(not math.isfinite(value) for value in positions)):
-                raise ContractError("ROS_JOINT_STATE")
-            by_name = dict(zip(names, positions))
-            observation = {"source_clock": "SYSTEM_TIME", "source_timestamps_s": stamps,
-                           "observation.state": [by_name[name] for name in JOINTS]}
-            for name, (message, _) in frames.items():
-                try:
-                    rgb = image_message_to_rgb(message)
-                except (ValueError, TypeError) as exc:
-                    raise ContractError("LEARNED_IMAGE", str(exc)) from exc
-                observation[f"observation.images.{name}"] = {
-                    "dtype": "uint8", "color_space": "RGB", "shape": list(rgb.shape),
-                    "data_hex": rgb.tobytes().hex()}
-            # Conversion time also consumes the source freshness budget.
-            from tools.data_factory.rollout.finite_plan import check_freshness
-            finished, finished_steady = time.time(), self._clock()
-            check_freshness({"source_timestamps_s": stamps, "max_observation_age_s": max_age_s}, finished)
-            if abs((finished - started_system) - (finished_steady - started)) > max_age_s:
-                raise ContractError("LEARNED_SOURCE_CLOCK")
-            if any(not 0 <= self._clock() - received <= max_age_s for _, received in samples.values()):
-                raise ContractError("LEARNED_STALE_OBSERVATION")
-            if self.node.get_parameter("use_sim_time").value is not False:
-                raise ContractError("LEARNED_SOURCE_CLOCK")
-            if self._execution_locked or self._active is not None:
-                raise ContractError("ROS_EXEC_ACTIVE")
-            return observation
+                observation = stream.poll()
+                if observation is not None:
+                    if self._execution_locked or self._active is not None:
+                        raise ContractError("ROS_EXEC_ACTIVE")
+                    return observation
+            raise ContractError("LEARNED_OBSERVATION_UNAVAILABLE")
         finally:
-            for subscription in subscriptions:
-                self.node.destroy_subscription(subscription)
+            stream.close()
 
     def _source_samples_fresh(self, max_age_s):
         """A just-dispatched DDS callback does not renew its source timestamp."""
