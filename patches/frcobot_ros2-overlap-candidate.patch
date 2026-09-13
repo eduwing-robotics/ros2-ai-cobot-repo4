@@ -1,0 +1,99 @@
+--- a/fairino_hardware_v3_9_7/src/fairino_hardware_interface.cpp
++++ b/fairino_hardware_v3_9_7/src/fairino_hardware_interface.cpp
+@@ -879,9 +879,11 @@
+         }
+     }
+     if (_require_gripper_source_clock && _gripper_command_generation.load() > 0 &&
+-        !_arm_stream_paused.load() && !gripper_release_ready()) {
+-        return (_gripper_error.load() || udp_command_error.load() || _arm_stream_paused.load())
+-            ? hardware_interface::return_type::ERROR : hardware_interface::return_type::OK;
++        !_arm_stream_paused.load()) {
++        // Retain fault/proof validation without making completion an ARM-release gate.
++        (void)gripper_release_ready();
++        if (_gripper_error.load() || udp_command_error.load() || _arm_stream_paused.load())
++            return hardware_interface::return_type::ERROR;
+     }
+     const int controller_error = udp_command_error.load();
+     if (controller_error != 0) {
+@@ -909,7 +911,8 @@
+         const int position = static_cast<int>(std::lround(100.0 * target / _gripper_upper_position));
+         const double last_command = _last_gripper_command.load();
+         if (last_command < 0.0 || (_require_gripper_source_clock ? target != last_command : std::abs(target - last_command) > 0.0001)) {
+-            // Gripper motion interrupts servo mode. Stop producing hold packets until it completes.
++            // Queue one exact endpoint for the non-realtime worker. Concurrent
++            // ARM/gripper operation remains an unqualified candidate behavior.
+             {
+                 std::lock_guard<std::mutex> lock(_gripper_mutex);
+                 if (_require_gripper_source_clock &&
+@@ -924,7 +927,6 @@
+                 _pending_gripper_position = position;
+                 _gripper_command_generation.fetch_add(1);
+                 _last_gripper_command = target;
+-                _arm_stream_paused = true;
+             }
+             _gripper_cv.notify_one();
+         }
+@@ -1001,7 +1003,7 @@
+             command_generation = _gripper_command_generation.load();
+         }
+         if (position.has_value()) {
+-            bool resume_arm = false;
++            bool completed = false;
+             int completion_reason = 0;
+             ROBOT_STATE_PKG completion_state{};
+             ROBOT_STATE_PKG initial_state{};
+@@ -1155,7 +1157,7 @@
+                     // Native telemetry is quantized to one percent; retain the existing tick, not JTC tolerance.
+                     (std::abs(int(feedback) - *position) <= 1 || observed_busy)) {
+                     completion_state = state; completion_sample = command_sample; completion_reason = 1;
+-                    resume_arm = true;
++                    completed = true;
+                     break;
+                 }
+                 const auto now = std::chrono::steady_clock::now();
+@@ -1173,7 +1175,7 @@
+                             "Gripper motion settled away from target (target=%d, feedback=%u, dwell=%d ms)",
+                             *position, feedback, _gripper_settle_time_ms);
+                         completion_state = state; completion_sample = command_sample; completion_reason = 2;
+-                        resume_arm = true;
++                        completed = true;
+                         break;
+                     }
+                 } else {
+@@ -1198,7 +1200,7 @@
+                     return;
+                 }
+             }
+-            if (resume_arm) {
++            if (completed) {
+                 {
+                     std::lock_guard<std::mutex> lock(_gripper_mutex);
+                     if (_stop_gripper_thread || _gripper_error.load() != 0 || udp_command_error.load() != 0) return;
+@@ -1215,19 +1217,6 @@
+                         _gripper_error = -5; return;
+                     }
+                 }
+-                const auto servo_result = send_udp_command_and_observe(
+-                    [this] { return _ptr_robot->ServoMoveStart(1); });
+-                if (!servo_result.ok()) {
+-                    _gripper_error = servo_result.controller_error != 0 ?
+-                        servo_result.controller_error :
+-                        (servo_result.send_error != 0 ? servo_result.send_error : -4);
+-                    RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+-                        "ServoMoveStart failed after gripper motion (send=%d, reply=%s, controller=%d)",
+-                        servo_result.send_error,
+-                        servo_result.reply_received ? "received" : "missing",
+-                        servo_result.controller_error);
+-                    return;
+-                }
+                 std::lock_guard<std::mutex> lock(_gripper_mutex);
+                 if (!_stop_gripper_thread && _gripper_error.load() == 0 && udp_command_error.load() == 0 &&
+                     !_pending_gripper_position.has_value() && _gripper_command_generation.load() == command_generation) {
+@@ -1257,7 +1246,6 @@
+                             completion_sample[40], completion_sample[41], completion_sample[42], completion_sample[66],
+                             completion_sample[8], completion_sample[5], completion_sample[1], completion_sample[2], completion_sample[3], completion_sample[4]};
+                     }
+-                    _arm_stream_paused = false;
+                 }
+             }
+             continue;
