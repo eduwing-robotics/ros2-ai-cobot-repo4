@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from tools.fr5_data_factory import ContractError, canonical_digest
+from .arm_stream import ArmStream
 
 
 JOINT_ORDER = ["j1", "j2", "j3", "j4", "j5", "j6"]
@@ -535,6 +536,7 @@ class RosMoveItTransport:
         self._clock = clock
         self._rclpy = rclpy
         self._get_action_names_and_types = get_action_names_and_types
+        self._ActionClient = ActionClient
         self._serialize_message = serialize_message
         self._deserialize_message = deserialize_message
         self._Duration = Duration
@@ -999,11 +1001,61 @@ class RosMoveItTransport:
         self._execution_locked = False
         return active
 
+    def open_learned_arm_stream(self, *, deadline):
+        """Reserve this transport's sole motion slot for native rolling JTC goals.
+
+        No goal is sent here. The task owner must admit each exact trajectory
+        through submit_learned_arm_trajectory's mandatory dispatch guard. Legacy
+        MoveIt/gripper phases cannot run concurrently through this transport.
+        """
+        if self._execution_locked or self._active is not None:
+            raise ContractError("ROS_EXEC_ACTIVE")
+        client = getattr(self, "_learned_arm_client", None)
+        if client is None:
+            client = self._ActionClient(self.node, self._FollowJointTrajectory,
+                                       "/fairino5_controller/follow_joint_trajectory")
+            self._learned_arm_client = client
+        stream = ArmStream(client, deadline=deadline, clock=self._clock)
+        self._active = stream
+
+    def submit_learned_arm_trajectory(self, goal, *, revision, dispatch_guard):
+        """Send a whole native goal; never create row-level execution phases."""
+        if self._execution_locked or not isinstance(self._active, ArmStream):
+            raise ContractError("ROS_EXEC_ACTIVE")
+        if (not isinstance(goal, self._FollowJointTrajectory.Goal)
+                or list(goal.trajectory.joint_names) != JOINT_ORDER
+                or not goal.trajectory.points):
+            raise ContractError("ROS_EXEC_STEP")
+        self._active.submit(goal, revision=revision, dispatch_guard=dispatch_guard)
+        self._execute_goal_count += 1
+
+    def poll_learned_arm_stream(self):
+        if not isinstance(self._active, ArmStream):
+            raise ContractError("ROS_EXEC_NO_ACTIVE")
+        self._rclpy.spin_once(self.node, timeout_sec=0.0)
+        return self._active.poll()
+
+    def close_learned_arm_stream(self):
+        """Release only a fenced stream whose native handles are all terminal."""
+        if not isinstance(self._active, ArmStream):
+            raise ContractError("ROS_EXEC_NO_ACTIVE")
+        if self._active.owns_goals or not self._active.fenced:
+            raise ContractError("ROS_EXEC_ACTIVE")
+        self._active = None
+
+    def fence_learned_arm_stream(self):
+        """Request cancellation without representing it as completed stopping."""
+        if not isinstance(self._active, ArmStream):
+            raise ContractError("ROS_EXEC_NO_ACTIVE")
+        self._active.cancel()
+
     def poll_active(self):
         """Return None while active, or a successful phase handle when terminal."""
         active = getattr(self, "_active", None)
         if active is None:
             raise ContractError("ROS_EXEC_NO_ACTIVE")
+        if isinstance(active, ArmStream):
+            raise ContractError("ROS_EXEC_STREAM_OWNER_REQUIRED")
         if active.result_future is None:
             raise ContractError("ROS_EXEC_GOAL_PENDING")
         if self._clock() > active.deadline:
@@ -1057,7 +1109,7 @@ class RosMoveItTransport:
     def terminal_verification(self):
         """Retain the last checked witness separately from any fault snapshot."""
         active = getattr(self, "_active", None)
-        if active is None or active.action_terminal_observation is None:
+        if active is None or isinstance(active, ArmStream) or active.action_terminal_observation is None:
             return None
         return copy.deepcopy({"phase": active.phase, "type": active.type,
             "deadline_monotonic_s": active.deadline, "status": active.terminal_observation_status,
@@ -1137,6 +1189,11 @@ class RosMoveItTransport:
         ):
             raise ContractError("ROS_EXEC_CANCEL_TIMEOUT")
         self._execution_locked = True
+        if isinstance(active, ArmStream):
+            # The stream's owner polls native cancellation/terminal evidence;
+            # never translate a fence or cancel acknowledgement into a stop.
+            active.cancel()
+            raise ContractError("ROS_EXEC_CANCEL_UNCERTAIN")
         if getattr(active, "action_succeeded", False):
             # The action is already terminal. A cancel request fences the handoff but
             # cannot manufacture CANCELED or stop an in-flight hardware RPC.
@@ -1184,6 +1241,8 @@ class RosMoveItTransport:
         active = getattr(self, "_active", None)
         if active is None:
             raise ContractError("ROS_EXEC_NO_ACTIVE")
+        if isinstance(active, ArmStream):
+            raise ContractError("ROS_EXEC_STREAM_OWNER_REQUIRED")
         if getattr(active, "action_succeeded", False) and not self._execution_locked:
             # A normal hardware handoff is still owned; diagnostic polling must
             # not release it early. After cancellation, report the actual JTC result.

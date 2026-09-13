@@ -463,3 +463,31 @@ The executor consumes the checked witness rather than replacing it with an
 unrelated second snapshot. Cancellation cannot relabel an already-successful
 action as canceled. CPU checks establish software behavior; fresh bounded
 physical execution and Pick/release outcomes remain unproven.
+
+### Native rolling-trajectory migration
+
+Use the existing six-joint JTC's `FollowJointTrajectory` endpoint for rolling
+ARM updates, under `RosMoveItTransport`'s same exclusive motion slot. JTC and
+the existing hardware writer retain interpolation/ServoJ ownership; do not add
+a Python row-level ServoJ controller. MoveIt remains the collision/admission
+dependency, not an additional rolling-goal execution manager. LeRobot retains
+inference, saved processors and selected native chunk/RTC behavior. Admission
+must bind the actual executable timing and suffix, not just the unmerged output.
+
+`motion/arm_stream.py` is the non-blocking native-handle part of this migration,
+not another selectable playback product. It retains pending/current/predecessor
+handles, exact guarded goals, the original deadline and native cancellation
+responses/results. Accepted replacement is not RT adoption or predecessor
+completion; neither canceled action status nor an empty handle set proves a
+physical stop. Normal OneJob/LeRobot admission and evidence consumers are not
+yet connected to this port, and full ARM/gripper coexistence remains unresolved.
+
+The installed JTC `4.40.1-1noble.20260615.171409` predates the native preemption
+result-delivery fix; its binary retains the old `Current goal cancelled due to
+new incoming action.` branch. Waiting for its lost predecessor result could
+stall subsequent rolling updates. Reuse the official Jazzy
+[fix `4ab98223`](https://github.com/ros-controls/ros2_controllers/commit/4ab98223c2377857a8568eb111344e46404ae223)
+(released in 4.41.0) and its `preempted_goal_receives_aborted_result` regression
+instead of inventing a terminal result or weakening ownership. Mocked fixed
+controller results do not qualify the installed binary. Stage/verify the native
+correction before live selection; do not hot-replace the active robot stack.
