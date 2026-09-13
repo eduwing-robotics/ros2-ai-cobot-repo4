@@ -537,3 +537,19 @@ Native pause does not cancel an in-flight inference, and stop's timeout is not
 proof of thread exit; the task owner must retain resource ownership until actual
 termination. Normal task-lifetime loading, observation binding and full 7D
 reference adoption remain integration work, not completed by this seam.
+
+Task-lifetime inference now retains the actual sampled observation's existing
+canonical digest and source timestamps with each raw queue row. In pinned
+LeRobot 0.6.1, native feature construction reads that owned observation mapping
+on the producer thread, and the same thread's native merge consumes its immutable
+identity. A later observation notification cannot relabel an in-flight output.
+The native inference-start cursor read clears the prior thread-local identity:
+a failed inference followed by an unwrapped input cannot inherit the old label.
+This adapter does not replace the inference loop, processors or merge policy;
+it must be revisited if native field-read semantics change. Provenance-required
+mode currently supports non-guided append queues only, not RTC-guided blending.
+These associations neither authenticate sensor timestamps nor prove command
+consumption. The actual 7D motion owner and normal runner integration remain open.
+Native 0.6.1 resets its error counter before merge, so a rejected publication
+does not necessarily make `engine.failed` true. Missing provenance publishes no
+rows; caller stop/deadline ownership is not replaced by that native error flag.

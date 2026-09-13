@@ -6,9 +6,10 @@ must advance only from commanded-reference progress for the complete action
 row.  In particular, ARM-only progress is not acknowledgment of a 7D row.
 """
 
+import math
 from dataclasses import dataclass
 from importlib.metadata import version
-from threading import RLock
+from threading import local, RLock
 
 from torch import Tensor
 
@@ -18,7 +19,7 @@ from lerobot.policies.rtc import ActionQueue, RTCConfig
 LEROBOT_VERSION = "0.6.1"
 
 
-def start_with_acknowledged_queue(engine):
+def start_with_acknowledged_queue(engine, *, require_observation_provenance=False):
     """Start a fresh native producer with the controller-facing queue adapter.
 
     The task owner must call this before publishing observations or resuming
@@ -34,7 +35,10 @@ def start_with_acknowledged_queue(engine):
     if (engine.action_queue is not None or engine._rtc_thread is not None
             or engine._policy_active.is_set()):
         raise RuntimeError("FR5_ACK_QUEUE_REQUIRES_FRESH_ENGINE")
-    queue = AcknowledgedActionQueue(engine._rtc_config)
+    queue = AcknowledgedActionQueue(
+        engine._rtc_config,
+        require_observation_provenance=require_observation_provenance,
+    )
     engine.start()
     # start() has no queue-factory parameter in the pinned upstream version.
     # This one private assignment is the compatibility seam; scheduling,
@@ -52,14 +56,60 @@ class RawActionIndex:
 
 
 @dataclass(frozen=True)
+class ObservationProvenance:
+    """Immutable source identity for the observation sampled by one inference."""
+
+    observation_digest: str
+    source_clock: str
+    source_timestamps_s: tuple[tuple[str, float], ...]
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.observation_digest, str)
+            or not self.observation_digest.startswith("sha256:")
+            or len(self.observation_digest) != 71
+            or any(character not in "0123456789abcdef" for character in self.observation_digest[7:])
+            or not isinstance(self.source_clock, str)
+            or not self.source_clock
+            or type(self.source_timestamps_s) is not tuple
+            or any(type(item) is not tuple or len(item) != 2 for item in self.source_timestamps_s)
+        ):
+            raise ValueError("FR5_ACK_QUEUE_OBSERVATION_PROVENANCE")
+        names = tuple(name for name, _ in self.source_timestamps_s)
+        if names != ("camera1", "camera2", "state") or any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for name, value in self.source_timestamps_s
+        ):
+            raise ValueError("FR5_ACK_QUEUE_OBSERVATION_PROVENANCE")
+
+
+@dataclass(frozen=True)
 class ActionQueueSnapshot:
     """Detached view of the currently unconsumed native queue."""
 
     generation: int
     queue_index: int
     rows: tuple[RawActionIndex, ...]
+    observation_provenance: tuple[ObservationProvenance | None, ...]
     original_actions: Tensor | None
     processed_actions: Tensor | None
+
+
+class _ObservedInput(dict):
+    """Pinned 0.6.1 input whose native feature reads mark the sampled identity."""
+
+    def __init__(self, values, queue, provenance):
+        super().__init__(values)
+        self._queue = queue
+        self._provenance = provenance
+
+    def __getitem__(self, key):
+        self._queue._bind_sampled_observation(self._provenance)
+        return super().__getitem__(key)
 
 
 class AcknowledgedActionQueue(ActionQueue):
@@ -73,10 +123,12 @@ class AcknowledgedActionQueue(ActionQueue):
     deliberately unchanged.  This class does not make RTC controller-paced.
     """
 
-    def __init__(self, cfg: RTCConfig):
+    def __init__(self, cfg: RTCConfig, *, require_observation_provenance=False):
         installed = version("lerobot")
         if installed != LEROBOT_VERSION:
             raise RuntimeError(f"FR5_ACK_QUEUE_UNAUDITED: {installed}")
+        if require_observation_provenance and cfg.enabled:
+            raise ValueError("FR5_ACK_QUEUE_PROVENANCE_REQUIRES_APPEND_ONLY")
 
         super().__init__(cfg)
         # Native methods acquire ``self.lock`` internally.  Reentrancy lets the
@@ -86,6 +138,33 @@ class AcknowledgedActionQueue(ActionQueue):
         self._generation = 0
         self._next_chunk = 0
         self._rows: tuple[RawActionIndex, ...] = ()
+        self._observation_provenance: tuple[ObservationProvenance | None, ...] = ()
+        self._sampled_observation = local()
+        self._require_observation_provenance = require_observation_provenance
+
+    def observed_input(self, values: dict, provenance: ObservationProvenance) -> dict:
+        """Bind an owned input to the exact native feature-read/merge thread.
+
+        This task-internal association is not an authenticity guarantee for the
+        source clock or payload; their admission remains the caller's contract.
+        """
+
+        if type(values) is not dict or not isinstance(provenance, ObservationProvenance):
+            raise TypeError("FR5_ACK_QUEUE_OBSERVATION_PROVENANCE")
+        return _ObservedInput(values, self, provenance)
+
+    def _bind_sampled_observation(self, provenance):
+        self._sampled_observation.value = provenance
+
+    def get_action_index(self) -> int:
+        """Retain the native cursor read and begin a new provenance attempt."""
+
+        # Pinned RTCInferenceEngine calls this immediately before it reads the
+        # selected observation. A failed inference never reaches merge, so clear
+        # its thread-local identity here before the next feature-read can bind.
+        if hasattr(self._sampled_observation, "value"):
+            del self._sampled_observation.value
+        return super().get_action_index()
 
     @property
     def generation(self) -> int:
@@ -100,10 +179,14 @@ class AcknowledgedActionQueue(ActionQueue):
         action_index_before_inference: int | None = None,
     ):
         with self.lock:
+            provenance = getattr(self._sampled_observation, "value", None)
+            if self._require_observation_provenance and provenance is None:
+                raise RuntimeError("FR5_ACK_QUEUE_OBSERVATION_PROVENANCE_MISSING")
             saved_queue = self.queue
             saved_original_queue = self.original_queue
             saved_last_index = self.last_index
             retained_rows = self._rows[self.last_index :]
+            retained_provenance = self._observation_provenance[self.last_index :]
             chunk = self._next_chunk + 1
 
             try:
@@ -120,21 +203,29 @@ class AcknowledgedActionQueue(ActionQueue):
                     rows = tuple(
                         RawActionIndex(chunk, raw_start + i) for i in range(queued)
                     )
+                    provenance_rows = (provenance,) * queued
                 else:
                     rows = retained_rows + tuple(
                         RawActionIndex(chunk, i) for i in range(len(processed_actions))
                     )
+                    provenance_rows = retained_provenance + (
+                        (provenance,) * len(processed_actions)
+                    )
 
                 queued = 0 if self.queue is None else len(self.queue)
-                if len(rows) != queued:
+                if len(rows) != queued or len(provenance_rows) != queued:
                     raise RuntimeError("FR5_ACK_QUEUE_NATIVE_LAYOUT_CHANGED")
             except BaseException:
                 self.queue = saved_queue
                 self.original_queue = saved_original_queue
                 self.last_index = saved_last_index
                 raise
+            finally:
+                if hasattr(self._sampled_observation, "value"):
+                    del self._sampled_observation.value
 
             self._rows = rows
+            self._observation_provenance = provenance_rows
             self._next_chunk = chunk
             self._generation += 1
             return result
@@ -143,6 +234,7 @@ class AcknowledgedActionQueue(ActionQueue):
         with self.lock:
             super().clear()
             self._rows = ()
+            self._observation_provenance = ()
             self._generation += 1
 
     def snapshot(self) -> ActionQueueSnapshot:
@@ -161,6 +253,7 @@ class AcknowledgedActionQueue(ActionQueue):
                 generation=self._generation,
                 queue_index=self.last_index,
                 rows=self._rows[self.last_index :],
+                observation_provenance=self._observation_provenance[self.last_index :],
                 original_actions=original,
                 processed_actions=processed,
             )

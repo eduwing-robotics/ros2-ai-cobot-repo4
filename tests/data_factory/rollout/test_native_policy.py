@@ -14,7 +14,7 @@ import torch
 from safetensors.numpy import save_file
 
 from tools.data_factory.learned_action_adapter import NativeSmolVLA, fake_rgb
-from tools.fr5_data_factory import ContractError
+from tools.fr5_data_factory import ContractError, canonical_digest
 
 
 def saved_processor_fixture(policy_dir, fault=None):
@@ -196,10 +196,22 @@ class NativePolicyTest(unittest.TestCase):
         }
         native._transform_raw_up = mock.Mock(return_value=fake_rgb(b"\xff\x00\x00"))
         value = {
+            "source_clock": "SYSTEM_TIME",
+            "source_timestamps_s": {"state": 1., "camera1": 2., "camera2": 3.},
             "observation.state": [float(index) for index in range(7)],
             "observation.images.camera1": fake_rgb(),
             "observation.images.camera2": fake_rgb(b"\x00\x00\xff"),
         }
+        expected_digest_input = {
+            **{key: item for key, item in value.items() if key.startswith("observation.")},
+            "task": "move the block",
+        }
+        for key in ("observation.images.camera1", "observation.images.camera2"):
+            expected_digest_input[key] = {
+                **expected_digest_input[key],
+                "data": expected_digest_input[key]["data"].hex(),
+            }
+        expected_observation_digest = canonical_digest(expected_digest_input)
 
         with mock.patch(
             "tools.data_factory.training_receipts.tree_digest", wraps=tree_digest,
@@ -212,8 +224,18 @@ class NativePolicyTest(unittest.TestCase):
                 self.assertIs(engine.action_queue, queue)
                 self.assertFalse(engine._rtc_config.enabled)
                 self.assertIsNone(policy.config.rtc_config)
+                without_provenance = {
+                    key: item for key, item in value.items()
+                    if key not in {"source_clock", "source_timestamps_s"}
+                }
+                with self.assertRaisesRegex(
+                    ContractError, "LEARNED_OBSERVATION_PROVENANCE",
+                ):
+                    notify(without_provenance)
+                self.assertEqual(queue.generation, 0)
                 notify(value)
                 value["observation.state"][0] = 999.
+                value["source_timestamps_s"]["state"] = 999.
                 value["observation.images.camera1"] = fake_rgb(b"\x00\xff\x00")
                 engine.resume()
                 deadline = time.monotonic() + 2.
@@ -221,6 +243,18 @@ class NativePolicyTest(unittest.TestCase):
                     time.sleep(.005)
                 first = queue.snapshot()
                 self.assertEqual(len(first.rows), 2)
+                self.assertEqual(
+                    first.observation_provenance[0].source_timestamps_s,
+                    (("camera1", 2.), ("camera2", 3.), ("state", 1.)),
+                )
+                self.assertEqual(
+                    first.observation_provenance[0].observation_digest,
+                    expected_observation_digest,
+                )
+                self.assertEqual(
+                    first.observation_provenance,
+                    (first.observation_provenance[0],) * 2,
+                )
                 queue.advance_if_current(
                     generation=first.generation,
                     expected_index=first.queue_index,
@@ -256,6 +290,8 @@ class NativePolicyTest(unittest.TestCase):
         policy = _AsyncPolicy(entered=entered, release=release)
         native = self.async_native(policy)
         value = {
+            "source_clock": "SYSTEM_TIME",
+            "source_timestamps_s": {"state": 1., "camera1": 2., "camera2": 3.},
             "observation.state": [0.] * 7,
             "observation.images.camera1": fake_rgb(),
             "observation.images.camera2": fake_rgb(),
@@ -297,6 +333,8 @@ class NativePolicyTest(unittest.TestCase):
         self.addCleanup(release.set)
         native = self.async_native(_AsyncPolicy(entered=entered, release=release))
         value = {
+            "source_clock": "SYSTEM_TIME",
+            "source_timestamps_s": {"state": 1., "camera1": 2., "camera2": 3.},
             "observation.state": [0.] * 7,
             "observation.images.camera1": fake_rgb(),
             "observation.images.camera2": fake_rgb(),
@@ -328,8 +366,8 @@ class NativePolicyTest(unittest.TestCase):
         started = []
         real_start = acknowledged_queue.start_with_acknowledged_queue
         real_stop = RTCInferenceEngine.stop
-        def broken_start(engine):
-            real_start(engine)
+        def broken_start(engine, **kwargs):
+            real_start(engine, **kwargs)
             started.append(engine)
             raise RuntimeError("primary startup failure")
         try:

@@ -7,6 +7,7 @@ import torch
 from lerobot.policies.rtc import ActionQueue, RTCConfig
 from lerobot_strategy_fr5.acknowledged_queue import (
     AcknowledgedActionQueue,
+    ObservationProvenance,
     RawActionIndex,
 )
 
@@ -16,6 +17,47 @@ def actions(start: int, rows: int = 4) -> torch.Tensor:
 
 
 class AcknowledgedActionQueueTest(unittest.TestCase):
+    def test_observed_input_binds_without_changing_native_tensors(self):
+        queue = AcknowledgedActionQueue(
+            RTCConfig(enabled=False), require_observation_provenance=True,
+        )
+        provenance = ObservationProvenance(
+            "sha256:" + "a" * 64,
+            "SYSTEM_TIME",
+            (("camera1", 2.), ("camera2", 3.), ("state", 1.)),
+        )
+        observed = queue.observed_input({"later": 2, "earlier": 1}, provenance)
+        self.assertEqual(observed["later"], 2)
+        self.assertEqual(observed["earlier"], 1)
+        self.assertEqual(observed["later"], 2)
+
+        original, processed = actions(0, 2), actions(100, 2)
+        expected_original, expected_processed = original.clone(), processed.clone()
+        queue.merge(original, processed, real_delay=0)
+        snapshot = queue.snapshot()
+        self.assertEqual(snapshot.observation_provenance, (provenance, provenance))
+        self.assertTrue(torch.equal(snapshot.original_actions, expected_original))
+        self.assertTrue(torch.equal(snapshot.processed_actions, expected_processed))
+        self.assertTrue(torch.equal(original, expected_original))
+        self.assertTrue(torch.equal(processed, expected_processed))
+
+        with self.assertRaisesRegex(RuntimeError, "PROVENANCE_MISSING"):
+            queue.merge(actions(1000, 1), actions(2000, 1), real_delay=0)
+        unchanged = queue.snapshot()
+        self.assertEqual(unchanged.generation, snapshot.generation)
+        self.assertEqual(unchanged.rows, snapshot.rows)
+        self.assertEqual(
+            unchanged.observation_provenance, snapshot.observation_provenance,
+        )
+        self.assertTrue(torch.equal(unchanged.original_actions, snapshot.original_actions))
+        self.assertTrue(torch.equal(unchanged.processed_actions, snapshot.processed_actions))
+
+    def test_required_provenance_rejects_rtc_guidance(self):
+        with self.assertRaisesRegex(ValueError, "PROVENANCE_REQUIRES_APPEND_ONLY"):
+            AcknowledgedActionQueue(
+                RTCConfig(enabled=True), require_observation_provenance=True,
+            )
+
     def test_snapshot_is_detached_and_does_not_consume(self):
         queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
         original = actions(0)

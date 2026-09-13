@@ -459,8 +459,11 @@ class NativeSmolVLA:
         from types import SimpleNamespace
         from lerobot.policies.rtc import RTCConfig
         from lerobot.rollout.inference import RTCInferenceConfig, create_inference_engine
-        from lerobot_strategy_fr5.acknowledged_queue import start_with_acknowledged_queue
-        from tools.fr5_data_factory import ContractError
+        from lerobot_strategy_fr5.acknowledged_queue import (
+            ObservationProvenance,
+            start_with_acknowledged_queue,
+        )
+        from tools.fr5_data_factory import ContractError, canonical_digest
         from tools.data_factory.training_receipts import tree_digest
 
         if (
@@ -544,7 +547,9 @@ class NativeSmolVLA:
                 use_torch_compile=False,
                 shutdown_event=shutdown_event,
             )
-            queue = start_with_acknowledged_queue(engine)
+            queue = start_with_acknowledged_queue(
+                engine, require_observation_provenance=True,
+            )
             # Native stop() clears its handle even when join times out. Retain
             # the actual thread now, including if the caller stops it early.
             producer_thread = engine._rtc_thread
@@ -554,15 +559,29 @@ class NativeSmolVLA:
                     if not available:
                         raise ContractError("LEARNED_INFERENCE_SCOPE")
                     try:
+                        if not isinstance(observation, dict):
+                            raise ValueError("LEARNED_OBSERVATION_PROVENANCE")
+                        source_clock = observation.get("source_clock")
+                        source_timestamps = observation.get("source_timestamps_s")
+                        if (
+                            source_clock != "SYSTEM_TIME"
+                            or not isinstance(source_timestamps, dict)
+                            or set(source_timestamps) != {"state", "camera1", "camera2"}
+                            or not all(_finite_number(value) for value in source_timestamps.values())
+                        ):
+                            raise ValueError("LEARNED_OBSERVATION_PROVENANCE")
                         state = observation["observation.state"]
                         if not isinstance(state, (list, tuple)) or len(state) != 7 or not all(
                             _finite_number(value) for value in state
                         ):
                             raise ValueError("OBSERVATION_STATE")
-                        raw = {name: float(value) for name, value in zip(state_names, state)}
+                        initial_state = [float(value) for value in state]
+                        raw = dict(zip(state_names, initial_state))
+                        digest_images = {}
                         for name in ("camera1", "camera2"):
                             key = f"observation.images.{name}"
                             frame = _rgb(observation[key])
+                            digest_images[key] = {**frame, "data": frame["data"].hex()}
                             if (
                                 key == "observation.images.camera1"
                                 and self.observation_view.get("representation") == "baked"
@@ -574,9 +593,20 @@ class NativeSmolVLA:
                             raw[name] = np.frombuffer(frame["data"], dtype=np.uint8).reshape(
                                 frame["shape"]
                             ).copy()
+                        provenance = ObservationProvenance(
+                            observation_digest=canonical_digest({
+                                "observation.state": initial_state,
+                                **digest_images,
+                                "task": instruction,
+                            }),
+                            source_clock=source_clock,
+                            source_timestamps_s=tuple(
+                                sorted((name, float(value)) for name, value in source_timestamps.items())
+                            ),
+                        )
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ContractError(str(exc) or "LEARNED_OBSERVATION") from exc
-                    engine.notify_observation(raw)
+                    engine.notify_observation(queue.observed_input(raw, provenance))
 
             available = True
             yield engine, queue, notify_observation

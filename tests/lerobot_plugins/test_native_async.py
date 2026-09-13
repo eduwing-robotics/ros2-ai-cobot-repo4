@@ -3,6 +3,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 from lerobot.policies.rtc import RTCConfig
@@ -10,6 +11,7 @@ from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.rollout.inference.factory import RTCInferenceConfig, create_inference_engine
 from lerobot.rollout.inference.rtc import supports_rtc_inference
 from lerobot_strategy_fr5.acknowledged_queue import (
+    ObservationProvenance,
     RawActionIndex,
     start_with_acknowledged_queue,
 )
@@ -42,7 +44,140 @@ class IdentityProcessor:
         return value
 
 
+class ProvenanceSampler(SyntheticSampler):
+    def __init__(self, *, fail_first=False):
+        super().__init__()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+        self.fail_first = fail_first
+
+    def _get_action_chunk(self, batch, noise=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            self.first_started.set()
+            if not self.release_first.wait(3.):
+                raise TimeoutError("synthetic sampler was not released")
+            if self.fail_first:
+                raise RuntimeError("synthetic first inference failure")
+        return batch["observation.state"].unsqueeze(1).repeat(1, 4, 1)
+
+
 class NativeAsyncTest(unittest.TestCase):
+    @staticmethod
+    def _provenance(stamp):
+        return ObservationProvenance(
+            "sha256:" + str(int(stamp)) * 64,
+            "SYSTEM_TIME",
+            (("camera1", stamp), ("camera2", stamp), ("state", stamp)),
+        )
+
+    def test_native_output_binds_sampled_observation_not_latest_notification(self):
+        policy = ProvenanceSampler()
+        engine = self._engine(policy)
+        queue = start_with_acknowledged_queue(
+            engine, require_observation_provenance=True,
+        )
+        thread = engine._rtc_thread
+        keys = [f"j{i}" for i in range(7)]
+        first, second = self._provenance(1.), self._provenance(2.)
+        try:
+            engine.notify_observation(queue.observed_input(dict.fromkeys(keys, 1.), first))
+            engine.resume()
+            self.assertTrue(policy.first_started.wait(2.))
+            engine.notify_observation(queue.observed_input(dict.fromkeys(keys, 2.), second))
+            policy.release_first.set()
+            deadline = time.monotonic() + 2.
+            while queue.generation < 1 and time.monotonic() < deadline:
+                time.sleep(.005)
+            snapshot = queue.snapshot()
+            self.assertEqual(snapshot.observation_provenance, (first,) * 4)
+            torch.testing.assert_close(snapshot.processed_actions, torch.ones(4, 7))
+
+            queue.advance_if_current(
+                generation=snapshot.generation,
+                expected_index=snapshot.queue_index,
+                count=4,
+            )
+            deadline = time.monotonic() + 2.
+            while queue.generation < 2 and time.monotonic() < deadline:
+                time.sleep(.005)
+            following = queue.snapshot()
+            self.assertEqual(following.observation_provenance, (second,) * 4)
+            torch.testing.assert_close(following.processed_actions, torch.full((4, 7), 2.))
+        finally:
+            policy.release_first.set()
+            engine.stop()
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(engine.failed)
+
+    def test_failed_inference_does_not_reuse_its_observation_identity(self):
+        policy = ProvenanceSampler(fail_first=True)
+        engine = self._engine(policy)
+        queue = start_with_acknowledged_queue(
+            engine, require_observation_provenance=True,
+        )
+        thread = engine._rtc_thread
+        keys = [f"j{i}" for i in range(7)]
+        first, second = self._provenance(1.), self._provenance(2.)
+        try:
+            engine.notify_observation(queue.observed_input(dict.fromkeys(keys, 1.), first))
+            engine.resume()
+            self.assertTrue(policy.first_started.wait(2.))
+            engine.notify_observation(queue.observed_input(dict.fromkeys(keys, 2.), second))
+            policy.release_first.set()
+            deadline = time.monotonic() + 3.
+            while queue.generation < 1 and time.monotonic() < deadline:
+                time.sleep(.005)
+            snapshot = queue.snapshot()
+            self.assertEqual(snapshot.observation_provenance, (second,) * 4)
+            torch.testing.assert_close(snapshot.processed_actions, torch.full((4, 7), 2.))
+        finally:
+            policy.release_first.set()
+            engine.stop()
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(engine.failed)
+
+    def test_unwrapped_observation_after_failure_cannot_inherit_stale_identity(self):
+        policy = ProvenanceSampler(fail_first=True)
+        engine = self._engine(policy)
+        keys = [f"j{i}" for i in range(7)]
+        first = self._provenance(1.)
+        queue = start_with_acknowledged_queue(
+            engine, require_observation_provenance=True,
+        )
+        thread = engine._rtc_thread
+        missing = threading.Event()
+        native_merge = queue.merge
+        def observed_merge(*args, **kwargs):
+            try:
+                return native_merge(*args, **kwargs)
+            except RuntimeError as exc:
+                if "OBSERVATION_PROVENANCE_MISSING" in str(exc):
+                    missing.set()
+                raise
+        with mock.patch.object(queue, "merge", side_effect=observed_merge):
+            try:
+                engine.notify_observation(
+                    queue.observed_input(dict.fromkeys(keys, 1.), first)
+                )
+                engine.resume()
+                self.assertTrue(policy.first_started.wait(2.))
+                # Deliberately bypass the required owner wrapper. This must fail
+                # closed, not make B's tensors appear to originate from A.
+                engine.notify_observation(dict.fromkeys(keys, 2.))
+                policy.release_first.set()
+                self.assertTrue(missing.wait(2.))
+                engine.pause()
+                self.assertEqual(policy.calls, 2)
+                self.assertEqual(queue.generation, 0)
+                self.assertEqual(queue.qsize(), 0)
+                self.assertEqual(queue.snapshot().observation_provenance, ())
+                self.assertFalse(engine.failed)
+            finally:
+                policy.release_first.set()
+                engine.stop()
+        self.assertFalse(thread.is_alive())
+
     def test_native_smolvla_capability_is_not_its_rtc_enabled_flag(self):
         policy = SyntheticSampler()
         self.assertFalse(policy._rtc_enabled())
