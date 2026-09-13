@@ -5,6 +5,53 @@ import math
 from tools.fr5_data_factory import ContractError, SAFE_ID, canonical_digest
 
 SCOPE = "SCOPED_TASK_GRANT"
+GENERATION_SCHEMA = "data_factory.learned_generation_context.v1"
+
+
+def validate_generation_context(value):
+    from tools.fr5_data_factory import DIGEST
+    fields = {"schema_version", "generation_id", "run_id", "task_grant_digest",
+              "scene_binding_digest", "predecessor_plan_digest", "opened_at_s",
+              "opened_monotonic_s", "task_deadline_monotonic_s"}
+    if not isinstance(value, dict) or set(value) != fields or value["schema_version"] != GENERATION_SCHEMA:
+        raise ContractError("LEARNED_GENERATION_CONTEXT")
+    for key in ("generation_id", "run_id"):
+        if not isinstance(value[key], str) or not SAFE_ID.fullmatch(value[key]):
+            raise ContractError("LEARNED_GENERATION_CONTEXT")
+    for key in ("task_grant_digest", "scene_binding_digest", "predecessor_plan_digest"):
+        if key == "predecessor_plan_digest" and value[key] is None:
+            continue
+        if not isinstance(value[key], str) or not DIGEST.fullmatch(value[key]):
+            raise ContractError("LEARNED_GENERATION_CONTEXT")
+    for key in ("opened_at_s", "opened_monotonic_s", "task_deadline_monotonic_s"):
+        try:
+            valid = type(value[key]) in (int, float) and math.isfinite(value[key]) and value[key] >= 0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ContractError("LEARNED_GENERATION_CONTEXT")
+    if value["task_deadline_monotonic_s"] <= value["opened_monotonic_s"]:
+        raise ContractError("TASK_DEADLINE_EXHAUSTED")
+    return copy.deepcopy(value)
+
+
+def check_generation(grant, proposal, *, run_id, scene, predecessor, now, steady):
+    """Validate frozen provenance; the executor additionally requires its allocation.
+
+    Hashes are exact context bindings, not authentication of arbitrary Python.
+    No current-state, Scene or execution authority is granted by this check.
+    """
+    context = validate_generation_context(proposal["generation_context"])
+    if (context["run_id"] != run_id or context["task_grant_digest"] != grant["grant_digest"]
+            or context["scene_binding_digest"] != canonical_digest(scene)
+            or context["predecessor_plan_digest"] != predecessor):
+        raise ContractError("LEARNED_GENERATION_CONTEXT")
+    if not context["opened_at_s"] <= proposal["inference_started_at_s"] <= proposal["inference_completed_at_s"] <= now:
+        raise ContractError("LEARNED_GENERATION_TIME")
+    if not context["opened_monotonic_s"] <= steady < context["task_deadline_monotonic_s"] or now >= grant["deadline_s"]:
+        raise ContractError("TASK_DEADLINE_EXHAUSTED")
+    if min(grant["deadline_s"] - now, context["task_deadline_monotonic_s"] - steady) <= grant["terminal_reserve_s"] + 5.:
+        raise ContractError("TASK_POLICY_BUDGET_EXHAUSTED")
 
 
 def task_scope(source, scene, proposal):
@@ -83,3 +130,12 @@ def check_runtime_source(inputs):
         raise
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise ContractError("TASK_SOURCE_CHANGED") from exc
+
+
+def uses_scoped_generation(grant):
+    from .finite_plan import SCOPED_SCHEMAS
+    if grant is None:
+        return False
+    grant = validate_grant(grant)
+    adaptation = grant["scope"].get("adaptation")
+    return isinstance(adaptation, dict) and adaptation.get("schema_version") in SCOPED_SCHEMAS

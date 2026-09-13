@@ -21,6 +21,32 @@ PROGRAM_SCHEMA = "fr5.learned_motion_program.v1"
 PROPOSAL_SCHEMA = "data_factory.finite_learned_proposal.v1"
 HELD_PROPOSAL_SCHEMA = "data_factory.finite_learned_held_target_proposal.v1"
 REFERENCE_PROPOSAL_SCHEMA = "data_factory.finite_learned_serialized_reference_proposal.v1"
+# v2 freezes generation qualification only within a preallocated task context.
+# Geometric/action contracts are identical to the corresponding archived v1.
+SCOPED_SCHEMAS = {schema[:-1] + "2": schema for schema in
+                  (PROPOSAL_SCHEMA, HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA)}
+
+
+def trajectory_schema(proposal):
+    return SCOPED_SCHEMAS.get(proposal.get("schema_version"), proposal.get("schema_version"))
+
+
+def generation_spec(checkpoint, *, instruction, robot_description, period_s,
+                    max_observation_age_s=.3, velocity_scaling=.1,
+                    held_gripper_targets=False, serialized_references=False,
+                    runtime_inputs=None, quantize_gripper=False):
+    """The concrete adaptation scope known before any observation or inference."""
+    schema = (REFERENCE_PROPOSAL_SCHEMA if serialized_references else
+              HELD_PROPOSAL_SCHEMA if held_gripper_targets else PROPOSAL_SCHEMA)
+    spec = dict(schema_version=schema[:-1] + "2", checkpoint=checkpoint,
+                instruction=instruction, robot_description=robot_description,
+                period_s=period_s, max_observation_age_s=max_observation_age_s,
+                velocity_scaling=velocity_scaling)
+    if runtime_inputs is not None:
+        spec["runtime_inputs"] = runtime_inputs
+    return copy.deepcopy(spec)
+
+
 ROBOT_MODEL_TRIAL_SCHEMA = "data_factory.robot_model_trial.v1"
 JOINTS = ["j1", "j2", "j3", "j4", "j5", "j6", "finger_right_joint"]
 UNITS = ["rad"] * 6 + ["m"]
@@ -77,12 +103,15 @@ def validate_proposal(value):
               "period_s", "robot_description", "velocity_scaling", "proposal_digest"}
     if isinstance(value, dict) and "runtime_inputs" in value:
         fields.add("runtime_inputs")
-    reference = isinstance(value, dict) and value.get("schema_version") == REFERENCE_PROPOSAL_SCHEMA
+    scoped = isinstance(value, dict) and value.get("schema_version") in SCOPED_SCHEMAS
+    if scoped:
+        fields.add("generation_context")
+    reference = isinstance(value, dict) and trajectory_schema(value) == REFERENCE_PROPOSAL_SCHEMA
     if reference:
         fields.add("reference_timing")
         if "raw_actions" in value:
             fields.add("raw_actions")
-    if not isinstance(value, dict) or set(value) != fields or value["schema_version"] not in {PROPOSAL_SCHEMA, HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA}:
+    if not isinstance(value, dict) or set(value) != fields or trajectory_schema(value) not in {PROPOSAL_SCHEMA, HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA}:
         raise ContractError("LEARNED_PROPOSAL_SCHEMA")
     p = copy.deepcopy(value)
     if p["proposal_digest"] != canonical_digest({k: v for k, v in p.items() if k != "proposal_digest"}):
@@ -165,6 +194,12 @@ def validate_proposal(value):
     if completed < started:
         raise ContractError("LEARNED_SOURCE_CLOCK")
     check_freshness(p, completed)
+    if scoped:
+        from .task_authority import validate_generation_context
+        context = validate_generation_context(p["generation_context"])
+        if age != .3 or context["opened_at_s"] > started:
+            raise ContractError("LEARNED_GENERATION_CONTEXT")
+        check_freshness(p, started)
     try:
         rows = [_action(p["initial_state"]), *[_action(row) for row in actions]]
     except ValueError as exc:
@@ -175,7 +210,7 @@ def validate_proposal(value):
             raise ContractError("LEARNED_JOINT_LIMIT")
     # A held gripper reference is governed by the bound hardware settings and
     # completion contract, not a claim about finger speed between samples.
-    checked = 6 if p["schema_version"] == HELD_PROPOSAL_SCHEMA else 7
+    checked = 6 if trajectory_schema(p) == HELD_PROPOSAL_SCHEMA else 7
     durations = [period] * len(actions)
     if reference:
         raw = p.get("raw_actions", actions)
@@ -269,8 +304,8 @@ def native_close_feedback(source, target):
 def held_target_segments(source, proposal):
     """Freeze exact runs of bound references; never classify or round model output."""
     p = validate_proposal(proposal)
-    reference = p["schema_version"] == REFERENCE_PROPOSAL_SCHEMA
-    if p["schema_version"] not in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA}:
+    reference = trajectory_schema(p) == REFERENCE_PROPOSAL_SCHEMA
+    if trajectory_schema(p) not in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA}:
         raise ContractError("LEARNED_HELD_TARGET_SCHEMA")
     close = next(s for s in source["steps"] if s["phase"] == "GRIPPER_CLOSE")
     opened = next(s for s in source["steps"] if s["phase"] == "GRIPPER_OPEN")
@@ -773,7 +808,7 @@ def _materialize(
         "requires_confirmation": "PRECONTACT_HUMAN",
         "pause_after": boundary,
     }
-    if proposal["schema_version"] in {
+    if trajectory_schema(proposal) in {
         HELD_PROPOSAL_SCHEMA,
         REFERENCE_PROPOSAL_SCHEMA,
     }:
@@ -906,7 +941,7 @@ class FinitePolicyInference:
     def cancel(self):
         self._cancel.set()
 
-    def propose(self, observation, *, instruction, robot_description, period_s, max_observation_age_s=.3, velocity_scaling=.1, held_gripper_targets=False, runtime_inputs=None, serialized_references=False, quantize_gripper=False):
+    def propose(self, observation, *, instruction, robot_description, period_s, max_observation_age_s=.3, velocity_scaling=.1, held_gripper_targets=False, runtime_inputs=None, serialized_references=False, quantize_gripper=False, generation_context=None):
         if not self._lock.acquire(blocking=False):
             self.cancel()
             raise ContractError("LEARNED_REENTRANT_INFERENCE")
@@ -923,6 +958,9 @@ class FinitePolicyInference:
                     or not 0 < _number(velocity_scaling, "LEARNED_LIMITS") <= .1):
                 raise ContractError("LEARNED_INFERENCE_CONFIG")
             _limits(robot_description)
+            if generation_context is not None:
+                from .task_authority import validate_generation_context
+                generation_context = validate_generation_context(copy.deepcopy(generation_context))
             fields = {"source_clock", "source_timestamps_s", "observation.state",
                       "observation.images.camera1", "observation.images.camera2"}
             if not isinstance(observation, dict) or set(observation) != fields or observation["source_clock"] != "SYSTEM_TIME":
@@ -978,6 +1016,9 @@ class FinitePolicyInference:
                 p["reference_timing"] = reference_timing(initial, checked_actions, period_s,
                                                         _limits(robot_description), velocity_scaling, raw=p.get("raw_actions"))
             check_freshness(p, p["inference_completed_at_s"])
+            if generation_context is not None:
+                p["schema_version"] = p["schema_version"][:-1] + "2"
+                p["generation_context"] = generation_context
             p["proposal_digest"] = canonical_digest(p)
             return validate_proposal(p)
         finally:
@@ -1011,7 +1052,7 @@ def validate_execution_trace(plan, trace):
     fields = {"schema_version", "proposal_digest", "plan_digest", "checkpoint", "status",
               "failure_code", "terminal_state", "terminal_phases", "task_effectiveness",
               "scene_outcome", "cell_ready", "online_policy_authorized", "trace_digest"}
-    held = p["schema_version"] in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA}
+    held = trajectory_schema(p) in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA}
     current_start = "initial_hardware_binding" in plan["steps"][0]
     if isinstance(trace, dict) and "terminal_observation" in trace:
         fields.add("terminal_observation")
@@ -1019,7 +1060,7 @@ def validate_execution_trace(plan, trace):
         fields.add("segments")
     elif current_start:
         fields.add("start_observation")
-    if p["schema_version"] == REFERENCE_PROPOSAL_SCHEMA:
+    if trajectory_schema(p) == REFERENCE_PROPOSAL_SCHEMA:
         fields.add("reference_consumption")
     if not isinstance(trace, dict) or set(trace) != fields:
         raise ContractError("LEARNED_TRACE_SCHEMA")
@@ -1109,7 +1150,7 @@ def validate_execution_trace(plan, trace):
             last = evidence[-1]["terminal_observation"]
             if trace["terminal_state"] != check_segment_observation(execution_step(segments[len(evidence) - 1], p), last, last["captured_at_s"], terminal=True):
                 raise ContractError("LEARNED_TRACE_TERMINAL")
-        if p["schema_version"] == REFERENCE_PROPOSAL_SCHEMA:
+        if trajectory_schema(p) == REFERENCE_PROPOSAL_SCHEMA:
             if trace["reference_consumption"] != reference_consumption(plan, evidence):
                 raise ContractError("LEARNED_TRACE_BINDING")
             if trace["status"] == "COMPLETED" and trace["reference_consumption"]["completed_row_indices"] != list(range(len(p["actions"]))):

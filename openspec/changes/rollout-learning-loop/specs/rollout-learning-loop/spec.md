@@ -1361,3 +1361,69 @@ failure, data deficiency, whole-run non-dispatch or execution/training authority
 - **WHEN** the bridge records its raw and postprocessed output for diagnosis
 - **THEN** instrumentation SHALL preserve output values and originating observation identity without another processor call
 - **AND** validation success alone SHALL NOT grant FR5 motion or training authority
+
+
+### Requirement: Prospective scoped generation qualification
+
+The system SHALL preserve the default v1 finite learned proposal interpretation,
+including original-input freshness at initial plan entry and continuation after
+compilation. Archived v1 proposals and their rejection diagnostics SHALL NOT be
+reinterpreted as evidence for a newer temporal mode.
+
+The explicit v2 variants of `data_factory.finite_learned_proposal`,
+`data_factory.finite_learned_held_target_proposal` and
+`data_factory.finite_learned_serialized_reference_proposal` SHALL freeze original
+observation qualification at generation only within a prospectively allocated
+scoped task context. The matching existing task grant SHALL name that exact v2
+schema in its adaptation scope. A HUMAN_GATED receipt alone SHALL NOT admit a v2
+proposal for execution.
+
+Before capture or inference, the existing PickupExecutor SHALL validate the
+concrete grant against run, source program, Scene, checkpoint/processors,
+instruction and adaptation inputs through `begin_generation`. It SHALL retain
+one pending generation context on that same owner, including a unique generation
+identity, run identity, grant digest, Scene-binding digest and predecessor plan
+digest (null initially). The producer SHALL include that unchanged context in the
+proposal digest. Initial planning and continuation SHALL compare it with the
+owner's retained allocation and actual caller bindings, both before and after
+compilation. An archived proposal cannot gain this interpretation through a new
+wrapper, owner or grant. These digests bind trusted software inputs; they do not
+authenticate an adversary able to forge both producer data and execution code.
+
+The original RGB bytes, source timestamps and full seven-dimensional output
+SHALL remain unchanged by this temporal mode. Capture and pre/post inference
+checks SHALL retain the 300 ms generation age bound and measured inference
+elapsed-time check. Future generation completion, stale generation or a
+completion preceding the context allocation SHALL reject. The corresponding v1
+trajectory representation, units, position/rate constraints and explicit
+numerical adaptation rules SHALL remain in effect.
+
+The initial generation allocation SHALL anchor the existing task wall and
+monotonic budgets. Planning, admission, recorder preparation and subsequent
+allocations SHALL NOT renew those deadlines or terminal reserve. Cancellation,
+revocation or expiry while generating or compiling SHALL prevent later admission
+or submission. Current-state/controller/hardware/start agreement, Scene/Cell,
+collision/contact, exact plan, lease and sole motion/recorder ownership checks
+SHALL still govern actual submission. Generation qualification grants no motion
+authority and plan-only SHALL produce zero motion and recorder effects.
+
+This mode relies on the existing approved structured Scene domain. It SHALL NOT
+claim that unchanged joints or a Scene revision detect unreported physical object
+movement, nor introduce a new vision/person approval. Actual task effectiveness
+and physical execution qualification remain separate from CPU verification.
+
+#### Scenario: Delay placement has one temporal interpretation
+- **GIVEN** a fresh v2 output generated in its matching unexpired scoped context
+- **WHEN** the same delay occurs before plan entry, within compilation or after planning
+- **THEN** initial and continuation planning use the same generation qualification
+- **AND** submission still requires current measured execution evidence and the original task budget.
+
+#### Scenario: A new wrapper cannot import generation authority
+- **GIVEN** a stored proposal qualified in an earlier generation context
+- **WHEN** it is submitted under a different owner allocation, run, grant, Scene or predecessor
+- **THEN** it is rejected with zero new goals even if its proposal and wrapper hashes are recomputed.
+
+#### Scenario: A late result cannot renew a task
+- **GIVEN** a valid allocation whose wall or monotonic budget expires, is revoked or cancelled
+- **WHEN** inference or plan compilation returns
+- **THEN** no new goal is authorized and no later admission restarts that budget.

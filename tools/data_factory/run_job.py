@@ -298,8 +298,8 @@ def _run_payload(value):
             raise ContractError("MOTION_PRESET_BINDING")
     _learned_options(value)
     if "task_grant" in value:
-        from tools.data_factory.rollout.task_authority import validate_grant
-        if value["mode"] != "live" or _learned_options(value) is None:
+        from tools.data_factory.rollout.task_authority import validate_grant, uses_scoped_generation
+        if (value["mode"] != "live" and not uses_scoped_generation(value["task_grant"])) or _learned_options(value) is None:
             raise ContractError("TASK_GRANT_SCOPE")
         validate_grant(value["task_grant"])
         keys.add("task_grant")
@@ -2475,12 +2475,15 @@ def _infer_native_program(
     runtime_inputs=None,
     serialized_references=False,
     robot_model_trial_urdf=None,
+    generation_binding=None,
 ):
     from tools.data_factory.rollout.finite_plan import (
         FinitePolicyInference,
         build_robot_model_trial,
         compile_program,
     )
+
+    import uuid
 
     with native.prepare_inference() as predict:
         # The existing non-motion owner verifies checkpoint bytes before
@@ -2500,112 +2503,130 @@ def _infer_native_program(
             cancel_event=cancel,
         )
 
-        if observation is None:
-            captured = _runtime_child_request(
-                child,
-                {
-                    "schema_version":
-                        "fr5.pickup_executor.command.v4",
-                    "op_id": "learned-observation",
-                    "op": "capture_observation",
-                    "payload": {
-                        "camera_topics": camera_topics,
-                        "max_observation_age_s":
-                            max_observation_age_s,
-                    },
-                },
-                cancel,
-            )
-            if not captured.get("ok"):
-                raise ContractError(
-                    captured.get(
-                        "code",
-                        "LEARNED_OBSERVATION_UNAVAILABLE",
-                    )
+        def proposal_inputs():
+            try:
+                source_robot_description = Path(urdf).read_text()
+                candidate_robot_description = (
+                    source_robot_description
+                    if robot_model_trial_urdf is None
+                    else Path(
+                        robot_model_trial_urdf
+                    ).read_text()
                 )
-            observation = captured["data"]["observation"]
+            except OSError as exc:
+                raise ContractError(
+                    "LEARNED_ROBOT_MODEL_TRIAL_IO"
+                ) from exc
 
-        observation = copy.deepcopy(
-            observation() if callable(observation) else observation
-        )
+            robot_model_trial = None
+            if robot_model_trial_urdf is not None:
+                robot_model_trial = build_robot_model_trial(
+                    source,
+                    source_robot_description,
+                    candidate_robot_description,
+                )
 
-        for key in (
-            "observation.images.camera1",
-            "observation.images.camera2",
-        ):
-            frame = observation[key]
-            if "data_hex" in frame:
-                if set(frame) != {
-                    "dtype",
-                    "color_space",
-                    "shape",
-                    "data_hex",
-                }:
-                    raise ContractError(
-                        "LEARNED_OBSERVATION_SCHEMA"
-                    )
-                try:
-                    frame["data"] = bytes.fromhex(
-                        frame.pop("data_hex")
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise ContractError(
-                        "LEARNED_OBSERVATION_SCHEMA"
-                    ) from exc
+            options = dict(
+                instruction=instruction, robot_description=candidate_robot_description,
+                period_s=period_s, max_observation_age_s=max_observation_age_s,
+                held_gripper_targets=held_gripper_targets, runtime_inputs=runtime_inputs,
+                serialized_references=serialized_references or "reference_mode" in (runtime_inputs or {}),
+                quantize_gripper=(runtime_inputs or {}).get("reference_mode") == "serialized_percent_retime",
+                velocity_scaling=min(step["limits"]["velocity_scaling"] for step in source["steps"]
+                                     if "velocity_scaling" in step["limits"]),
+            )
+            return options, robot_model_trial
 
-        if cancel.is_set():
-            raise ContractError("LEARNED_CANCELLED")
-
+        options = robot_model_trial = None
+        from tools.data_factory.rollout.task_authority import uses_scoped_generation, validate_generation_context
+        context = None
+        if generation_binding is not None and uses_scoped_generation(generation_binding["grant"]):
+            options, robot_model_trial = proposal_inputs()
+            from tools.data_factory.rollout.finite_plan import generation_spec
+            opened = _runtime_child_request(child, {
+                "schema_version": "fr5.pickup_executor.command.v4",
+                "op_id": "generation-" + uuid.uuid4().hex, "op": "begin_generation",
+                "payload": {**generation_binding, "source_program": source,
+                            "proposal_spec": generation_spec(native.checkpoint, **options)},
+            }, cancel)
+            if not opened.get("ok"):
+                raise ContractError(opened.get("code", "LEARNED_GENERATION_CONTEXT"))
+            context = validate_generation_context(opened["data"]["generation_context"])
         try:
-            source_robot_description = Path(urdf).read_text()
-            candidate_robot_description = (
-                source_robot_description
-                if robot_model_trial_urdf is None
-                else Path(
-                    robot_model_trial_urdf
-                ).read_text()
-            )
-        except OSError as exc:
-            raise ContractError(
-                "LEARNED_ROBOT_MODEL_TRIAL_IO"
-            ) from exc
+            if observation is None:
+                captured = _runtime_child_request(
+                    child,
+                    {
+                        "schema_version":
+                            "fr5.pickup_executor.command.v4",
+                        "op_id": "learned-observation",
+                        "op": "capture_observation",
+                        "payload": {
+                            "camera_topics": camera_topics,
+                            "max_observation_age_s":
+                                max_observation_age_s,
+                        },
+                    },
+                    cancel,
+                )
+                if not captured.get("ok"):
+                    raise ContractError(
+                        captured.get(
+                            "code",
+                            "LEARNED_OBSERVATION_UNAVAILABLE",
+                        )
+                    )
+                observation = captured["data"]["observation"]
 
-        robot_model_trial = None
-        if robot_model_trial_urdf is not None:
-            robot_model_trial = build_robot_model_trial(
+            observation = copy.deepcopy(
+                observation() if callable(observation) else observation
+            )
+
+            for key in (
+                "observation.images.camera1",
+                "observation.images.camera2",
+            ):
+                frame = observation[key]
+                if "data_hex" in frame:
+                    if set(frame) != {
+                        "dtype",
+                        "color_space",
+                        "shape",
+                        "data_hex",
+                    }:
+                        raise ContractError(
+                            "LEARNED_OBSERVATION_SCHEMA"
+                        )
+                    try:
+                        frame["data"] = bytes.fromhex(
+                            frame.pop("data_hex")
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ContractError(
+                            "LEARNED_OBSERVATION_SCHEMA"
+                        ) from exc
+
+            if cancel.is_set():
+                raise ContractError("LEARNED_CANCELLED")
+
+            if options is None:
+                options, robot_model_trial = proposal_inputs()
+            proposal = inference.propose(observation, generation_context=context, **options)
+
+            return compile_program(
                 source,
-                source_robot_description,
-                candidate_robot_description,
+                proposal,
+                robot_model_trial=robot_model_trial,
             )
 
-        proposal = inference.propose(
-            observation,
-            instruction=instruction,
-            robot_description=candidate_robot_description,
-            period_s=period_s,
-            max_observation_age_s=max_observation_age_s,
-            held_gripper_targets=held_gripper_targets,
-            runtime_inputs=runtime_inputs,
-            serialized_references=(
-                serialized_references
-                or "reference_mode" in (runtime_inputs or {})
-            ),
-            quantize_gripper=(
-                (runtime_inputs or {}).get("reference_mode")
-                == "serialized_percent_retime"
-            ),
-            velocity_scaling=min(
-                step["limits"]["velocity_scaling"]
-                for step in source["steps"]
-                if "velocity_scaling" in step["limits"]
-            ),
-        )
-
-        return compile_program(
-            source,
-            proposal,
-            robot_model_trial=robot_model_trial,
-        )
+        except BaseException:
+            if context is not None:
+                _runtime_child_request(child, {
+                    "schema_version": "fr5.pickup_executor.command.v4",
+                    "op_id": "cancel-generation-" + uuid.uuid4().hex, "op": "cancel",
+                    "payload": {"run_id": context["run_id"], "generation_id": context["generation_id"]},
+                }, cancel)
+            raise
 
 
 def _native_run_inputs(payload, profile, cancel, *, instruction):
@@ -2680,14 +2701,17 @@ def run_learned_plan_only(payload, cancel, publish, *, checkpoint, observation=N
         native = NativeSmolVLA.load(checkpoint, device=device)
         if cancel.is_set():
             raise ContractError("LEARNED_CANCELLED")
-        if observation is None:
+        from tools.data_factory.rollout.task_authority import uses_scoped_generation
+        if observation is None or uses_scoped_generation(payload.get("task_grant")):
             child = acquire_child(_timeout_s(source))
         program = _infer_native_program(native, source, child, cancel,
             urdf=payload.get("urdf"), instruction=instruction, period_s=period_s,
             observation=observation, camera_topics=camera_topics, max_observation_age_s=max_observation_age_s,
             held_gripper_targets=held_gripper_targets,
             serialized_references=serialized_references,
-            robot_model_trial_urdf=robot_model_trial_urdf)
+            robot_model_trial_urdf=robot_model_trial_urdf,
+            generation_binding=dict(run_id=payload["run_id"], grant=payload.get("task_grant"),
+                scene_binding=scene, predecessor_plan_digest=None, lease_id=None))
         def planning_child(timeout_s):
             nonlocal transferred
             transferred = child is not None
@@ -2760,6 +2784,8 @@ def run_plan_only(payload, cancel, publish, *, resolver=resolve_inputs, executor
                     period_s=1 / inputs["fps"],
                     camera_topics=inputs["camera_topics"],
                     runtime_inputs=inputs,
+                    generation_binding=dict(run_id=payload["run_id"], grant=payload.get("task_grant"),
+                        scene_binding=scene_binding, predecessor_plan_digest=None, lease_id=None),
                     robot_model_trial_urdf=learned.get(
                         "robot_model_trial_urdf"
                     ),
@@ -4192,7 +4218,9 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                 program = _infer_native_program(native, program, executor, cancel,
                     urdf=payload["urdf"], instruction=(validated["normalized_job"]["instruction"]
                         if checked_episode_instruction is None else checked_episode_instruction["instruction"]),
-                    period_s=1 / inputs["fps"], camera_topics=inputs["camera_topics"], runtime_inputs=inputs)
+                    period_s=1 / inputs["fps"], camera_topics=inputs["camera_topics"], runtime_inputs=inputs,
+                    generation_binding=dict(run_id=payload["run_id"], grant=payload.get("task_grant"),
+                        scene_binding=scene_binding, predecessor_plan_digest=None, lease_id=None))
                 trajectory_binding = None
             planned = job.plan_only(payload["run_id"], program, scene_binding)
         except Exception as exc:
@@ -4874,7 +4902,10 @@ def run_live(payload, cancel, publish, *, resolver=resolve_inputs, executor_fact
                 try:
                     next_program = _infer_native_program(native, program["source_program"], executor, cancel,
                         urdf=payload["urdf"], instruction=program["learned_proposal"]["instruction"],
-                        period_s=1 / inputs["fps"], observation=observe_task_boundary, runtime_inputs=inputs)
+                        period_s=1 / inputs["fps"], observation=observe_task_boundary, runtime_inputs=inputs,
+                        generation_binding=dict(run_id=job.run_id, grant=payload["task_grant"],
+                            scene_binding=job.scene_binding, predecessor_plan_digest=job.plan_digest,
+                            lease_id=job.lease_id))
                     acted = job.prepare_next_learned(next_program)
                     if acted["ok"]:
                         acted = job.admit_task()

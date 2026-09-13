@@ -50,7 +50,7 @@ PHASES = (
 ARM_PHASES = frozenset(PHASES) - {"GRIPPER_CLOSE", "GRIPPER_OPEN"}
 JOINT_ORDER = ["j1", "j2", "j3", "j4", "j5", "j6"]
 COMMAND_FIELDS = {"schema_version", "op_id", "op", "payload"}
-COMMAND_OPS = {"admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "plan", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
+COMMAND_OPS = {"begin_generation", "admit_task", "task_boundary", "execute_terminal", "revoke_task", "prepare_next", "approve_next", "execute_next", "preflight", "capture_observation", "plan", "approve", "execute", "heartbeat", "confirm", "grasp_verdict", "semantic_verdict", "release_verdict", "cancel", "status"}
 ACTIVE_STATES = {"EXECUTING", "PRECONTACT_HUMAN", "GRASP_VERDICT", "SEMANTIC_VERDICT", "LEARNED_CHUNK_COMPLETE", "RELEASE_VERDICT"}
 RECYCLE_PHASES = ("RECYCLE_APPROACH_PTP", "LOWER_LIN", "GRIPPER_OPEN", "RETREAT_LIN", "SAFE_POSE_PTP")
 EXECUTION_RESULT_MARGIN_S = 2.0
@@ -306,9 +306,12 @@ class PickupExecutor:
         self.cache = {}
         self._cached_observation = None
         self.runs = {}
+        self._generation = None  # One pending output on this existing command owner.
         self._phase_event_writer = None
 
     def close(self):
+        if self._generation is not None:
+            self._generation["cancelled"] = True
         self._retire_observation_cache()
         if self._phase_event_writer is None:
             return True
@@ -440,6 +443,7 @@ class PickupExecutor:
         return copy.deepcopy(snapshot)
 
     def _capture_observation(self, payload):
+        self._check_pending_generation()
         fields = {"camera_topics", "max_observation_age_s"}
         bound = isinstance(payload, dict) and "run_id" in payload
         _exact(payload, fields | ({"run_id", "plan_digest", "lease_id"} if bound else set()), "LEARNED_OBSERVATION_SCHEMA")
@@ -465,6 +469,7 @@ class PickupExecutor:
         if capture is None:
             raise ContractError("LEARNED_OBSERVATION_UNAVAILABLE")
         observation = capture(payload["camera_topics"], payload["max_observation_age_s"])
+        self._check_pending_generation()
         if bound:
             # A late read cannot renew the lease or revive a cancelled attempt.
             self.tick()
@@ -532,6 +537,79 @@ class PickupExecutor:
         ):
             raise ContractError("MOTION_ONLY_CONTINUATION_BINDING")
 
+    def _check_pending_generation(self):
+        owned = self._generation
+        if owned is None or owned["consumed"]:
+            return
+        if owned["cancelled"]:
+            raise ContractError("LEARNED_CANCELLED")
+        if owned["revoked"]:
+            raise ContractError("TASK_GRANT_REVOKED")
+        context, grant = owned["context"], owned["grant"]
+        if self.source_clock() >= grant["deadline_s"] or not context["opened_monotonic_s"] <= self.monotonic_clock() < context["task_deadline_monotonic_s"]:
+            raise ContractError("TASK_DEADLINE_EXHAUSTED")
+
+    def _begin_generation(self, payload):
+        from uuid import uuid4
+        from tools.data_factory.rollout.finite_plan import SCOPED_SCHEMAS
+        from tools.data_factory.rollout.task_authority import GENERATION_SCHEMA, check_grant
+        fields = {"run_id", "grant", "source_program", "scene_binding", "proposal_spec", "predecessor_plan_digest", "lease_id"}
+        _exact(payload, fields, "LEARNED_GENERATION_CONTEXT")
+        source = validate_motion_program(copy.deepcopy(payload["source_program"]))
+        scene = validate_scene_binding(payload["scene_binding"])
+        spec, grant = payload["proposal_spec"], payload["grant"]
+        keys = {"schema_version", "checkpoint", "instruction", "robot_description", "velocity_scaling", "period_s", "max_observation_age_s"}
+        if isinstance(spec, dict) and "runtime_inputs" in spec:
+            keys.add("runtime_inputs")
+        if not isinstance(spec, dict) or set(spec) != keys or spec["schema_version"] not in SCOPED_SCHEMAS or spec["max_observation_age_s"] != .3:
+            raise ContractError("LEARNED_GENERATION_CONTEXT")
+        plan = {"run_id": payload["run_id"], "learned_source_program": source, "scene_binding": scene, "learned_proposal": spec}
+        now, steady = self.source_clock(), self.monotonic_clock()
+        check_grant(grant, plan, now)
+        predecessor = payload["predecessor_plan_digest"]
+        if predecessor is None:
+            if self.runs or self._generation is not None or payload["lease_id"] is not None:
+                raise ContractError("LEARNED_GENERATION_REUSED")
+            deadline = steady + (grant["deadline_s"] - now)
+        else:
+            run = self._bound({"run_id": payload["run_id"], "plan_digest": predecessor})
+            self._chunk_boundary(run, payload["lease_id"])
+            if grant != run.get("task_grant") or scene != run["plan"]["scene_binding"] or source != run["plan"]["learned_source_program"]:
+                raise ContractError("TASK_GRANT_SCOPE")
+            if "pending_chunk" in run or (self._generation is not None and not self._generation["consumed"]):
+                raise ContractError("LEARNED_GENERATION_REUSED")
+            if self._task_termination(run) is not None:
+                raise ContractError("TASK_POLICY_BUDGET_EXHAUSTED")
+            deadline = run["task_deadline"]
+        if min(grant["deadline_s"] - now, deadline - steady) <= grant["terminal_reserve_s"] + 5.:
+            raise ContractError("TASK_POLICY_BUDGET_EXHAUSTED")
+        context = {"schema_version": GENERATION_SCHEMA, "generation_id": uuid4().hex,
+                   "run_id": payload["run_id"], "task_grant_digest": grant["grant_digest"],
+                   "scene_binding_digest": canonical_digest(scene), "predecessor_plan_digest": predecessor,
+                   "opened_at_s": now, "opened_monotonic_s": steady, "task_deadline_monotonic_s": deadline}
+        self._generation = {"context": context, "grant": copy.deepcopy(grant), "spec": copy.deepcopy(spec),
+                            "cancelled": False, "revoked": False, "consumed": False}
+        return _response(ok=True, code="LEARNED_GENERATION_OPENED", state="IDLE" if predecessor is None else run["state"],
+                         run_id=payload["run_id"], plan_digest=predecessor, data={"generation_context": copy.deepcopy(context)})
+
+    def _check_generation(self, payload, predecessor):
+        from tools.data_factory.rollout.task_authority import check_generation, check_grant
+        p = payload["motion_program"]["learned_proposal"]
+        owned = self._generation
+        if owned is None or p["generation_context"] != owned["context"] or owned["consumed"]:
+            raise ContractError("LEARNED_GENERATION_CONTEXT")
+        if owned["cancelled"]:
+            raise ContractError("LEARNED_CANCELLED")
+        if owned["revoked"]:
+            raise ContractError("TASK_GRANT_REVOKED")
+        if any(p.get(k) != v for k, v in owned["spec"].items()):
+            raise ContractError("TASK_GRANT_SCOPE")
+        plan = {"run_id": payload["run_id"], "scene_binding": payload["scene_binding"],
+                "learned_source_program": payload["motion_program"]["source_program"], "learned_proposal": p}
+        check_grant(owned["grant"], plan, self.source_clock())
+        check_generation(owned["grant"], p, run_id=payload["run_id"], scene=payload["scene_binding"],
+                         predecessor=predecessor, now=self.source_clock(), steady=self.monotonic_clock())
+
     def _plan(self, payload):
         _exact(payload, {"run_id", "motion_program", "scene_binding"}, "PLAN_SCHEMA")
         run_id = payload["run_id"]
@@ -544,7 +622,13 @@ class PickupExecutor:
 
         response = self._compile_plan(payload)
         if response["ok"]:
+            if "generation_context" in payload["motion_program"].get("learned_proposal", {}):
+                self._check_generation(payload, None)
             self.runs[run_id] = self._planned_record(response)
+            if "generation_context" in response["data"]["plan"].get("learned_proposal", {}):
+                self._generation["consumed"] = True
+                self.runs[run_id].update(generation_grant=copy.deepcopy(self._generation["grant"]),
+                                         task_deadline=self._generation["context"]["task_deadline_monotonic_s"])
         return response
 
     @staticmethod
@@ -577,7 +661,10 @@ class PickupExecutor:
                 validate_release_slot(scene_binding["release_slot"], motion_program["robot_system_id"])
             checked_at = self.source_clock()
             try:
-                check_freshness(proposal, checked_at)
+                if "generation_context" in proposal:
+                    self._check_generation(payload, None if chunk_binding is None else chunk_binding["previous_plan_digest"])
+                else:
+                    check_freshness(proposal, checked_at)
             except ContractError as exc:
                 if exc.code != "LEARNED_STALE_OBSERVATION" or chunk_binding is not None:
                     raise
@@ -1014,11 +1101,17 @@ class PickupExecutor:
         if not response["ok"]:
             raise ContractError(response["code"])
         from tools.data_factory.rollout.finite_plan import check_freshness
-        check_freshness(proposal, self.source_clock())
+        if "generation_context" in proposal:
+            self._check_generation({"run_id": payload["run_id"], "motion_program": program,
+                                    "scene_binding": run["plan"]["scene_binding"]}, run["digest"])
+        else:
+            check_freshness(proposal, self.source_clock())
         elapsed = self.monotonic_clock() - prepared_steady
-        if elapsed < 0 or max(prepared_source - stamp for stamp in proposal["source_timestamps_s"].values()) + elapsed > proposal["max_observation_age_s"]:
+        if elapsed < 0 or ("generation_context" not in proposal and max(prepared_source - stamp for stamp in proposal["source_timestamps_s"].values()) + elapsed > proposal["max_observation_age_s"]):
             raise ContractError("LEARNED_STALE_OBSERVATION")
         run["pending_chunk"] = {**self._planned_record(response), "previous_chunk": previous_chunk}
+        if "generation_context" in proposal:
+            self._generation["consumed"] = True
         return self._execution_response(run, payload["run_id"], run["digest"], "LEARNED_NEXT_PLANNED")
 
     def _check_task(self, run):
@@ -1029,6 +1122,10 @@ class PickupExecutor:
         if run.get("task_revoked"):
             raise ContractError("TASK_GRANT_REVOKED")
         check_grant(grant, run["plan"], self.source_clock())
+        proposal = run["plan"].get("learned_proposal", {})
+        if "generation_context" in proposal and (self.source_clock() < proposal["inference_completed_at_s"]
+                or self.monotonic_clock() < proposal["generation_context"]["opened_monotonic_s"]):
+            raise ContractError("LEARNED_GENERATION_TIME")
         if self.monotonic_clock() >= run["task_deadline"]:
             raise ContractError("TASK_DEADLINE_EXHAUSTED")
 
@@ -1041,11 +1138,22 @@ class PickupExecutor:
             if run["state"] != "PLANNED" or "task_grant" in run:
                 raise ContractError("TASK_GRANT_STATE")
             grant = payload["grant"]
+            if "generation_context" in run["plan"].get("learned_proposal", {}):
+                if run.get("task_revoked"):
+                    raise ContractError("TASK_GRANT_REVOKED")
+                if grant != run.get("generation_grant"):
+                    raise ContractError("TASK_GRANT_SCOPE")
+                if self.monotonic_clock() >= run["task_deadline"]:
+                    raise ContractError("TASK_DEADLINE_EXHAUSTED")
+                proposal = run["plan"]["learned_proposal"]
+                if (self.source_clock() < proposal["inference_completed_at_s"]
+                        or self.monotonic_clock() < proposal["generation_context"]["opened_monotonic_s"]):
+                    raise ContractError("LEARNED_GENERATION_TIME")
             receipt = admission(grant, run["plan"], run["digest"], self.source_clock())
-            remaining = grant["deadline_s"] - self.source_clock()
+            remaining = min(grant["deadline_s"] - self.source_clock(), run.get("task_deadline", math.inf) - self.monotonic_clock())
             if remaining <= grant["terminal_reserve_s"] + 5.:
                 raise ContractError("TASK_POLICY_BUDGET_EXHAUSTED")
-            run.update(task_grant=copy.deepcopy(grant), task_deadline=self.monotonic_clock() + remaining)
+            run.update(task_grant=copy.deepcopy(grant), task_deadline=run.get("task_deadline", self.monotonic_clock() + remaining))
             run["approval"], run["state"] = receipt, "APPROVED"
         else:
             self._chunk_boundary(run, payload["lease_id"])
@@ -1186,9 +1294,14 @@ class PickupExecutor:
     def _revoke_task(self, payload):
         _exact(payload, {"run_id", "grant_digest"}, "TASK_GRANT_SCHEMA")
         run = self.runs.get(payload["run_id"])
+        owned = self._generation
+        if owned is not None and payload["run_id"] == owned["context"]["run_id"] and payload["grant_digest"] == owned["grant"]["grant_digest"]:
+            owned["revoked"] = True
+            if run is None:
+                return _response(ok=True, code="TASK_GRANT_REVOKED", state="BLOCKED", run_id=payload["run_id"])
         if run is None:
             raise ContractError("TASK_GRANT_SCOPE")
-        if run.get("task_grant", {}).get("grant_digest") != payload["grant_digest"]:
+        if run.get("task_grant", run.get("generation_grant", {})).get("grant_digest") != payload["grant_digest"]:
             raise ContractError("TASK_GRANT_SCOPE")
         run["task_revoked"] = True
         if "execution" in run:
@@ -1331,6 +1444,8 @@ class PickupExecutor:
         if payload["approval_scope"] not in {"HUMAN_GATED", "HIL_NUMERIC_PROXY"}:
             raise ContractError("APPROVAL_SCOPE")
         run = self._bound(payload)
+        if "generation_context" in run["plan"].get("learned_proposal", {}):
+            raise ContractError("TASK_GRANT_ADMISSION_REQUIRED")
         if run["state"] != "PLANNED":
             raise ContractError("APPROVAL_STATE")
         if payload["resolved_job_digest"] != run["plan"]["resolved_job_digest"]:
@@ -1466,6 +1581,12 @@ class PickupExecutor:
                         run["execution"]["behavior_report_status"] = "BEHAVIOR_REPORT_UNAVAILABLE"
                 run["cancel_event"] = threading.Event()
                 run["state"] = "EXECUTING"
+                if proposal is None:
+                    self._start_current_step(run)
+            if proposal is not None:
+                # Learned start owns its validation-through-send Scene lock.
+                # Automatic grant admission must not nest it inside arming;
+                # mutations after this release are checked by that same owner.
                 self._start_current_step(run)
         except ContractError as exc:
             return _response(code=exc.code, run_id=payload["run_id"], plan_digest=payload["plan_digest"], state="APPROVED")
@@ -2241,6 +2362,18 @@ class PickupExecutor:
         return self._execution_response(run, run["plan"]["run_id"], run["digest"], code)
 
     def _cancel(self, payload):
+        if isinstance(payload, dict) and set(payload) == {"run_id", "generation_id"}:
+            owned = self._generation
+            if owned is None or any(payload[k] != owned["context"][k] for k in payload):
+                raise ContractError("LEARNED_GENERATION_CONTEXT")
+            owned["cancelled"] = True
+            run = self.runs.get(payload["run_id"])
+            if run is not None:
+                if "execution" in run:
+                    self._fault(run, "LEARNED_CANCELLED")
+                else:
+                    run.update(state="BLOCKED", failure_code="LEARNED_CANCELLED")
+            return _response(ok=True, code="LEARNED_CANCELLED", state="BLOCKED", run_id=payload["run_id"])
         run = self._execution_payload(payload, {"run_id", "plan_digest", "lease_id"}, "CANCEL_SCHEMA")
         if not isinstance(payload["lease_id"], str) or not SAFE_ID.fullmatch(payload["lease_id"]) or payload["lease_id"] != run.get("execution", {}).get("lease_id"):
             raise ContractError("LEASE_BINDING")

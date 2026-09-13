@@ -1943,9 +1943,9 @@ class RosMoveItTransport:
         No retiming, clipping, delta conversion or secondary gripper goal is used.
         Controller support for the combined trajectory needs physical qualification.
         """
-        from tools.data_factory.rollout.finite_plan import validate_proposal, JOINTS, PROPOSAL_SCHEMA
+        from tools.data_factory.rollout.finite_plan import validate_proposal, JOINTS, PROPOSAL_SCHEMA, trajectory_schema
         proposal = validate_proposal(proposal)
-        if proposal["schema_version"] != PROPOSAL_SCHEMA:
+        if trajectory_schema(proposal) != PROPOSAL_SCHEMA:
             raise ContractError("LEARNED_HELD_SEGMENTS_REQUIRED")
         trajectory = self._RobotTrajectory()
         trajectory.joint_trajectory.joint_names = list(JOINTS)
@@ -1958,11 +1958,11 @@ class RosMoveItTransport:
 
     def build_learned_segment(self, proposal, segment):
         """Serialize a frozen held target or six-joint slice, without rebasing."""
-        from tools.data_factory.rollout.finite_plan import validate_proposal, HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA
+        from tools.data_factory.rollout.finite_plan import validate_proposal, HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA, trajectory_schema
         p = validate_proposal(proposal)
         start, end = segment["action_range"]
-        reference = p["schema_version"] == REFERENCE_PROPOSAL_SCHEMA
-        if (p["schema_version"] not in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA} or type(start) is not int or type(end) is not int
+        reference = trajectory_schema(p) == REFERENCE_PROPOSAL_SCHEMA
+        if (trajectory_schema(p) not in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA} or type(start) is not int or type(end) is not int
                 or not 0 <= start <= end <= len(p["actions"]) or start == len(p["actions"])
                 or not (reference and segment["type"] == "ARM") and p["actions"][start][-1] != segment["gripper_position_m"]):
             raise ContractError("LEARNED_SEGMENT_BINDING")

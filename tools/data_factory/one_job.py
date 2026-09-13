@@ -682,15 +682,27 @@ class OneJob:
         """Compile a non-moving plan without manufacturing a human approval."""
         return self._prepare_plan(run_id, motion_program, scene_binding)
 
-    def plan_learned(self, run_id, motion_program, scene_binding, inference, observation, **options):
+    def plan_learned(self, run_id, motion_program, scene_binding, inference, observation, *, task_grant=None, **options):
         """Consume a native inference session through the existing zero-motion planner."""
-        from tools.data_factory.rollout.finite_plan import compile_program
+        from tools.data_factory.rollout.finite_plan import compile_program, generation_spec
+        from tools.data_factory.rollout.task_authority import uses_scoped_generation, validate_generation_context
         if self.state != "IDLE":
             return self._result(False, "ONE_JOB_ONLY")
+        context = None
         try:
-            proposal = inference.propose(observation, **options)
+            if uses_scoped_generation(task_grant):
+                response = self._request("executor", "begin_generation", {
+                    "run_id": run_id, "grant": task_grant, "source_program": motion_program,
+                    "scene_binding": scene_binding, "proposal_spec": generation_spec(inference.checkpoint, **options),
+                    "predecessor_plan_digest": None, "lease_id": None}, update_state=False)
+                context = validate_generation_context(response["data"]["generation_context"])
+            proposal = inference.propose(observation() if callable(observation) else observation,
+                                         generation_context=context, **options)
             program = compile_program(motion_program, proposal)
         except ContractError as exc:
+            if context is not None:
+                self._request("executor", "cancel", {"run_id": run_id, "generation_id": context["generation_id"]},
+                              allowed_failure=True, update_state=False)
             self.state = "BLOCKED"
             return self._result(False, exc.code)
         return self.plan_only(run_id, program, scene_binding)

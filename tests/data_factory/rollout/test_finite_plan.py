@@ -476,6 +476,17 @@ class FinitePlanTest(unittest.TestCase):
     def test_public_native_task_grant_runs_two_outputs_without_clicks_and_hands_off(self):
         self._public_native_consumer("live", causal=True, granted=True)
 
+    def test_public_scoped_native_consumer_binds_before_capture_and_continues(self):
+        self._public_native_consumer("live", causal=True, granted=True, scoped=True)
+
+    def test_public_scoped_plan_only_binds_before_capture_without_motion(self):
+        self._public_native_consumer("plan_only", causal=True, scoped=True)
+
+    def test_public_scoped_capture_and_inference_failures_retire_context(self):
+        for failure in ("capture", "inference"):
+            with self.subTest(failure=failure):
+                self._public_native_consumer("plan_only", causal=True, scoped=True, generation_failure=failure)
+
     def test_public_native_continuation_reuses_owner_and_recorder_with_exact_approval(self):
         self._public_native_consumer("live", causal=True, continuation=True)
 
@@ -491,7 +502,7 @@ class FinitePlanTest(unittest.TestCase):
     def test_public_causal_plan_only_freezes_explicit_percent_representation(self):
         self._public_native_consumer("plan_only", causal=True, reference_mode="serialized_percent_retime")
 
-    def _public_native_consumer(self, mode, *, causal=False, reference_mode=None, continuation=False, next_choice="APPROVE", precontact_cancel=False, granted=False, source_changed=False):
+    def _public_native_consumer(self, mode, *, causal=False, reference_mode=None, continuation=False, next_choice="APPROVE", precontact_cancel=False, granted=False, source_changed=False, scoped=False, generation_failure=None):
         from tools.data_factory import run_job
         from tools.data_factory.learned_action_adapter import NativeSmolVLA
         from tests.data_factory.operator.fixtures import PROFILE, JOB, runtime_validated, payload
@@ -512,6 +523,8 @@ class FinitePlanTest(unittest.TestCase):
         transport.hardware_causal = causal
         transport.hardware_selected = causal
         def capture(topics, age):
+            if generation_failure == "capture":
+                raise ContractError("LEARNED_STALE_OBSERVATION")
             self.assertEqual(topics, {"camera1": "/up", "camera2": "/wrist"})
             self.assertEqual(age, .3)
             value = observation()
@@ -546,6 +559,8 @@ class FinitePlanTest(unittest.TestCase):
                 yield self
             checkpoint = CHECKPOINT
             def __call__(self, value):
+                if generation_failure == "inference":
+                    raise RuntimeError("synthetic inference failure")
                 self_test.assertEqual(value["task"], "synthetic probe")
                 return [ACTION[:]]
         self_test = self
@@ -567,8 +582,10 @@ class FinitePlanTest(unittest.TestCase):
                 value["learned_reference_mode"] = reference_mode
             if mode == "live":
                 value.update(run_root=str(root / "runs"), dataset_root=str(root / "unused-dataset"), camera_profile="up-wrist")
-            if granted:
+            if granted or scoped:
                 bound_proposal = proposal()
+                if scoped:
+                    bound_proposal["schema_version"] = "data_factory.finite_learned_proposal.v2"
                 bound_proposal["period_s"] = 1 / profile["fps"]
                 bound_proposal["runtime_inputs"] = {**run_job._learned_options(value), "clock_binding": clock_binding,
                     "camera_topics": {"camera1": "/up", "camera2": "/wrist"}, "camera_mapping": mapping,
@@ -624,6 +641,14 @@ class FinitePlanTest(unittest.TestCase):
                     session.worker.join(2.)
                 self.assertFalse(session.worker.is_alive())
                 result = session.snapshot
+            if generation_failure is not None:
+                self.assertEqual(result["code"], "LEARNED_STALE_OBSERVATION" if generation_failure == "capture" else "LEARNED_POLICY_FAILED")
+                self.assertEqual(calls.count(("executor", "cancel")), 1)
+                self.assertTrue(executor._generation["cancelled"])
+                self.assertEqual(transport.sent, [])
+                self.assertFalse(any(target == "recorder" for target, _ in calls))
+                self.assertEqual(closed, [True])
+                return
             if granted and source_changed:
                 self.assertEqual(result["code"], "LEARNED_CHECKPOINT_CHANGED", result)
                 self.assertEqual(len(transport.sent), 1)
@@ -641,6 +666,12 @@ class FinitePlanTest(unittest.TestCase):
                 self.assertEqual(calls.count(("executor", "admit_task")), 2)
                 self.assertFalse(any(target == "operator" or op in {"approve", "approve_next", "confirm", "commit"} for target, op in calls))
                 current = executor.runs["run"]
+                if scoped:
+                    self.assertEqual(calls.count(("executor", "begin_generation")), 2)
+                    self.assertLess(calls.index(("executor", "begin_generation")), calls.index(("executor", "capture_observation")))
+                    context = current["plan"]["learned_proposal"]["generation_context"]
+                    self.assertEqual(context["predecessor_plan_digest"], current["learned_history"][0]["approval"]["plan_digest"])
+                    self.assertEqual(context["task_deadline_monotonic_s"], current["task_deadline"])
                 self.assertEqual(len(current["learned_history"]), 1)
                 previous = current["learned_history"][0]
                 self.assertNotEqual(previous["approval"]["plan_digest"], current["digest"])
@@ -654,7 +685,8 @@ class FinitePlanTest(unittest.TestCase):
             factory.assert_called_once()
             self.assertLess(calls.index(("native", "warmup")), calls.index(("executor", "capture_observation")))
             self.assertEqual(closed, [True])
-            self.assertEqual([op for target, op in calls if target == "executor"][:2], ["capture_observation", "plan"])
+            expected_prefix = ["begin_generation", "capture_observation", "plan"] if scoped else ["capture_observation", "plan"]
+            self.assertEqual([op for target, op in calls if target == "executor"][:len(expected_prefix)], expected_prefix)
             if mode == "plan_only":
                 self.assertEqual(transport.sent, [])
                 self.assertFalse(any(target in {"operator", "recorder"} for target, _ in calls))
@@ -700,7 +732,7 @@ class FinitePlanTest(unittest.TestCase):
             self.assertEqual(plan["learned_proposal"]["runtime_inputs"][hardware_key], str(binding_path))
             self.assertEqual(result["data"]["task_effectiveness"], "UNKNOWN")
 
-    def make_held_job(self, initial_feedback=.021, *, controller_samples=True, arm_target=.001, recorded=None, quantize_gripper=False, max_observation_age_s=5., mechanical=False, contact_fixture=None):
+    def make_held_job(self, initial_feedback=.021, *, controller_samples=True, arm_target=.001, recorded=None, quantize_gripper=False, max_observation_age_s=5., mechanical=False, contact_fixture=None, scoped=False):
         # Reuse this file's lifecycle fixtures with the actual ROS serializers,
         # action dispatch, polling and cancellation; no ROS node is constructed.
         from builtin_interfaces.msg import Duration
@@ -887,12 +919,38 @@ class FinitePlanTest(unittest.TestCase):
                 "camera_topics": {"camera1": "/up", "camera2": "/wrist"},
                 "camera_mapping": {"observation.images.up": "observation.images.camera1",
                                    "observation.images.wrist": "observation.images.camera2"}, "fps": 30.}
-        planned = job.plan_learned("run", src, SCENE, inference, obs, **{**OPTIONS, "robot_description": xml, "period_s": 1 / 30,
-                                  "held_gripper_targets": recorded is None and not mechanical, "serialized_references": recorded is not None or mechanical,
-                                  "quantize_gripper": quantize_gripper, "max_observation_age_s": max_observation_age_s,
-                                  "runtime_inputs": runtime_inputs})
+        options = {**OPTIONS, "robot_description": xml, "period_s": 1 / 30,
+                   "held_gripper_targets": recorded is None and not mechanical, "serialized_references": recorded is not None or mechanical,
+                   "quantize_gripper": quantize_gripper, "max_observation_age_s": .3 if scoped else max_observation_age_s,
+                   "runtime_inputs": runtime_inputs}
+        from tools.data_factory.rollout.finite_plan import generation_spec
+        grant = task_grant(src, SCENE, generation_spec(inference.checkpoint, **options)) if scoped else None
+        planned = job.plan_learned("run", src, SCENE, inference, obs, task_grant=grant, **options)
         self.assertTrue(planned["ok"], planned)
         return job, executor, t, state, now, sent, handles, calls
+
+    def test_scoped_variants_reuse_actual_native_serializers_and_goal_consumer(self):
+        for reference in (False, True):
+            with self.subTest(reference=reference):
+                job, executor, transport, state, now, sent, _, calls = self.make_held_job(scoped=True, mechanical=reference)
+                p = job._program["learned_proposal"]
+                expected = ("data_factory.finite_learned_serialized_reference_proposal.v2" if reference else
+                            "data_factory.finite_learned_held_target_proposal.v2")
+                self.assertEqual(p["schema_version"], expected)
+                grant = task_grant(job._program["source_program"], SCENE, p)
+                now[0] += .4
+                self.assertTrue(job.admit_task(grant)["ok"])
+                with mock.patch('tools.data_factory.motion.moveit_transport.time.time', side_effect=lambda: now[0]):
+                    self.assertTrue(job.start()["ok"])
+                self.assertEqual(len(sent), 1)  # Actual serializer and native start method, synthetic action server only.
+                self.assertNotIn(("recorder", "commit"), calls)
+                self.assertEqual(executor.runs["run"]["task_deadline"], 100.)
+                plain_job, *_ = self.make_job(scoped=True)
+                plain = plain_job._program["learned_proposal"]
+                raw = transport.build_learned_trajectory(plain)
+                trajectory = transport._deserialize_message(raw, transport._RobotTrajectory).joint_trajectory
+                self.assertEqual(trajectory.joint_names, JOINTS)
+                self.assertEqual([list(point.positions) for point in trajectory.points], [INITIAL, ACTION])
 
     def test_native_percent_adaptation_preserves_transitions_and_exposes_changed_endpoint(self):
         data = json.loads(Path(__file__).with_name("recorded4032.json").read_text())
@@ -2087,7 +2145,7 @@ class FinitePlanTest(unittest.TestCase):
         self.assertEqual(transport.sent, [])
         self.assertEqual(transport.cancel_count, 0)
 
-    def make_job(self, *, hardware=True, scene_store=None, scene_binding=None):
+    def make_job(self, *, hardware=True, scene_store=None, scene_binding=None, scoped=False, planning_delay=0.):
         calls = []
         transport, cell, scene = Transport(), Cell(), scene_store if scene_store is not None else Scene()
         now = [10.]
@@ -2106,9 +2164,307 @@ class FinitePlanTest(unittest.TestCase):
                    if snapshot is not None else SCENE)
         if scene_binding is not None:
             binding = copy.deepcopy(scene_binding)
-        planned = job.plan_learned("run", source(), binding, inference, observation(), **OPTIONS)
+        grant = None
+        if scoped:
+            from tools.data_factory.rollout.finite_plan import generation_spec
+            grant = task_grant(source(), binding, generation_spec(CHECKPOINT, **OPTIONS))
+        original_plan = job.plan_only
+        def delayed_plan(*args):
+            now[0] += planning_delay
+            return original_plan(*args)
+        job.plan_only = delayed_plan
+        planned = job.plan_learned("run", source(), binding, inference, observation(), task_grant=grant, **OPTIONS)
         self.assertTrue(planned["ok"], planned)
         return job, executor, transport, cell, scene, now, calls
+
+    def test_scoped_generation_delay_is_consistent_before_and_after_plan_entry(self):
+        for before, after in ((.8, 0.), (0., .8)):
+            with self.subTest(before=before, after=after):
+                job, executor, transport, _, _, now, calls = self.make_job(scoped=True, planning_delay=before)
+                proposal = job._program["learned_proposal"]
+                self.assertEqual(proposal["schema_version"], "data_factory.finite_learned_proposal.v2")
+                self.assertEqual(proposal["source_timestamps_s"], observation()["source_timestamps_s"])
+                self.assertEqual(proposal["actions"], [ACTION])
+                self.assertEqual(transport.sent, [])
+                self.assertFalse(any(target == "recorder" for target, _ in calls))
+                original_deadline = executor.runs["run"]["task_deadline"]
+                self.assertEqual(original_deadline, 100.)
+                now[0] += after
+                grant = task_grant(source(), SCENE, proposal)
+                self.assertTrue(job.admit_task(grant)["ok"])
+                self.assertEqual(executor.runs["run"]["task_deadline"], original_deadline)
+                self.assertTrue(job.start()["ok"])
+                self.assertEqual(len(transport.sent), 1)
+
+    def test_scoped_generation_requires_grant_and_original_budget_at_admission(self):
+        for failure in ("human", "grant", "expiry", "revoke", "cancel", "current_state", "hardware", "future"):
+            with self.subTest(failure=failure):
+                job, executor, transport, _, _, now, _ = self.make_job(scoped=True)
+                grant = task_grant(source(), SCENE, job._program["learned_proposal"])
+                if failure == "human":
+                    result = job.approve(APPROVAL)
+                else:
+                    if failure == "grant":
+                        grant["grant_id"] = "different"
+                        grant.pop("grant_digest")
+                        grant["grant_digest"] = canonical_digest(grant)
+                    elif failure == "expiry":
+                        executor.monotonic_clock = lambda: 101.
+                    elif failure == "revoke":
+                        executor.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "revoke-before-admit",
+                            "op": "revoke_task", "payload": {"run_id": "run", "grant_digest": grant["grant_digest"]}})
+                    elif failure == "cancel":
+                        context = job._program["learned_proposal"]["generation_context"]
+                        executor.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "cancel-before-admit",
+                            "op": "cancel", "payload": {"run_id": "run", "generation_id": context["generation_id"]}})
+                    elif failure == "future":
+                        now[0] = 9.9
+                    result = job.admit_task(grant)
+                    if failure in {"current_state", "hardware"}:
+                        self.assertTrue(result["ok"], result)
+                        if failure == "current_state":
+                            transport.current[0] += .1
+                        else:
+                            transport.hardware = False
+                        result = job.start()
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(transport.sent, [])
+
+    def test_scoped_generation_rejects_archived_wrapper_and_changed_context(self):
+        for mutation in ("wrapper", "run_id", "task_grant_digest", "scene_binding_digest", "predecessor_plan_digest", "future_completion"):
+            with self.subTest(mutation=mutation):
+                job, owner, _, _, _, _, _ = self.make_job(scoped=True)
+                archived = copy.deepcopy(job._program)
+                transport, cell, scene = Transport(), Cell(), Scene()
+                transport.hardware = True
+                fresh = PickupExecutor(transport, execution_enabled=True, cell_state_store=cell,
+                    scene_state_store=scene, source_clock=lambda: 10., monotonic_clock=lambda: 10.)
+                p = archived["learned_proposal"]
+                grant = task_grant(source(), SCENE, p)
+                from tools.data_factory.rollout.finite_plan import generation_spec
+                opened = fresh.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "open",
+                    "op": "begin_generation", "payload": {"run_id": "run", "grant": grant, "source_program": source(),
+                    "scene_binding": SCENE, "proposal_spec": generation_spec(CHECKPOINT, **OPTIONS),
+                    "predecessor_plan_digest": None, "lease_id": None}})
+                self.assertTrue(opened["ok"], opened)
+                if mutation != "wrapper":
+                    # Even a rehashed proposal cannot substitute a different bound context.
+                    p["generation_context"] = copy.deepcopy(opened["data"]["generation_context"])
+                    if mutation == "future_completion":
+                        p["inference_completed_at_s"] = 10.1
+                    else:
+                        p["generation_context"][mutation] = "wrong-run" if mutation == "run_id" else canonical_digest("wrong")
+                    archived = compile_program(source(), redigest(p))
+                response = fresh.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "plan",
+                    "op": "plan", "payload": {"run_id": "run", "motion_program": archived, "scene_binding": SCENE}})
+                self.assertFalse(response["ok"], response)
+                self.assertEqual(transport.sent, [])
+
+    def scoped_next_program(self, job, executor, now, *, policy=None):
+        from tools.data_factory.rollout.finite_plan import generation_spec
+        grant = executor.runs["run"]["task_grant"]
+        response = executor.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "open-next",
+            "op": "begin_generation", "payload": {"run_id": job.run_id, "grant": grant, "source_program": source(),
+                "scene_binding": job.scene_binding, "proposal_spec": generation_spec(CHECKPOINT, **OPTIONS),
+                "predecessor_plan_digest": job.plan_digest, "lease_id": job.lease_id}})
+        self.assertTrue(response["ok"], response)
+        obs = observation()
+        obs["source_timestamps_s"] = {k: now[0] for k in obs["source_timestamps_s"]}
+        obs["observation.state"] = ACTION[:]
+        inference = FinitePolicyInference(policy or (lambda _: [ACTION[:]]), CHECKPOINT,
+            source_clock=lambda: now[0], monotonic_clock=lambda: now[0])
+        candidate = inference.propose(obs, generation_context=response["data"]["generation_context"], **OPTIONS)
+        return compile_program(source(), candidate)
+
+    def test_scoped_continuation_delay_on_either_side_of_compile_preserves_budget(self):
+        for placement in ("before", "inside", "after"):
+            with self.subTest(placement=placement):
+                job, executor, transport, _, _, now, calls = self.make_job(scoped=True)
+                self.assertTrue(job.admit_task(task_grant(source(), SCENE, job._program["learned_proposal"]))["ok"])
+                self.assertTrue(job.start()["ok"])
+                now[0] = 10.1
+                self.assertEqual(job.poll()["state"], "LEARNED_CHUNK_COMPLETE")
+                deadline = executor.runs["run"]["task_deadline"]
+                candidate = self.scoped_next_program(job, executor, now)
+                if placement == "before":
+                    now[0] += .4
+                elif placement == "inside":
+                    original = executor._compile_plan
+                    def delayed(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        now[0] += .4
+                        return result
+                    executor._compile_plan = delayed
+                result = job.prepare_next_learned(candidate)
+                self.assertTrue(result["ok"], result)
+                if placement == "after":
+                    now[0] += .4
+                self.assertTrue(job.admit_task()["ok"])
+                result = job.start_next_learned()
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(len(transport.sent), 2)
+                self.assertEqual(executor.runs["run"]["task_deadline"], deadline)
+                self.assertEqual(calls.count(("recorder", "begin")), 1)
+                self.assertNotIn(("recorder", "commit"), calls)
+
+    def test_scoped_continuation_late_compile_and_invalid_inputs_send_no_new_goal(self):
+        for failure in ("expired_compile", "cancelled_compile", "revoked_compile", "predecessor",
+                        "current_state", "hardware", "stale_generation", "active"):
+            with self.subTest(failure=failure):
+                job, executor, transport, _, _, now, calls = self.make_job(scoped=True)
+                grant = task_grant(source(), SCENE, job._program["learned_proposal"])
+                self.assertTrue(job.admit_task(grant)["ok"])
+                self.assertTrue(job.start()["ok"])
+                now[0] = 10.1
+                self.assertEqual(job.poll()["state"], "LEARNED_CHUNK_COMPLETE")
+                if failure == "stale_generation":
+                    def slow(_):
+                        now[0] += .301
+                        return [ACTION[:]]
+                    with self.assertRaisesRegex(ContractError, "LEARNED_STALE_OBSERVATION|LEARNED_INFERENCE_TIMEOUT|LEARNED_HORIZON"):
+                        self.scoped_next_program(job, executor, now, policy=slow)
+                    self.assertEqual(len(transport.sent), 1)
+                    continue
+                candidate = self.scoped_next_program(job, executor, now)
+                if failure == "predecessor":
+                    candidate["learned_proposal"]["generation_context"]["predecessor_plan_digest"] = canonical_digest("foreign")
+                    candidate = compile_program(source(), redigest(candidate["learned_proposal"]))
+                elif failure in {"expired_compile", "cancelled_compile", "revoked_compile"}:
+                    original = executor._compile_plan
+                    def late(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        if failure == "expired_compile":
+                            executor.monotonic_clock = lambda: 101.
+                        elif failure == "cancelled_compile":
+                            executor.runs["run"]["cancel_event"].set()
+                        else:
+                            executor.runs["run"]["task_revoked"] = True
+                        return result
+                    executor._compile_plan = late
+                elif failure == "current_state":
+                    transport.current[0] += .1
+                elif failure == "hardware":
+                    transport.hardware = False
+                elif failure == "active":
+                    transport.active = True
+                result = job.prepare_next_learned(candidate)
+                if failure == "hardware" and result["ok"]:
+                    self.assertTrue(job.admit_task()["ok"])
+                    result = job.start_next_learned()
+                self.assertFalse(result["ok"], result["code"])
+                self.assertEqual(len(transport.sent), 1)
+                self.assertNotIn(("recorder", "commit"), calls)
+
+    def test_scoped_monotonic_budget_is_not_reset_by_initial_compilation(self):
+        # Wall time stalls while compilation consumes the original task budget.
+        transport = Transport()
+        transport.hardware = True
+        steady = [10.]
+        executor = PickupExecutor(transport, execution_enabled=True, cell_state_store=Cell(),
+            scene_state_store=Scene(), source_clock=lambda: 10., monotonic_clock=lambda: steady[0])
+        job = OneJob(Recorder([]), executor.process)
+        from tools.data_factory.rollout.finite_plan import generation_spec
+        grant = task_grant(source(), SCENE, generation_spec(CHECKPOINT, **OPTIONS))
+        original = executor._compile_plan
+        def late(*args, **kwargs):
+            result = original(*args, **kwargs)
+            steady[0] = 101.
+            return result
+        executor._compile_plan = late
+        result = job.plan_learned("run", source(), SCENE,
+            FinitePolicyInference(lambda _: [ACTION[:]], CHECKPOINT, source_clock=lambda: 10.),
+            observation(), task_grant=grant, **OPTIONS)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["code"], "TASK_DEADLINE_EXHAUSTED")
+        self.assertEqual(transport.sent, [])
+        self.assertEqual(executor.runs, {})
+
+    def test_scoped_generation_keeps_real_scene_guard_at_initial_and_next_dispatch(self):
+        from tools.data_factory.scene_state import SceneStateStore
+        for continued in (False, True):
+            with self.subTest(continued=continued), tempfile.TemporaryDirectory() as directory:
+                scene = SceneStateStore(directory, "fr5-lab-a")
+                def human_pose(x):
+                    scene.update_object(instance_id="cube-1", object_profile_id="cube", state="ON_SURFACE",
+                        source="HUMAN", updated_by="operator",
+                        pose={"place_id": "PLACE_A", "yaw_deg": 0., "x_mm": x, "y_mm": 20.})
+                human_pose(10.)
+                job, executor, transport, _, _, now, _ = self.make_job(scoped=True, scene_store=scene)
+                self.assertTrue(job.admit_task(task_grant(source(), job.scene_binding, job._program["learned_proposal"]))["ok"])
+                if continued:
+                    result = job.start()
+                    self.assertTrue(result["ok"], result["code"])
+                    now[0] = 10.1
+                    self.assertEqual(job.poll()["state"], "LEARNED_CHUNK_COMPLETE")
+                    candidate = self.scoped_next_program(job, executor, now)
+                    self.assertTrue(job.prepare_next_learned(candidate)["ok"])
+                    self.assertTrue(job.admit_task()["ok"])
+                sent = len(transport.sent)
+                human_pose(99.)
+                changed = scene.snapshot()
+                result = job.start_next_learned() if continued else job.start()
+                self.assertFalse(result["ok"], result["code"])
+                self.assertEqual(len(transport.sent), sent)
+                self.assertEqual(scene.snapshot(), changed)
+
+    def test_task_grant_scene_arming_release_revalidates_before_submission(self):
+        from tools.data_factory.scene_state import SceneStateStore
+        for scoped in (False, True):
+            for mutate in (False, True):
+                with self.subTest(scoped=scoped, mutate=mutate), tempfile.TemporaryDirectory() as directory:
+                    scene = SceneStateStore(directory, "fr5-lab-a")
+                    def human_pose(x):
+                        scene.update_object(instance_id="cube-1", object_profile_id="cube", state="ON_SURFACE",
+                            source="HUMAN", updated_by="operator",
+                            pose={"place_id": "PLACE_A", "yaw_deg": 0., "x_mm": x, "y_mm": 20.})
+                    human_pose(10.)
+                    job, executor, transport, _, _, _, _ = self.make_job(scoped=scoped, scene_store=scene)
+                    self.assertTrue(job.admit_task(task_grant(source(), job.scene_binding, job._program["learned_proposal"]))["ok"])
+                    locked = scene.locked_snapshot
+                    armed_release = []
+                    @contextmanager
+                    def interleaved(*args, **kwargs):
+                        with locked(*args, **kwargs) as value:
+                            yield value
+                        if not armed_release and "execution" in executor.runs["run"]:
+                            armed_release.append(True)
+                            if mutate:
+                                human_pose(99.)
+                    scene.locked_snapshot = interleaved
+                    result = job.start()
+                    self.assertEqual(result["ok"], not mutate, result["code"])
+                    self.assertEqual(len(transport.sent), 0 if mutate else 1)
+                    self.assertEqual(scene.snapshot()["scene_state"]["objects"]["cube-1"]["pose"]["x_mm"], 99. if mutate else 10.)
+
+    def test_generation_retry_and_cancel_never_allocate_a_new_context_or_budget(self):
+        from tools.data_factory.rollout.finite_plan import generation_spec
+        transport, now = Transport(), [10.]
+        executor = PickupExecutor(transport, source_clock=lambda: now[0], monotonic_clock=lambda: now[0])
+        spec = generation_spec(CHECKPOINT, **OPTIONS)
+        request = {"schema_version": "fr5.pickup_executor.command.v4", "op_id": "original-generation",
+            "op": "begin_generation", "payload": {"run_id": "run", "grant": task_grant(source(), SCENE, spec),
+                "source_program": source(), "scene_binding": SCENE, "proposal_spec": spec,
+                "predecessor_plan_digest": None, "lease_id": None}}
+        first = executor.process(copy.deepcopy(request))
+        self.assertTrue(first["ok"], first["code"])
+        context = first["data"]["generation_context"]
+        now[0] += 1.
+        self.assertEqual(executor.process(copy.deepcopy(request)), first)
+        stopped = executor.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "stop-generation",
+            "op": "cancel", "payload": {"run_id": "run", "generation_id": context["generation_id"]}})
+        self.assertTrue(stopped["ok"])
+        # The idempotent receipt is historical; it cannot undo the owner's fence.
+        self.assertEqual(executor.process(copy.deepcopy(request)), first)
+        self.assertEqual(executor._generation["context"], context)
+        self.assertTrue(executor._generation["cancelled"])
+        request["op_id"] = "new-generation"
+        self.assertEqual(executor.process(request)["code"], "LEARNED_GENERATION_REUSED")
+        p = FinitePolicyInference(lambda _: [ACTION[:]], CHECKPOINT, source_clock=lambda: 10.).propose(
+            observation(), generation_context=context, **OPTIONS)
+        result = executor.process({"schema_version": "fr5.pickup_executor.command.v4", "op_id": "late-plan",
+            "op": "plan", "payload": {"run_id": "run", "motion_program": compile_program(source(), p), "scene_binding": SCENE}})
+        self.assertEqual(result["code"], "LEARNED_CANCELLED")
+        self.assertEqual(transport.sent, [])
 
     def start_job(self):
         values = self.make_job()

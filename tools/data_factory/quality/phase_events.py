@@ -73,9 +73,9 @@ def validate_phase_event(value: Mapping[str, Any], *, plan: Mapping[str, Any] | 
             raise ContractError("PHASE_EVENT_PLAN_BINDING")
         held = steps[0].get("held_target_segments")
         if held is not None:
-            from tools.data_factory.rollout.finite_plan import HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA, validate_proposal
+            from tools.data_factory.rollout.finite_plan import HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA, validate_proposal, trajectory_schema
             proposal = validate_proposal(plan.get("learned_proposal"))
-            if (proposal["schema_version"] not in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA} or not isinstance(held, list)
+            if (trajectory_schema(proposal) not in {HELD_PROPOSAL_SCHEMA, REFERENCE_PROPOSAL_SCHEMA} or not isinstance(held, list)
                     or not 1 <= len(held) <= 2 * len(proposal["actions"])
                     or value["phase"] != "LEARNED_CHUNK" or value["event_source"] != "pickup_executor"):
                 raise ContractError("PHASE_EVENT_PLAN_BINDING")
