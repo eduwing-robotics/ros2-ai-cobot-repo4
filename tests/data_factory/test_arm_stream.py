@@ -3,10 +3,11 @@ from concurrent.futures import Future
 from itertools import count
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
+from unique_identifier_msgs.msg import UUID
 
 from tools.data_factory.motion.arm_stream import ArmStream
 from tools.data_factory.motion.moveit_transport import RosMoveItTransport
@@ -44,6 +45,17 @@ def finish(item, status=4, code=0):
         status=status, result=SimpleNamespace(error_code=code)))
 
 
+def feedback(item, nanosec=100_000_000):
+    message = FollowJointTrajectory.Impl.FeedbackMessage()
+    message.goal_id = UUID(uuid=list(item.goal_id.uuid))
+    message.feedback.joint_names = [f"j{i}" for i in range(1, 7)]
+    message.feedback.header.stamp.sec = 42
+    message.feedback.desired = JointTrajectoryPoint(positions=[.1] * 6)
+    message.feedback.desired.time_from_start.nanosec = nanosec
+    message.feedback.actual = JointTrajectoryPoint(positions=[.09] * 6)
+    return message
+
+
 class ArmStreamTest(unittest.TestCase):
     def setUp(self):
         self.now = 10.
@@ -78,6 +90,92 @@ class ArmStreamTest(unittest.TestCase):
         self.assertTrue(self.stream.owns_goals)
         self.assertIsNone(self.stream.current_revision)
         self.client.send_goal_async.assert_called_once()
+
+    def test_goal_feedback_is_bound_to_native_identity_and_preserves_source_time(self):
+        first = self.initial()
+        callback = self.client.send_goal_async.call_args.kwargs["feedback_callback"]
+        sample = feedback(first)
+        callback(sample)
+        sample.feedback.desired.positions[0] = 9.
+        self.now = 11.
+        events = self.stream.poll()
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual((event["revision"], event["event"]), ("first", "FEEDBACK"))
+        self.assertEqual(event["goal_id"], list(first.goal_id.uuid))
+        self.assertEqual(event["received_monotonic_s"], 10.)
+        self.assertEqual(event["feedback"]["header"]["stamp"]["sec"], 42)
+        self.assertEqual(event["feedback"]["desired"]["positions"][0], .1)
+        self.assertEqual(event["feedback"]["actual"]["positions"][0], .09)
+        self.assertEqual(event["feedback"]["desired"]["time_from_start"]["nanosec"], 100_000_000)
+        self.assertEqual(self.stream.poll(), [])
+        self.assertFalse(first.get_result_async.return_value.done())
+        self.client.send_goal_async.assert_called_once()
+
+    def test_feedback_before_acceptance_is_retained_but_not_published_unbound(self):
+        self.stream.submit(goal(), revision="first", dispatch_guard=self.guard)
+        callback = self.client.send_goal_async.call_args.kwargs["feedback_callback"]
+        first = handle()
+        callback(feedback(first))
+        self.assertEqual(self.stream.poll(), [])
+        self.response.set_result(first)
+        self.assertEqual([e["event"] for e in self.stream.poll()], ["ACCEPTED", "FEEDBACK"])
+        callback(feedback(handle()))
+        self.assertEqual(self.stream.poll(), [])
+        self.assertFalse(self.stream.fenced)
+
+    def test_feedback_is_latest_only_and_cannot_alias_replacement_or_revive_terminal(self):
+        first = self.initial()
+        old_callback = self.client.send_goal_async.call_args.kwargs["feedback_callback"]
+        response = self.replacement()
+        new_callback = self.client.send_goal_async.call_args.kwargs["feedback_callback"]
+        second = handle()
+        response.set_result(second)
+        self.stream.poll()
+        for n in range(1, 1001):
+            old_callback(feedback(first, n))
+        new_callback(feedback(second, 7))
+        finish(first, 6, -1)
+        events = self.stream.poll()
+        self.assertEqual([(e["revision"], e["event"]) for e in events],
+                         [("first", "FEEDBACK"), ("first", "TERMINAL"), ("second", "FEEDBACK")])
+        self.assertEqual(events[0]["samples_since_poll"], 1000)
+        self.assertEqual(events[0]["feedback"]["desired"]["time_from_start"]["nanosec"], 1000)
+        self.assertEqual(events[2]["samples_since_poll"], 1)
+        old_callback(feedback(first, 2000))
+        self.assertEqual(self.stream.poll(), [])
+        self.assertEqual(self.stream.current_revision, "second")
+
+    def test_feedback_does_not_dispatch_or_hide_cancellation_and_native_terminal(self):
+        first = self.initial()
+        callback = self.client.send_goal_async.call_args.kwargs["feedback_callback"]
+        self.stream.cancel()
+        callback(feedback(first))
+        self.assertEqual(self.stream.poll()[0]["event"], "FEEDBACK")
+        first.cancel_goal_async.assert_called_once()
+        callback(feedback(first, 200_000_000))
+        finish(first, 5)
+        self.assertEqual([e["event"] for e in self.stream.poll()], ["FEEDBACK", "TERMINAL"])
+        self.assertFalse(self.stream.owns_goals)
+        self.client.send_goal_async.assert_called_once()
+
+    def test_feedback_projection_error_does_not_cancel_motion_or_hide_native_result(self):
+        first = self.initial()
+        callback = self.client.send_goal_async.call_args.kwargs["feedback_callback"]
+        response = self.replacement()
+        second = handle()
+        response.set_result(second)
+        self.stream.poll()
+        callback(feedback(first))
+        finish(first, 6, -1)
+        error = ValueError("projection failed")
+        with patch("rosidl_runtime_py.convert.message_to_ordereddict", side_effect=error):
+            events = self.stream.poll()
+        self.assertEqual(events, [
+            {"revision": "first", "event": "FEEDBACK_UNAVAILABLE", "error_type": "ValueError"},
+            {"revision": "first", "event": "TERMINAL", "result_status": 6, "error_code": -1}])
+        self.assertFalse(self.stream.fenced)
+        second.cancel_goal_async.assert_not_called()
 
     def test_replacement_does_not_invent_predecessor_terminal(self):
         first = self.initial()

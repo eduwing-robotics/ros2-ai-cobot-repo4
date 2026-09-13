@@ -23,13 +23,15 @@ class _Submission:
     cancel_response: object = None
     cancel_requested: bool = False
     cancel_observed: bool = False
+    feedback: object = None
 
 
 class ArmStream:
     """One attempt's native rolling trajectory handles; never sends ServoJ.
 
     All methods are called by the same existing motion-owner thread. ROS futures
-    are observed without waits or callbacks that can write files or dispatch.
+    are observed without waits. Feedback callbacks retain one latest native
+    sample per owned goal; they never write files, advance policy queues or send.
     Only one replacement can be pending. A predecessor remains owned until its
     actual native result arrives, even after the successor has been accepted.
     """
@@ -92,10 +94,19 @@ class ArmStream:
         pending = _Submission(revision, retained, None)
         self._pending = pending
         try:
-            pending.response = self._client.send_goal_async(copy.deepcopy(retained))
+            pending.response = self._client.send_goal_async(copy.deepcopy(retained),
+                feedback_callback=lambda message: self._receive_feedback(pending, message))
         except Exception:
             self._fenced = True
             raise
+
+    def _receive_feedback(self, item, message):
+        if not any(item is owned for owned in (self._current, self._pending, self._retiring)):
+            return
+        if item.handle is not None and list(message.goal_id.uuid) != list(item.handle.goal_id.uuid):
+            return
+        count = 1 if item.feedback is None else item.feedback[2] + 1
+        item.feedback = (copy.deepcopy(message), self._clock(), count)
 
     def cancel(self):
         """Fence new updates; request cancellation once handles become known.
@@ -138,6 +149,22 @@ class ArmStream:
             item = getattr(self, slot)
             if item is None:
                 continue
+            try:
+                if item.feedback is not None and item.handle is not None:
+                    message, received, count = item.feedback
+                    item.feedback = None
+                    if list(message.goal_id.uuid) == list(item.handle.goal_id.uuid):
+                        from rosidl_runtime_py.convert import message_to_ordereddict
+                        events.append({"revision": item.revision, "event": "FEEDBACK",
+                                       "goal_id": list(message.goal_id.uuid),
+                                       "received_monotonic_s": received,
+                                       "samples_since_poll": count,
+                                       "feedback": message_to_ordereddict(message.feedback)})
+            except Exception as exc:
+                # Diagnostic projection is not actuator authority. Missing
+                # feedback cannot advance a queue, but must not cancel motion.
+                events.append({"revision": item.revision, "event": "FEEDBACK_UNAVAILABLE",
+                               "error_type": type(exc).__name__})
             try:
                 if (item.cancel_response is not None and not item.cancel_observed
                         and item.cancel_response.done()):

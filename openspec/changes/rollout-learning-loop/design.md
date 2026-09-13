@@ -491,3 +491,19 @@ stall subsequent rolling updates. Reuse the official Jazzy
 instead of inventing a terminal result or weakening ownership. Mocked fixed
 controller results do not qualify the installed binary. Stage/verify the native
 correction before live selection; do not hot-replace the active robot stack.
+
+The staged 4.42.1 release library (SHA-256
+`38539ff288bf4328d3047cc9cb386ba83f59f57d82051ab553e5693a756cc5fd`)
+passed the upstream preemption regression using vector-backed fake joint
+interfaces, not the FR5 hardware plugin. This verifies the packaged native
+result-delivery correction, not live deployment or physical behavior.
+
+The ARM port retains goal-UUID-bound action feedback separately from acceptance
+and terminal results. The native source stamp and `desired.time_from_start`
+remain controller-reference evidence; host receipt time is recorded separately.
+Feedback callbacks only copy the latest sample per owned handle. Polling exposes
+the number of coalesced samples rather than claiming a complete feedback stream;
+the existing recorder remains the state/action time-series owner. Neither this
+feedback nor ARM-only progress proves full seven-dimensional command adoption,
+gripper completion or task success. Diagnostic projection failure is reported as
+unavailable feedback without becoming an actuator cancellation condition.
