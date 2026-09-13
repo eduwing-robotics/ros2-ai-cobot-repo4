@@ -315,14 +315,18 @@ class PickupExecutor:
             self._generation["cancelled"] = True
         self._retire_observation_cache()
         observer_closed = self._close_policy_observer()
+        streams_owned = any(
+            run.get("execution", {}).get("actuator_stream_stop_pending") is True
+            for run in self.runs.values()
+        )
         if self._phase_event_writer is None:
-            return observer_closed
+            return observer_closed and not streams_owned
         ok = self._phase_event_writer.close()
         if not ok:
             for run in self.runs.values():
                 if "execution" in run:
                     run["execution"]["behavior_report_status"] = "BEHAVIOR_REPORT_UNAVAILABLE"
-        return ok and observer_closed
+        return ok and observer_closed and not streams_owned
 
     def _close_policy_observer(self):
         if self._policy_observer is None:
@@ -1699,6 +1703,9 @@ class PickupExecutor:
             data["terminal_verification"] = copy.deepcopy(execution["terminal_verification"])
         if "scene_preservation" in execution:
             data["scene_preservation"] = copy.deepcopy(execution["scene_preservation"])
+        for key in ("actuator_stream_events", "actuator_stream_feedback", "actuator_stream_drain", "actuator_stream_drain_error"):
+            if key in execution:
+                data[key] = copy.deepcopy(execution[key])
         if run.get("recycle_plan_digest") is not None:
             data["recycle_plan_digest"] = run["recycle_plan_digest"]
         if "learned_proposal" in run["plan"]:
@@ -1990,6 +1997,103 @@ class PickupExecutor:
         run["execution"]["motion_dispatch_attempted"] = True
         return self.transport.start_phase(step, **options)
 
+    def _actuator_stream_status(self):
+        reader = getattr(type(self.transport), "learned_actuator_stream_status", None)
+        if not callable(reader):
+            return None
+        status = reader(self.transport)
+        if (
+            not isinstance(status, dict)
+            or set(status) != {"active", "fenced", "owns_goals"}
+            or any(type(status[key]) is not bool for key in status)
+            or not status["active"] and (status["fenced"] or status["owns_goals"])
+        ):
+            raise ContractError("ROS_EXEC_STREAM_STATUS")
+        return status
+
+    @staticmethod
+    def _retain_actuator_stream_events(execution, events):
+        if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
+            raise ContractError("ROS_EXEC_STREAM_EVENTS")
+        for event in events:
+            if event.get("event") != "FEEDBACK":
+                execution.setdefault("actuator_stream_events", []).append(copy.deepcopy(event))
+                continue
+            revision, actuator, goal_id = event.get("revision"), event.get("actuator"), event.get("goal_id")
+            samples = event.get("samples_since_poll")
+            if (
+                not isinstance(revision, str) or not revision
+                or actuator not in {"arm", "gripper"}
+                or not isinstance(goal_id, list) or not goal_id
+                or any(type(value) is not int or not 0 <= value <= 255 for value in goal_id)
+                or type(samples) is not int or samples <= 0
+            ):
+                raise ContractError("ROS_EXEC_STREAM_EVENTS")
+            retained = execution.setdefault("actuator_stream_feedback", [])
+            previous = next((item for item in retained
+                             if item["revision"] == revision and item["actuator"] == actuator
+                             and item["goal_id"] == goal_id), None)
+            record = {
+                "revision": revision, "actuator": actuator, "goal_id": copy.deepcopy(goal_id),
+                "coalesced_event_count": 1, "coalesced_sample_count": samples,
+                "latest_event": copy.deepcopy(event),
+            }
+            if previous is None:
+                retained.append(record)
+            else:
+                record["coalesced_event_count"] += previous["coalesced_event_count"]
+                record["coalesced_sample_count"] += previous["coalesced_sample_count"]
+                retained[retained.index(previous)] = record
+
+    def _drain_actuator_stream(self, run):
+        execution = run["execution"]
+        if execution.get("actuator_stream_stop_pending") is not True:
+            return
+        try:
+            events = self.transport.poll_learned_actuator_stream()
+            self._retain_actuator_stream_events(execution, events)
+        except Exception as exc:
+            try:
+                self._retain_actuator_stream_events(
+                    execution, getattr(exc, "actuator_stream_events", []),
+                )
+            except ContractError:
+                pass
+            execution["actuator_stream_drain_error"] = (
+                exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_POLL_FAILED"
+            )
+        try:
+            status = self._actuator_stream_status()
+        except Exception as exc:
+            execution["actuator_stream_drain_error"] = (
+                exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_STATUS"
+            )
+            return
+        if status is None or not status["active"]:
+            execution["actuator_stream_drain"] = {
+                "status": "OWNERSHIP_UNAVAILABLE", "fenced": None, "owns_goals": None,
+            }
+            execution["active"] = True
+            return
+        execution["actuator_stream_drain"] = {
+            "status": "FENCE_REQUESTED", "fenced": status["fenced"],
+            "owns_goals": status["owns_goals"],
+        }
+        if not status["fenced"] or status["owns_goals"]:
+            return
+        try:
+            self.transport.close_learned_actuator_stream()
+        except Exception as exc:
+            execution["actuator_stream_drain_error"] = (
+                exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_CLOSE_FAILED"
+            )
+            return
+        execution["actuator_stream_drain"] = {
+            "status": "NATIVE_HANDLES_TERMINAL", "fenced": True, "owns_goals": False,
+        }
+        execution["active"] = False
+        execution.pop("actuator_stream_stop_pending", None)
+
     def _fault(self, run, code):
         self._retire_observation_cache()
         if "cancel_event" in run:
@@ -2018,7 +2122,35 @@ class PickupExecutor:
         # Fence callbacks before waiting on the sole transport cancellation owner.
         run["state"] = "BLOCKED"
         execution = run["execution"]
-        if execution.get("active") and getattr(self.transport, "owns_active_goal", True):
+        stream_status = None
+        stream_status_error = False
+        try:
+            stream_status = self._actuator_stream_status()
+        except Exception as exc:
+            stream_status_error = True
+            execution["actuator_stream_drain_error"] = (
+                exc.code if isinstance(exc, ContractError) else "ROS_EXEC_STREAM_STATUS"
+            )
+        stream_owned = bool(stream_status and stream_status["active"] or stream_status_error)
+        if stream_owned:
+            execution["active"] = True
+            execution["actuator_stream_stop_pending"] = True
+            execution["cancel_error"] = "ROS_EXEC_CANCEL_UNCERTAIN"
+            execution["actuator_stream_drain"] = ({
+                "status": "FENCE_REQUESTED", "fenced": stream_status["fenced"],
+                "owns_goals": stream_status["owns_goals"],
+            } if stream_status is not None else {
+                "status": "OWNERSHIP_UNAVAILABLE", "fenced": None, "owns_goals": None,
+            })
+            if execution.get("actuator_stream_fence_requested") is not True:
+                execution["actuator_stream_fence_requested"] = True
+                try:
+                    self.transport.fence_learned_actuator_stream()
+                except Exception as exc:
+                    execution["cancel_error"] = (
+                        exc.code if isinstance(exc, ContractError) else "CANCEL_FAILED"
+                    )
+        elif execution.get("active") and getattr(self.transport, "owns_active_goal", True):
             try:
                 self.transport.cancel_active(run["plan"]["execution_timeouts_s"]["cancel"])
                 step = self._active_steps(run)[execution["step_index"]]
@@ -2027,7 +2159,8 @@ class PickupExecutor:
                 self._emit_phase_event(run, "ACTION_TERMINAL", step, "CANCELLED", {"failure_code": code, "step": step, "terminal_status": "CANCELLED"})
             except Exception as exc:
                 execution["cancel_error"] = exc.code if isinstance(exc, ContractError) else "CANCEL_FAILED"
-        execution["active"] = False
+        if not stream_owned:
+            execution["active"] = False
         try:
             execution["snapshot"] = self.transport.snapshot(run["plan"]["planning"]["max_joint_state_age_s"])
         except Exception as exc:
@@ -2149,6 +2282,8 @@ class PickupExecutor:
 
     def _tick(self):
         for run in self.runs.values():
+            if run.get("execution", {}).get("actuator_stream_stop_pending") is True:
+                self._drain_actuator_stream(run)
             if run["state"] not in ACTIVE_STATES:
                 continue
             try:
@@ -2559,6 +2694,7 @@ def run_jsonl(input_stream, output_stream, executor):
     """Keep ticking while stdin is quiet so a lease cannot be bypassed."""
     events = queue.Queue()
     terminal_ok = None
+    reader_terminal = None
     def read_lines():
         try:
             for line in input_stream:
@@ -2584,6 +2720,12 @@ def run_jsonl(input_stream, output_stream, executor):
             kind, value = events.get(timeout=timeout)
         except queue.Empty:
             executor.tick()
+            if reader_terminal is not None and not any(
+                run.get("execution", {}).get("actuator_stream_stop_pending") is True
+                for run in executor.runs.values()
+            ):
+                run = next((item for item in executor.runs.values() if item["state"] == "BLOCKED"), None)
+                return terminal(run) if run is not None else terminal_ok
             continue
         if kind == "line":
             try:
@@ -2602,12 +2744,24 @@ def run_jsonl(input_stream, output_stream, executor):
             executor.tick()
             for run in executor.runs.values():
                 if run["state"] == "BLOCKED":
-                    return terminal(run)
+                    if run.get("execution", {}).get("actuator_stream_stop_pending") is not True:
+                        return terminal(run)
+            continue
+        if any(
+            run.get("execution", {}).get("actuator_stream_stop_pending") is True
+            for run in executor.runs.values()
+        ):
+            reader_terminal = kind
             continue
         for run in executor.runs.values():
             if run["state"] in ACTIVE_STATES:
                 executor._fault(run, "INPUT_READER_ERROR" if kind == "error" else "INPUT_EOF")
+                if run.get("execution", {}).get("actuator_stream_stop_pending") is True:
+                    reader_terminal = kind
+                    break
                 return terminal(run)
+        if reader_terminal is not None:
+            continue
         return terminal_ok if terminal_ok is not None else not any(run["state"] == "BLOCKED" for run in executor.runs.values())
 
 

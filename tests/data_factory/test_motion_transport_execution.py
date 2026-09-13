@@ -1019,3 +1019,250 @@ class NativeClockPreparationTest(unittest.TestCase):
                 if mode=="live":
                     t._prepare_native_clock(.3)
                     self.assertEqual(len(configured),1)
+
+
+class TestExecutorActuatorStreamDrain(unittest.TestCase):
+    class Transport:
+        def __init__(self, *, terminal_ready=None, fail_first_poll=False, feedback_while_pending=False):
+            self.active = True
+            self.fenced = False
+            self.owns_goals = True
+            self.terminal_ready = terminal_ready
+            self.fail_first_poll = fail_first_poll
+            self.feedback_while_pending = feedback_while_pending
+            self.status_error = False
+            self.fence_calls = 0
+            self.poll_calls = 0
+            self.close_calls = 0
+            self.cancel_calls = 0
+
+        @property
+        def owns_active_goal(self):
+            return self.active
+
+        def learned_actuator_stream_status(self):
+            if self.status_error:
+                raise ContractError("STREAM_STATUS_UNAVAILABLE")
+            return {
+                "active": self.active,
+                "fenced": self.fenced if self.active else False,
+                "owns_goals": self.owns_goals if self.active else False,
+            }
+
+        def fence_learned_actuator_stream(self):
+            self.fence_calls += 1
+            self.fenced = True
+
+        def poll_learned_actuator_stream(self):
+            self.poll_calls += 1
+            if self.fail_first_poll and self.poll_calls == 1:
+                error = ContractError("NATIVE_PRIMARY")
+                error.actuator_stream_events = [{
+                    "actuator": "arm", "revision": "rev-1", "event": "CANCEL_RESPONSE",
+                    "return_code": 0, "goal_id": [1], "accepted": True,
+                }]
+                raise error
+            if self.terminal_ready is not None and not self.terminal_ready.is_set():
+                if self.feedback_while_pending:
+                    return [{
+                        "actuator": "arm", "revision": "rev-1", "event": "FEEDBACK",
+                        "goal_id": [1], "received_monotonic_s": self.poll_calls,
+                        "samples_since_poll": 2, "feedback": {"desired": {"time_from_start": {"sec": 0}}},
+                    }]
+                return []
+            self.owns_goals = False
+            return [{
+                "actuator": "gripper", "revision": "rev-1", "event": "TERMINAL",
+                "result_status": 4, "error_code": 0,
+            }]
+
+        def close_learned_actuator_stream(self):
+            if not self.fenced or self.owns_goals:
+                raise ContractError("ROS_EXEC_ACTIVE")
+            self.close_calls += 1
+            self.active = False
+
+        def cancel_active(self, _timeout):
+            self.cancel_calls += 1
+            raise AssertionError("stream fault must use the pair fence")
+
+        def snapshot(self, _age):
+            return {}
+
+    @staticmethod
+    def executor_run(transport):
+        import threading
+        from tools.data_factory.motion.pickup_executor import PickupExecutor
+
+        executor = PickupExecutor(
+            transport=transport, source_clock=lambda: 10., monotonic_clock=lambda: 10.,
+        )
+        run = {
+            "state": "EXECUTING", "digest": "sha256:" + "1" * 64,
+            "cancel_event": threading.Event(),
+            "plan": {
+                "run_id": "stream-run", "steps": [],
+                "scene_binding": {"object_instance_id": "cube"},
+                "planning": {"max_joint_state_age_s": .1},
+                "execution_timeouts_s": {"cancel": .1},
+            },
+            "execution": {
+                "step_index": 0, "lease_deadline": 20., "active": True,
+                "motion_dispatch_attempted": True, "terminal_phases": [],
+            },
+        }
+        executor.runs = {"stream-run": run}
+        return executor, run
+
+    def test_fault_fences_once_and_drains_exact_events_without_replacing_primary(self):
+        transport = self.Transport(fail_first_poll=True)
+        executor, run = self.executor_run(transport)
+
+        executor._fault(run, "PRIMARY_FAULT")
+        self.assertEqual((run["state"], run["failure_code"]), ("BLOCKED", "PRIMARY_FAULT"))
+        self.assertTrue(run["execution"]["active"])
+        self.assertEqual(run["execution"]["cancel_error"], "ROS_EXEC_CANCEL_UNCERTAIN")
+        self.assertEqual((transport.fence_calls, transport.cancel_calls, transport.close_calls), (1, 0, 0))
+        self.assertFalse(executor.close())
+        executor._fault(run, "LATER_FAULT")
+        self.assertEqual((run["failure_code"], transport.fence_calls), ("PRIMARY_FAULT", 1))
+
+        executor.tick()
+        self.assertEqual(run["failure_code"], "PRIMARY_FAULT")
+        self.assertEqual(run["execution"]["actuator_stream_events"][0]["event"], "CANCEL_RESPONSE")
+        self.assertEqual(run["execution"]["actuator_stream_drain_error"], "NATIVE_PRIMARY")
+        self.assertTrue(run["execution"]["active"])
+
+        executor.tick()
+        self.assertEqual([event["event"] for event in run["execution"]["actuator_stream_events"]],
+                         ["CANCEL_RESPONSE", "TERMINAL"])
+        self.assertEqual((transport.fence_calls, transport.close_calls), (1, 1))
+        self.assertFalse(run["execution"]["active"])
+        self.assertEqual(run["execution"]["actuator_stream_drain"]["status"], "NATIVE_HANDLES_TERMINAL")
+        self.assertNotIn("physical_stop", executor._execution_data(run)["actuator_stream_drain"])
+        self.assertTrue(executor.close())
+
+    def test_jsonl_eof_waits_for_owned_stream_terminal_facts(self):
+        import io
+        import threading
+        import time
+        from tools.data_factory.motion.pickup_executor import run_jsonl
+
+        terminal_ready = threading.Event()
+        transport = self.Transport(terminal_ready=terminal_ready)
+        executor, run = self.executor_run(transport)
+        output, result = io.StringIO(), []
+        worker = threading.Thread(target=lambda: result.append(run_jsonl(io.StringIO(), output, executor)))
+        worker.start()
+        time.sleep(.08)
+        self.assertTrue(worker.is_alive())
+        self.assertEqual((transport.fence_calls, transport.close_calls), (1, 0))
+        self.assertEqual(run["failure_code"], "INPUT_EOF")
+
+        terminal_ready.set()
+        worker.join(1.)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [False])
+        self.assertEqual((transport.fence_calls, transport.close_calls), (1, 1))
+        response = __import__("json").loads(output.getvalue())
+        self.assertEqual((response["state"], response["data"]["actuator_stream_events"][0]["event"]),
+                         ("BLOCKED", "TERMINAL"))
+
+    def test_missing_stream_status_never_releases_ambiguous_owner(self):
+        transport = self.Transport()
+        executor, run = self.executor_run(transport)
+        executor._fault(run, "PRIMARY_FAULT")
+        transport.active = False
+        transport.owns_goals = False
+
+        executor.tick()
+        self.assertTrue(run["execution"]["active"])
+        self.assertTrue(run["execution"]["actuator_stream_stop_pending"])
+        self.assertEqual(run["execution"]["actuator_stream_drain"]["status"], "OWNERSHIP_UNAVAILABLE")
+        self.assertEqual(transport.close_calls, 0)
+        self.assertFalse(executor.close())
+
+        class MissingStatus:
+            def poll_learned_actuator_stream(self):
+                return []
+
+            def close_learned_actuator_stream(self):
+                raise AssertionError("missing ownership status cannot authorize close")
+
+        executor.transport = MissingStatus()
+        executor.tick()
+        self.assertTrue(run["execution"]["active"])
+        self.assertTrue(run["execution"]["actuator_stream_stop_pending"])
+        self.assertEqual(run["execution"]["actuator_stream_drain"]["status"], "OWNERSHIP_UNAVAILABLE")
+
+    def test_fault_status_error_preserves_ambiguous_owner_without_generic_cancel(self):
+        transport = self.Transport()
+        transport.status_error = True
+        executor, run = self.executor_run(transport)
+
+        executor._fault(run, "PRIMARY_FAULT")
+        self.assertEqual((run["failure_code"], run["execution"]["active"]), ("PRIMARY_FAULT", True))
+        self.assertTrue(run["execution"]["actuator_stream_stop_pending"])
+        self.assertEqual(run["execution"]["actuator_stream_drain"]["status"], "OWNERSHIP_UNAVAILABLE")
+        self.assertEqual((transport.fence_calls, transport.cancel_calls), (1, 0))
+
+    def test_blocked_pending_stream_eof_still_waits_for_terminal_facts(self):
+        import io
+        import threading
+        import time
+        from tools.data_factory.motion.pickup_executor import run_jsonl
+
+        terminal_ready = threading.Event()
+        transport = self.Transport(terminal_ready=terminal_ready)
+        executor, run = self.executor_run(transport)
+        executor._fault(run, "PRIMARY_FAULT")
+        output, result = io.StringIO(), []
+        worker = threading.Thread(target=lambda: result.append(run_jsonl(io.StringIO(), output, executor)))
+        worker.start()
+        time.sleep(.08)
+        self.assertTrue(worker.is_alive())
+        terminal_ready.set()
+        worker.join(1.)
+        self.assertEqual((worker.is_alive(), result), (False, [False]))
+        self.assertEqual(__import__("json").loads(output.getvalue())["data"]["actuator_stream_events"][0]["event"],
+                         "TERMINAL")
+
+    def test_after_line_tick_fault_cannot_exit_with_owned_stream(self):
+        import io
+        import threading
+        import time
+        from tools.data_factory.motion.pickup_executor import run_jsonl
+
+        terminal_ready = threading.Event()
+        transport = self.Transport(terminal_ready=terminal_ready)
+        executor, run = self.executor_run(transport)
+        run["execution"]["lease_deadline"] = 5.
+        output, result = io.StringIO(), []
+        worker = threading.Thread(target=lambda: result.append(run_jsonl(io.StringIO("{}\n"), output, executor)))
+        worker.start()
+        time.sleep(.08)
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(run["failure_code"], "HEARTBEAT_TIMEOUT")
+        terminal_ready.set()
+        worker.join(1.)
+        self.assertEqual((worker.is_alive(), result), (False, [False]))
+        self.assertEqual(len(output.getvalue().splitlines()), 2)
+
+    def test_pending_feedback_is_bounded_to_latest_identity_with_coalesced_counts(self):
+        import threading
+
+        terminal_ready = threading.Event()
+        transport = self.Transport(terminal_ready=terminal_ready, feedback_while_pending=True)
+        executor, run = self.executor_run(transport)
+        executor._fault(run, "PRIMARY_FAULT")
+        for _ in range(20):
+            executor.tick()
+        feedback = run["execution"]["actuator_stream_feedback"]
+        self.assertEqual(len(feedback), 1)
+        self.assertEqual((feedback[0]["coalesced_event_count"], feedback[0]["coalesced_sample_count"]),
+                         (20, 40))
+        self.assertEqual(feedback[0]["latest_event"]["received_monotonic_s"], 20)
+        self.assertNotIn("FEEDBACK", [event["event"] for event in run["execution"].get("actuator_stream_events", [])])
+        terminal_ready.set()
+        executor.tick()
+        self.assertEqual(run["execution"]["actuator_stream_events"][0]["event"], "TERMINAL")

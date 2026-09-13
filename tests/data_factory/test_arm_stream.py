@@ -584,9 +584,13 @@ class TransportActuatorStreamTest(unittest.TestCase):
 
     def test_generic_cancel_never_reports_async_fence_as_completed_stop(self):
         self.transport.open_learned_actuator_stream(deadline=20.)
+        self.assertEqual(self.transport.learned_actuator_stream_status(),
+                         {"active": True, "fenced": False, "owns_goals": False})
         self.transport.submit_learned_actuator_revision(*self.goals(), revision="one", dispatch_guard=Mock())
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_CANCEL_UNCERTAIN"):
             self.transport.cancel_active(.1)
+        self.assertEqual(self.transport.learned_actuator_stream_status(),
+                         {"active": True, "fenced": True, "owns_goals": True})
         with self.assertRaisesRegex(ContractError, "ROS_EXEC_ACTIVE"):
             self.transport.close_learned_actuator_stream()
         item, gripper = handle(), handle()
@@ -603,7 +607,11 @@ class TransportActuatorStreamTest(unittest.TestCase):
             self.transport.close_learned_actuator_stream()
         finish(gripper, 5)
         self.transport.poll_learned_actuator_stream()
+        self.assertEqual(self.transport.learned_actuator_stream_status(),
+                         {"active": True, "fenced": True, "owns_goals": False})
         self.transport.close_learned_actuator_stream()
+        self.assertEqual(self.transport.learned_actuator_stream_status(),
+                         {"active": False, "fenced": False, "owns_goals": False})
         self.assertFalse(self.transport.owns_active_goal)
         self.assertTrue(self.transport._execution_locked)
 

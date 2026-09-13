@@ -1155,6 +1155,17 @@ class RosMoveItTransport:
         self._rclpy.spin_once(self.node, timeout_sec=0.0)
         return self._active.poll()
 
+    def learned_actuator_stream_status(self):
+        """Expose native-handle ownership without interpreting it as a stop."""
+        active = getattr(self, "_active", None)
+        if not isinstance(active, ActuatorStream):
+            return {"active": False, "fenced": False, "owns_goals": False}
+        return {
+            "active": True,
+            "fenced": active.fenced,
+            "owns_goals": active.owns_goals,
+        }
+
     def close_learned_actuator_stream(self):
         """Release only a fenced stream whose native handles are all terminal."""
         if not isinstance(self._active, ActuatorStream):
