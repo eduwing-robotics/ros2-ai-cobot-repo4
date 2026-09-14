@@ -10,7 +10,7 @@
 
 ### Planning–Execution Interface
 
-![상위 subgoal·context와 기존 작업 조건·유한 정책 실행·진단 출력의 연결 지점. 현재 Scene State와 실행 당시 원본 조건을 구분한다. 점선은 상위 연동 확장, 실선은 내부 실행·추천 소비.](portfolio/task-evidence.drawio.svg)
+![상위 subgoal·context와 기존 작업 조건·정책 실행 인터페이스·진단 출력의 연결 지점. 현재 Scene State와 실행 당시 원본 조건을 구분한다. 점선은 상위 연동과 연속 실행 진단의 연결 대상, 실선은 기존 내부 소비.](portfolio/task-evidence.drawio.svg)
 
 <details>
 <summary>인터페이스 계약과 현재 소비자</summary>
@@ -19,7 +19,7 @@
 | --- | --- | --- |
 | [Scene State](../tools/data_factory/scene_state.py) | 현재 물체 위치·상태·출처·revision | Collection 계획·실행, 현재 장면의 수집 추천 |
 | [Task Binding](../tools/data_factory/task_recipe.py) | task·공간 역할·workspace·pose | Collection 계획·실행, 기록 instruction |
-| [NativeSmolVLA](../tools/data_factory/learned_action_adapter.py) | 언어 지시·RGB × 2·7D 상태 → action chunk | OneJob의 유한 정책 실행 |
+| [NativeSmolVLA](../tools/data_factory/learned_action_adapter.py) | 언어 지시·RGB × 2·7D 상태 → action chunk | 기존 유한 실행·연속 실행 연결 중 |
 | [Execution Diagnostic](../tools/data_factory/rollout/evidence_boundary.py) | checkpoint·실행 trace·사람 판정 범위 | Curator의 원본 실행 진단과 조건 대응 |
 | [Collection Recommendation](../tools/data_factory/collection_recommendation.py) | 관측·제안·근거 참조·선택 변경 | CampaignOperator의 draft 갱신 |
 
@@ -31,23 +31,20 @@
 
 ## Scene & Execution
 
-![Collection 궤적과 VLA 출력에서 구성한 실행 계획이 같은 계획 검사를 거친다. PlanningScene의 등록 형상과 Scene State의 물체 상태는 각 검사에 입력되며, PickupExecutor가 계획과 실행을 함께 소유한다.](portfolio/execution-safety.drawio.svg)
+![다음 동작의 충돌·FK 검사를 별도 CPU에서 수행하는 동안 단일 실행 소유자가 현재 동작을 감시하고 취소한다.](portfolio/execution-safety.drawio.svg)
 
-충돌 검사는 등록된 환경 형상과 궤적 표본을 기준으로 한다.
+LeRobot의 native async inference와 ActionQueue를 재사용한다. FR5는 원본 관측·예측 row 대응, 장면·상태 검사, ARM·그리퍼 전송과 취소를 맡는다. 연속 Rollout의 전체 공개 호출은 구현 중이며, 검사·전송 소유자 연결은 CPU geometry와 모의 actuator로 검증했다.
 
 <details>
-<summary>환경 형상·공통 검사·실행 결속</summary>
+<summary>형상 검사와 명령 참조의 진행</summary>
 
-| 계약 | 실행에서 확인하는 대상 |
-| --- | --- |
-| [PlanningScene profile](../config/data_factory/planning_scenes/fr5-table-floor-wall-r003.json) | 바닥 높이·여유와 후면 벽 형상. 로봇 기준 좌표·workspace datum과 결속 |
-| [SceneStateStore](../tools/data_factory/scene_state.py) | 물체 위치·상태·revision과 근거. 현재 실행 조건에 결속 |
-| [RosMoveItTransport](../tools/data_factory/motion/moveit_transport.py) | 환경 apply/readback, 직렬화한 궤적의 관절·그리퍼 표본 유효성 |
-| [PickupExecutor](../tools/data_factory/motion/pickup_executor.py) | 검사·승인한 계획 식별값, 시작 관측·장비·장면과 단일 실행 owner |
+Collection은 계획한 MoveIt 궤적을 검사한다. 연속 Rollout은 native 7D rows를 공통 시각의 ARM·그리퍼 참조로 구성한다. 별도 CPU helper가 전체 PlanningScene·로봇 모델로 충돌과 FK를 계산하는 동안 현재 동작의 감시·취소는 계속된다. 검사한 후보와 현재 상태·장면·권한이 일치해야 같은 실행 소유자가 전송한다.
 
-바닥·후면 벽은 현재 등록된 환경 장애물이다. 물체 위치 기록과 충돌 형상 등록은 별도이다. 기계적 release/reset 경로는 접촉 근거에 결속된 물체를 충돌 형상으로 추가한다. 검사는 궤적 knot와 구간별 네 보간 표본을 사용하며, 연속 충돌 검증이나 미등록 물체와의 접촉 회피를 보장하지 않는다.
+바닥·벽·원래 물체 형상을 보존하고, 접촉·운반·놓기의 점유 공간을 계산 가정으로 추가한다. 이 형상 가정은 실제 파지 판정이나 Scene State 갱신 권한이 아니다. 충돌 표본 검증과 실물 접촉 성공은 별도이다.
 
-구현 근거: main `68466a9` · [Collection 회귀](../tests/data_factory/test_motion.py) · [학습 궤적 충돌 회귀](../tests/data_factory/rollout/test_finite_plan.py)
+ARM과 그리퍼의 명령 참조 진행을 함께 확인해 소비한 큐 prefix를 계산한다. 명령 접수는 소비나 작업 성공으로 취급하지 않는다. 현재 공개 호출의 producer→selection→commit→ACK 연결과 실물 연속 동작 검증은 남아 있다. 기존 유한 실행 진단과 새 stream 진단의 재수집 소비도 분리한다. 새 stream 진단을 이용한 표적 재수집은 아직 지원되지 않는다.
+
+구현: [native queue adapter](https://github.com/hasemu1211/fr5-lerobot-connector/blob/816de823590ad1315c7a6d575713fe660d25a1a8/plugins/lerobot_strategy_fr5/src/lerobot_strategy_fr5/acknowledged_queue.py) · [실행 소유자](https://github.com/hasemu1211/fr5-lerobot-connector/blob/816de823590ad1315c7a6d575713fe660d25a1a8/tools/data_factory/motion/pickup_executor.py) · [비동기 geometry](https://github.com/hasemu1211/fr5-lerobot-connector/blob/816de823590ad1315c7a6d575713fe660d25a1a8/tools/data_factory/motion/native_geometry.py) · [현재 호출](https://github.com/hasemu1211/fr5-lerobot-connector/blob/816de823590ad1315c7a6d575713fe660d25a1a8/tools/data_factory/run_job.py)
 
 </details>
 

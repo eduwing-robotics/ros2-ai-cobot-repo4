@@ -6,11 +6,11 @@
 
 양방향 시연 40개를 TRAIN 32개와 heldout 8개로 분리해 SmolVLA base에서 12,000 step을 학습했다. Batch 4, 시각·언어 모델(VLM) 고정, action expert 학습이며 saved pre/postprocessor와 TRAIN 정규화 통계를 보존했다.
 
-![같은24관측과3개 noise seed의 checkpoint별 flow loss](portfolio/assets/rhythm40-loss.svg)
+![같은9k 부모에서 학습률 감소와 유지를 비교한12k·15k·18k의 flow loss·J6·gripper 오차](portfolio/assets/rhythm40-schedule.svg)
 
-12k는 네 checkpoint 중 평균 flow loss·관절·그리퍼 오차가 가장 작다. J6의 큰 진입 변화와 그리퍼 범위 초과는 후속 실험에서 살필 진단 항목이다. 이 오프라인 비교와 실물 실행 승인은 별도이며, 실행 계층은 실제로 보낼 동작을 검사한다.
+같은 9k checkpoint에서 학습률을 다르게 적용해 18k까지 비교했다. 원래 12k 모델에 비해 학습률 유지 18k 모델은 J6 RMSE가 5.25% 감소하고 그리퍼 RMSE가 17.05% 증가했다. 8개 시연의 24개 관측과 동일한 3개 noise seed를 사용한 오프라인 결과이다. [학습 계보·조건·원본](https://github.com/hasemu1211/fr5-lerobot-connector/blob/816de823590ad1315c7a6d575713fe660d25a1a8/openspec/changes/learning-evaluation-loop/design.md#completed-lr-tail-evidence-and-stopping-decision-2026-09-13)
 
-기존 실행 경로는 LeRobot의 모델·processor가 반환한 전체 action chunk를 FR5의 단일 실행기로 전달한다. 별도의 LeRobot CLI용 FR5 플러그인은 아직 행동 전송을 열지 않았다. 소프트웨어 연결과 실물 성공은 다른 근거이며, 학습 정책의 Pick & Place 실행은 실물 검증 대상이다. 9월 11일에는 자세 유지 조건에서 같은 시점의 로봇 상태를 10초간 연속 전달함을 확인했다.
+실물 정책 시험에서는 초기 ARM 2구간의 완료 뒤 상태 검사에서 중단됐으며 Pick & Place 성공은 확인되지 않았다. 현재 연속 Rollout은 LeRobot의 비동기 추론·큐와 FR5의 실행 소유자를 연결하는 구조로 개발 중이다. 구성요소의 검사·전송·취소 연결과 전체 공개 호출의 완성 범위를 [실행 아키텍처](architecture.md#scene--execution)에서 구분한다.
 
 <details>
 <summary>현재 데이터 구조와 원본 식별</summary>
