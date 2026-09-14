@@ -1,6 +1,6 @@
 # Closed-Loop Data Engine · 포트폴리오
 
-**[포트폴리오 다운로드](https://github.com/hasemu1211/fr5-lerobot-connector/releases/download/portfolio-2026-09-08/FR5-Portfolio.html)**
+**[포트폴리오 다운로드](https://github.com/hasemu1211/fr5-lerobot-connector/releases/download/portfolio-2026-09-14/FR5-Portfolio.html)**
 
 [시스템 아키텍처](../architecture.md) · [데이터셋 품질](../dataset-quality.md) · [학습과 평가](../training-and-evaluation.md)
 
