@@ -2,9 +2,9 @@
 
 조건과 궤적을 설계해 실물 시연을 만들고, 그 데이터로 학습한 VLA 정책을 검증한다. 구현·검증 플랫폼은 FAIRINO FR5이다.
 
-**[포트폴리오 다운로드](https://github.com/hasemu1211/fr5-lerobot-connector/releases/download/portfolio-2026-09-08/FR5-Portfolio.html)** · [시스템 아키텍처](docs/architecture.md)
+**[포트폴리오 다운로드](https://github.com/hasemu1211/fr5-lerobot-connector/releases/download/portfolio-2026-09-14/FR5-Portfolio.html)** · [시스템 아키텍처](docs/architecture.md)
 
-[![Pick & Place 시연의 고정 카메라와 손목 카메라 관측](docs/portfolio/assets/pick-place-latest-poster.jpg)](https://github.com/hasemu1211/fr5-lerobot-connector/releases/download/portfolio-2026-09-08/FR5-Portfolio.html)
+[![Pick & Place 시연의 고정 카메라와 손목 카메라 관측](docs/portfolio/assets/pick-place-latest-poster.jpg)](https://github.com/hasemu1211/fr5-lerobot-connector/releases/download/portfolio-2026-09-14/FR5-Portfolio.html)
 
 Pick & Place · 21.1초
 
