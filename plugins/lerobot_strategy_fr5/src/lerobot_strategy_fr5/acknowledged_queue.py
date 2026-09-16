@@ -414,21 +414,42 @@ class AcknowledgedActionQueue(ActionQueue):
         with self.lock:
             if count == 0:
                 return ()
-            end = self.last_index + count
-            if (self._rows[self.last_index:end] != snapshot.rows[offset:offset + count]
-                    or self._observation_provenance[self.last_index:end]
-                    != snapshot.observation_provenance[offset:offset + count]
-                    or self._generation_eligibility[self.last_index:end]
-                    != (snapshot.generation_eligibility or (None,) * len(snapshot.rows))[offset:offset + count]):
-                raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
-            for saved, current in ((snapshot.original_actions, self.original_queue),
-                                   (snapshot.processed_actions, self.queue)):
-                if not isinstance(saved, Tensor) or not isinstance(current, Tensor):
-                    raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
-                expected, actual = saved[offset:offset + count], current[self.last_index:end]
-                if (expected.shape != actual.shape or expected.dtype != actual.dtype
-                        or expected.device != actual.device or not expected.equal(actual)):
-                    raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+            self._check_unchanged_prefix_locked(snapshot, count=count, offset=offset)
             return self.advance_if_current(
                 generation=self._generation, expected_index=self.last_index, count=count,
             )
+
+    def check_unchanged_prefix(
+        self, snapshot: ActionQueueSnapshot, *, count: int,
+    ) -> tuple[RawActionIndex, ...]:
+        """Require an exact current prefix without advancing the native cursor."""
+
+        if not isinstance(snapshot, ActionQueueSnapshot):
+            raise TypeError("FR5_ACK_QUEUE_EXPECTED_SNAPSHOT")
+        if type(count) is not int:
+            raise TypeError("FR5_ACK_QUEUE_EXPECTED_INTEGER: count")
+        if count <= 0 or count > len(snapshot.rows):
+            raise ValueError(f"FR5_ACK_QUEUE_INVALID_COUNT: {count}")
+        with self.lock:
+            return self._check_unchanged_prefix_locked(
+                snapshot, count=count, offset=0,
+            )
+
+    def _check_unchanged_prefix_locked(self, snapshot, *, count, offset):
+        end = self.last_index + count
+        expected_rows = snapshot.rows[offset:offset + count]
+        if (self._rows[self.last_index:end] != expected_rows
+                or self._observation_provenance[self.last_index:end]
+                != snapshot.observation_provenance[offset:offset + count]
+                or self._generation_eligibility[self.last_index:end]
+                != (snapshot.generation_eligibility or (None,) * len(snapshot.rows))[offset:offset + count]):
+            raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+        for saved, current in ((snapshot.original_actions, self.original_queue),
+                               (snapshot.processed_actions, self.queue)):
+            if not isinstance(saved, Tensor) or not isinstance(current, Tensor):
+                raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+            expected, actual = saved[offset:offset + count], current[self.last_index:end]
+            if (expected.shape != actual.shape or expected.dtype != actual.dtype
+                    or expected.device != actual.device or not expected.equal(actual)):
+                raise RuntimeError("FR5_ACK_QUEUE_PREFIX_CHANGED")
+        return expected_rows

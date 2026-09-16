@@ -357,6 +357,67 @@ class AcknowledgedActionQueueTest(unittest.TestCase):
         self.assertEqual(queue.advance_unchanged_prefix(snapshot, count=2), snapshot.rows[:2])
         self.assertTrue(torch.equal(queue.get_processed_left_over(), actions(100)[2:]))
 
+    def test_current_prefix_check_survives_append_without_advancing(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
+        queue.merge(actions(0), actions(100), real_delay=0)
+        queue.get()
+        snapshot = queue.snapshot()
+
+        # Native append compacts the consumed head while retaining the exact
+        # detached prefix. Membership remains true without moving the cursor.
+        compared, attempted, release = Event(), Event(), Event()
+        compare = queue._check_unchanged_prefix_locked
+
+        def hold_after_comparison(*args, **kwargs):
+            result = compare(*args, **kwargs)
+            compared.set()
+            if not release.wait(3):
+                raise TimeoutError("test did not release current-prefix check")
+            return result
+
+        def append():
+            if not compared.wait(3):
+                raise TimeoutError("prefix was never compared")
+            acquired = queue.lock.acquire(blocking=False)
+            if acquired:
+                queue.lock.release()
+            attempted.set()
+            queue.merge(actions(1000, 2), actions(2000, 2), real_delay=0)
+            return acquired
+
+        with ThreadPoolExecutor(max_workers=2) as pool, patch.object(
+                queue, "_check_unchanged_prefix_locked", side_effect=hold_after_comparison):
+            consumer = pool.submit(queue.check_unchanged_prefix, snapshot, count=2)
+            producer = pool.submit(append)
+            try:
+                self.assertTrue(attempted.wait(3))
+            finally:
+                release.set()
+            self.assertEqual(consumer.result(timeout=3), snapshot.rows[:2])
+            self.assertFalse(producer.result(timeout=3))
+
+        before_check = queue.get_action_index()
+        self.assertEqual(
+            queue.check_unchanged_prefix(snapshot, count=2),
+            snapshot.rows[:2],
+        )
+        self.assertEqual(queue.get_action_index(), before_check)
+        self.assertEqual(queue.qsize(), 5)
+
+        queue.get()
+        moved = queue.get_action_index()
+        with self.assertRaisesRegex(RuntimeError, "FR5_ACK_QUEUE_PREFIX_CHANGED"):
+            queue.check_unchanged_prefix(snapshot, count=2)
+        self.assertEqual(queue.get_action_index(), moved)
+
+        for count in (False, 0, -1, len(snapshot.rows) + 1):
+            with self.subTest(count=count), self.assertRaises((TypeError, ValueError)):
+                queue.check_unchanged_prefix(snapshot, count=count)
+            self.assertEqual(queue.get_action_index(), moved)
+
     def test_cumulative_progress_reuses_bound_snapshot_with_explicit_offset(self):
         queue = AcknowledgedActionQueue(RTCConfig(enabled=False))
         queue.merge(actions(0), actions(100), real_delay=0)

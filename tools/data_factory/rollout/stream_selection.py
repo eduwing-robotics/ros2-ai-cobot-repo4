@@ -329,3 +329,35 @@ def acknowledge_stream_selection(queue, snapshot, selection, *, selected_count,
         count=selected_count - acknowledged_count,
     )
     return selected_count
+
+
+def check_stream_selection_current(
+    queue, snapshot, selection, *, robot_description,
+    gripper_projection_quanta=GRIPPER_PROJECTION_QUANTA,
+):
+    """Require the selected rows to remain the native queue's exact prefix.
+
+    This is a non-advancing membership check immediately before the owner's
+    synchronous commit request. It is not an ACK, dispatch, or authority fact.
+    """
+    from lerobot_strategy_fr5.acknowledged_queue import (
+        AcknowledgedActionQueue, ActionQueueSnapshot,
+    )
+
+    if not isinstance(queue, AcknowledgedActionQueue) or not isinstance(snapshot, ActionQueueSnapshot):
+        raise ContractError("LEARNED_STREAM_SELECTION_SNAPSHOT")
+    checked = validate_stream_selection(
+        selection, robot_description=robot_description,
+        gripper_projection_quanta=gripper_projection_quanta,
+    )
+    expected = select_stream_revision(
+        snapshot, robot_description=robot_description,
+        gripper_projection_quanta=gripper_projection_quanta,
+        row_count=len(checked["source_row_indices"]),
+    )
+    if checked != expected:
+        raise ContractError("LEARNED_STREAM_SELECTION_SNAPSHOT")
+    queue.check_unchanged_prefix(
+        snapshot, count=len(checked["source_row_indices"]),
+    )
+    return checked

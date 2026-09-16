@@ -92,6 +92,18 @@ personal exact-plan verdict supplied execution authority.
   `LEARNED_STALE_STATE`: execute goal count0, recorder goal count1,14 retained
   diagnostic rows. No dataset episode was admitted; physical Pick remains UNKNOWN.
 
+Later current-state inspection refines that report: `execute_goal_count: 0` is
+the normal caller's fixed unsuccessful-start projection, not a retained native
+transport counter. Phase events are empty, and the observed rejection/code path
+is consistent with pre-send failure; do not promote the response alone into an
+independent no-dispatch receipt. Cell is now blocked with `LEARNED_STALE_STATE`,
+and Scene revision314 marks the object UNKNOWN/ROBOT_ACTION. Arming consumed the
+source before the later start check faulted. The next attempt must resolve this
+existing recovery boundary rather than restoring an archived pose or inventing
+a human acknowledgment. The unsuccessful-start branch also omitted the retained
+OneJob lifecycle from the public diagnostic; a separate bounded consumer review
+is checking that evidence loss while the acquisition owner works independently.
+
 The retained r2 plan digest is
 `sha256:9faacb7f17498d85bd14c40eb608ef7c50fca5f42581a36c51622784cc520a74`;
 proposal digest is

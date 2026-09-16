@@ -17,6 +17,7 @@ from lerobot_strategy_fr5.acknowledged_queue import (
 from tools.data_factory.rollout.execution_state import JOINTS
 from tools.data_factory.rollout.stream_selection import (
     acknowledge_stream_selection,
+    check_stream_selection_current,
     select_stream_revision,
     validate_stream_selection,
 )
@@ -249,6 +250,64 @@ class StreamSelectionTest(unittest.TestCase):
                 self.queue, snapshot, selected, selected_count=4,
                 robot_description=ROBOT)
         self.assertEqual(self.queue.qsize(), before)
+
+    def test_current_membership_rechecks_exact_selection_without_ack(self):
+        queue, snapshot, selected = self.qualified_selection()
+        before = queue.snapshot()
+        checked = check_stream_selection_current(
+            queue, snapshot, selected, robot_description=ROBOT,
+        )
+        self.assertEqual(checked, selected)
+        after = queue.snapshot()
+        self.assertEqual((after.queue_index, after.rows),
+                         (before.queue_index, before.rows))
+        torch.testing.assert_close(after.original_actions, before.original_actions)
+        torch.testing.assert_close(after.processed_actions, before.processed_actions)
+
+        changed = copy.deepcopy(selected)
+        changed["generation_eligibility"]["observation_digest"] = canonical_digest("rebound")
+        changed["generation_eligibility"]["receipt_digest"] = canonical_digest({
+            key: item for key, item in changed["generation_eligibility"].items()
+            if key != "receipt_digest"
+        })
+        changed["selection_digest"] = canonical_digest({
+            key: item for key, item in changed.items() if key != "selection_digest"
+        })
+        with self.assertRaisesRegex(ContractError, "GENERATION_BINDING"):
+            check_stream_selection_current(
+                queue, snapshot, changed, robot_description=ROBOT,
+            )
+        self.assertEqual(queue.snapshot().queue_index, before.queue_index)
+
+    def test_current_membership_allows_native_append_and_preserves_failed_commit(self):
+        raw = torch.tensor([[99.] * 7, [100.] * 7])
+        processed = torch.tensor([[.1] * 6 + [.01], [.2] * 6 + [.019]])
+        merge(self.queue, raw, processed)
+        snapshot = self.queue.snapshot()
+        selected = select_stream_revision(snapshot, robot_description=ROBOT)
+        merge(self.queue, torch.ones(1, 7),
+              torch.tensor([[.3] * 6 + [.01]]), provenance(2.))
+        before = self.queue.snapshot()
+
+        checked = check_stream_selection_current(
+            self.queue, snapshot, selected, robot_description=ROBOT,
+        )
+        commit = mock.Mock(side_effect=ContractError("CHECKED_COMMIT_FAILED"))
+        with self.assertRaisesRegex(ContractError, "CHECKED_COMMIT_FAILED"):
+            commit(checked)
+        after = self.queue.snapshot()
+        self.assertEqual((after.queue_index, after.rows),
+                         (before.queue_index, before.rows))
+        torch.testing.assert_close(after.original_actions, before.original_actions)
+        torch.testing.assert_close(after.processed_actions, before.processed_actions)
+
+        self.queue.get()
+        moved = self.queue.get_action_index()
+        with self.assertRaisesRegex(RuntimeError, "PREFIX_CHANGED"):
+            check_stream_selection_current(
+                self.queue, snapshot, selected, robot_description=ROBOT,
+            )
+        self.assertEqual(self.queue.get_action_index(), moved)
 
 
 if __name__ == "__main__":

@@ -19,3 +19,7 @@ __all__ = [
     "project_gripper_action",
     "make_fr5_robot_action_processor",
 ]
+
+from .chunk_tap import CapturedPolicyChunk, ExactSmolVLAChunkTap
+
+from .proposal_bridge import build_finite_proposal, observation_digest, project_processed_chunk

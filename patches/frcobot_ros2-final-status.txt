@@ -1,0 +1,20 @@
+HEAD detached at 60755d4
+You are in a sparse checkout with 8% of tracked files present.
+
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	deleted:    fairino_hardware_v3_9_7/.vscode/c_cpp_properties.json
+	deleted:    fairino_hardware_v3_9_7/.vscode/settings.json
+	deleted:    fairino_hardware_v3_9_7/.vscode/tasks.json
+	modified:   fairino_hardware_v3_9_7/include/fairino_hardware/fairino_hardware_interface.hpp
+	modified:   fairino_hardware_v3_9_7/src/CNDE_thread.cpp
+	modified:   fairino_hardware_v3_9_7/src/command_server.cpp
+	deleted:    fairino_hardware_v3_9_7/src/command_server.cpp.bak
+	modified:   fairino_hardware_v3_9_7/src/fairino_hardware_interface.cpp
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	fairino_hardware_v3_9_7/include/fairino_hardware/gripper_execution_evidence.hpp
+
+no changes added to commit (use "git add" and/or "git commit -a")

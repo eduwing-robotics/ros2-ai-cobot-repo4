@@ -88,6 +88,37 @@ def _image_to_rgb(message: Image) -> np.ndarray:
     return np.ascontiguousarray(rgb)
 
 
+
+# Bound to the training-time RGB-to-target synchronization contract.
+# Do not relax independently from the qualified dataset contract.
+OBSERVATION_ALIGNMENT_SLOP_S = 0.050
+
+
+def _validate_source_alignment(
+    source_timestamps: dict[str, float],
+) -> None:
+    required = {"state", "up", "wrist"}
+
+    if set(source_timestamps) != required:
+        raise RuntimeError("FR5_OBSERVATION_INCOMPLETE")
+
+    state_stamp = source_timestamps["state"]
+
+    for camera in ("up", "wrist"):
+        delta_s = abs(
+            source_timestamps[camera] - state_stamp
+        )
+
+        if (
+            not math.isfinite(delta_s)
+            or delta_s
+            > OBSERVATION_ALIGNMENT_SLOP_S + 1e-9
+        ):
+            raise RuntimeError(
+                f"FR5_OBSERVATION_MISALIGNED: {camera}"
+            )
+
+
 def build_observation_from_samples(
     samples: dict[str, _Sample],
     *,
@@ -123,6 +154,8 @@ def build_observation_from_samples(
         source_timestamps[key] = source
         source_ages[key] = source_age
         receive_ages[key] = receive_age
+
+    _validate_source_alignment(source_timestamps)
 
     state: JointState = samples["state"].message
 
@@ -262,6 +295,8 @@ class FR5RosObservationBridge:
         if self.node is None:
             raise RuntimeError("FR5_OBSERVATION_BRIDGE_NOT_STARTED")
 
+        required = ("state", "up", "wrist")
+
         baseline = {
             key: sample.generation
             for key, sample in self._samples.items()
@@ -273,6 +308,7 @@ class FR5RosObservationBridge:
             else self.initial_timeout_s
         )
         deadline = time.monotonic() + wait_budget_s
+        last_alignment_error = None
 
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
@@ -281,41 +317,66 @@ class FR5RosObservationBridge:
                 timeout_sec=max(0.0, min(0.02, remaining)),
             )
 
-            if all(
+            if not all(
                 key in self._samples
                 and self._samples[key].generation
                 > baseline.get(key, -1)
-                for key in ("state", "up", "wrist")
+                for key in required
             ):
-                break
-        else:
-            waiting = [
-                key
-                for key in ("state", "up", "wrist")
-                if (
-                    key not in self._samples
-                    or self._samples[key].generation
-                    <= baseline.get(key, -1)
+                continue
+
+            samples = {
+                key: self._samples[key]
+                for key in required
+            }
+
+            try:
+                result = build_observation_from_samples(
+                    samples,
+                    max_age_s=self.max_age_s,
                 )
-            ]
-            raise RuntimeError(
-                "FR5_OBSERVATION_TIMEOUT: "
-                f"waiting={waiting} "
-                f"seen={sorted(self._samples)} "
-                f"initial={not self._initial_complete}"
+            except RuntimeError as exc:
+                if not str(exc).startswith(
+                    "FR5_OBSERVATION_MISALIGNED:"
+                ):
+                    raise
+
+                last_alignment_error = str(exc)
+
+                # Reject this asynchronous tuple and require every
+                # source to advance before considering another one.
+                baseline = {
+                    key: self._samples[key].generation
+                    for key in required
+                }
+                continue
+
+            self._initial_complete = True
+            return result
+
+        waiting = [
+            key
+            for key in required
+            if (
+                key not in self._samples
+                or self._samples[key].generation
+                <= baseline.get(key, -1)
             )
+        ]
 
-        samples = {
-            key: self._samples[key]
-            for key in ("state", "up", "wrist")
-        }
-
-        result = build_observation_from_samples(
-            samples,
-            max_age_s=self.max_age_s,
+        detail = (
+            ""
+            if last_alignment_error is None
+            else f" last_alignment_error={last_alignment_error}"
         )
-        self._initial_complete = True
-        return result
+
+        raise RuntimeError(
+            "FR5_OBSERVATION_TIMEOUT: "
+            f"waiting={waiting} "
+            f"seen={sorted(self._samples)} "
+            f"initial={not self._initial_complete}"
+            f"{detail}"
+        )
 
     def close(self) -> None:
         if self.node is not None:
